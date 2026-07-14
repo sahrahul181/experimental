@@ -12,10 +12,17 @@ pub fn main(init: std.process.Init) !void {
 
     _ = args.next(); // skip executable name
 
-    const user_dex_path = args.next() orelse {
+    var user_dex_path = args.next() orelse {
         printUsage();
         std.process.exit(1);
     };
+
+    if (std.mem.eql(u8, user_dex_path, "--")) {
+        user_dex_path = args.next() orelse {
+            printUsage();
+            std.process.exit(1);
+        };
+    }
 
     const next_arg = args.next() orelse {
         printUsage();

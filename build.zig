@@ -15,8 +15,8 @@ pub fn build(b: *std.Build) void {
     const parser = b.addModule("parser", .{ .root_source_file = b.path("common/00_frontend/10_parser.zig"), .target = target, .optimize = optimize_mode });
     const print = b.addModule("print", .{ .root_source_file = b.path("common/00_frontend/20_print.zig"), .target = target, .optimize = optimize_mode });
     const interpreter = b.addModule("interpreter", .{ .root_source_file = b.path("common/00_frontend/30_interpreter.zig"), .target = target, .optimize = optimize_mode });
-    const heap = b.addModule("heap", .{ .root_source_file = b.path("common/00_frontend/40_heap.zig"), .target = target, .optimize = optimize_mode });
-    const java_thread = b.addModule("java_thread", .{ .root_source_file = b.path("common/00_frontend/50_java_thread.zig"), .target = target, .optimize = optimize_mode });
+    // const heap = b.addModule("heap", .{ .root_source_file = b.path("common/00_frontend/40_heap.zig"), .target = target, .optimize = optimize_mode });
+    // const java_thread = b.addModule("java_thread", .{ .root_source_file = b.path("common/00_frontend/50_java_thread.zig"), .target = target, .optimize = optimize_mode });
 
     const cfg = b.addModule("cfg", .{ .root_source_file = b.path("common/10_cfg/00_cfg.zig"), .target = target, .optimize = optimize_mode });
     const dominator = b.addModule("dominator", .{ .root_source_file = b.path("common/10_cfg/10_dominator.zig"), .target = target, .optimize = optimize_mode });
@@ -58,9 +58,9 @@ pub fn build(b: *std.Build) void {
     print.addImport("parser", parser);
     print.addImport("instructions", instructions);
     interpreter.addImport("instructions", instructions);
-    java_thread.addImport("interpreter", interpreter);
-    java_thread.addImport("heap", heap);
-    heap.addImport("interpreter", interpreter);
+    // java_thread.addImport("interpreter", interpreter);
+    // java_thread.addImport("heap", heap);
+    // heap.addImport("interpreter", interpreter);
 
     cfg.addImport("instructions", instructions);
     dominator.addImport("cfg", cfg);
@@ -178,7 +178,6 @@ pub fn build(b: *std.Build) void {
     regalloc.addImport("optimizer", optimizer);
     regalloc.addImport("instructions", instructions);
 
-
     storage.addImport("lock", lock);
     actor_runtime.addImport("scheduler", scheduler);
     actor_runtime.addImport("immix", immix);
@@ -194,8 +193,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "parser", .module = parser },
         .{ .name = "print", .module = print },
         .{ .name = "interpreter", .module = interpreter },
-        .{ .name = "heap", .module = heap },
-        .{ .name = "java_thread", .module = java_thread },
+        // .{ .name = "heap", .module = heap },
+        // .{ .name = "java_thread", .module = java_thread },
         .{ .name = "cfg", .module = cfg },
         .{ .name = "cfg_phase", .module = cfg_phase },
         .{ .name = "cfg_rewrite", .module = cfg_rewrite },
@@ -283,69 +282,6 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_runner_cli.addArgs(args);
     const run_runner_step = b.step("run-runner", "Run the DEX runner CLI (usage: zig build run-runner -- <user_dex> <class_name> <method_name> [args...])");
     run_runner_step.dependOn(&run_runner_cli.step);
-
-    const stress_mod = b.createModule(.{
-        .root_source_file = b.path("src/examples/concurrent_gc_thread_stress.zig"),
-        .target = target,
-        .optimize = optimize_mode,
-    });
-    stress_mod.addImport("heap", heap);
-    stress_mod.addImport("java_thread", java_thread);
-    const stress_exe = b.addExecutable(.{ .name = "concurrent_gc_thread_stress", .root_module = stress_mod });
-    b.installArtifact(stress_exe);
-
-    const run_stress_exe = b.addRunArtifact(stress_exe);
-    run_stress_exe.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_stress_exe.addArgs(args);
-    const run_stress_step = b.step("run-stress", "Run the real-world concurrent GC + JavaThread stress test");
-    run_stress_step.dependOn(&run_stress_exe.step);
-
-    const chaos_mod = b.createModule(.{
-        .root_source_file = b.path("src/examples/chaos_concurrent_vm_stress.zig"),
-        .target = target,
-        .optimize = optimize_mode,
-    });
-    chaos_mod.addImport("heap", heap);
-    chaos_mod.addImport("java_thread", java_thread);
-    const chaos_exe = b.addExecutable(.{ .name = "chaos_concurrent_vm_stress", .root_module = chaos_mod });
-    b.installArtifact(chaos_exe);
-
-    const run_chaos_exe = b.addRunArtifact(chaos_exe);
-    run_chaos_exe.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_chaos_exe.addArgs(args);
-    const run_chaos_step = b.step("run-chaos", "Run the Aether VM Chaos Stress Engine benchmark");
-    run_chaos_step.dependOn(&run_chaos_exe.step);
-
-    const titan_mod = b.createModule(.{
-        .root_source_file = b.path("src/examples/titan_concurrent_gc_engine.zig"),
-        .target = target,
-        .optimize = optimize_mode,
-    });
-    titan_mod.addImport("heap", heap);
-    titan_mod.addImport("java_thread", java_thread);
-    titan_mod.addImport("interpreter", interpreter);
-    const titan_exe = b.addExecutable(.{ .name = "titan_concurrent_gc_engine", .root_module = titan_mod });
-    b.installArtifact(titan_exe);
-
-    const run_titan_exe = b.addRunArtifact(titan_exe);
-    run_titan_exe.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_titan_exe.addArgs(args);
-    const run_titan_step = b.step("run-titan", "Run the Titan VM Distributed Banking & Complex Graph Stress Engine");
-    run_titan_step.dependOn(&run_titan_exe.step);
-
-    const runner50x_mod = b.createModule(.{
-        .root_source_file = b.path("src/examples/run_all_50x.zig"),
-        .target = target,
-        .optimize = optimize_mode,
-    });
-    const runner50x_exe = b.addExecutable(.{ .name = "run_all_50x", .root_module = runner50x_mod });
-    b.installArtifact(runner50x_exe);
-
-    const run50x_cmd = b.addRunArtifact(runner50x_exe);
-    run50x_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run50x_cmd.addArgs(args);
-    const run50x_step = b.step("run-50x", "Run all 4 stress & unit test suites 50 times each with strict timeouts");
-    run50x_step.dependOn(&run50x_cmd.step);
 
     const test_step = b.step("test", "Run tests");
     addModuleTest(b, test_step, root_mod, test_filters);
