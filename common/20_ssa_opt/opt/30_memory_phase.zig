@@ -146,8 +146,16 @@ fn isArrayAllocation(inst: Instruction) bool {
 
 fn instanceLoad(op: ssa.Operation) ?MemKey {
     return switch (op.inst) {
-        .iget, .iget_wide, .iget_object, .iget_boolean, .iget_byte, .iget_char, .iget_short,
-        .iget_quick, .iget_wide_quick, .iget_object_quick,
+        .iget,
+        .iget_wide,
+        .iget_object,
+        .iget_boolean,
+        .iget_byte,
+        .iget_char,
+        .iget_short,
+        .iget_quick,
+        .iget_wide_quick,
+        .iget_object_quick,
         => |inst| if (op.uses.len >= 1) .{ .kind = .instance, .base = op.uses[0], .field = inst.field_idx } else null,
         else => null,
     };
@@ -155,7 +163,13 @@ fn instanceLoad(op: ssa.Operation) ?MemKey {
 
 fn staticLoad(op: ssa.Operation) ?MemKey {
     return switch (op.inst) {
-        .sget, .sget_wide, .sget_object, .sget_boolean, .sget_byte, .sget_char, .sget_short,
+        .sget,
+        .sget_wide,
+        .sget_object,
+        .sget_boolean,
+        .sget_byte,
+        .sget_char,
+        .sget_short,
         => |inst| .{ .kind = .static, .base = 0, .field = inst.field_idx },
         else => null,
     };
@@ -163,8 +177,14 @@ fn staticLoad(op: ssa.Operation) ?MemKey {
 
 fn instanceStore(op: ssa.Operation) ?StoreInfo {
     return switch (op.inst) {
-        .iput, .iput_object, .iput_boolean, .iput_byte, .iput_char, .iput_short,
-        .iput_quick, .iput_object_quick,
+        .iput,
+        .iput_object,
+        .iput_boolean,
+        .iput_byte,
+        .iput_char,
+        .iput_short,
+        .iput_quick,
+        .iput_object_quick,
         => |inst| if (op.uses.len >= 2) .{
             .key = .{ .kind = .instance, .base = op.uses[op.uses.len - 1], .field = inst.field_idx },
             .value = op.uses[0],
@@ -179,7 +199,12 @@ fn instanceStore(op: ssa.Operation) ?StoreInfo {
 
 fn staticStore(op: ssa.Operation) ?StoreInfo {
     return switch (op.inst) {
-        .sput, .sput_object, .sput_boolean, .sput_byte, .sput_char, .sput_short,
+        .sput,
+        .sput_object,
+        .sput_boolean,
+        .sput_byte,
+        .sput_char,
+        .sput_short,
         => |inst| if (op.uses.len >= 1) .{ .key = .{ .kind = .static, .base = 0, .field = inst.field_idx }, .value = op.uses[0] } else null,
         .sput_wide => |inst| if (op.uses.len >= 1) .{ .key = .{ .kind = .static, .base = 0, .field = inst.field_idx }, .value = op.uses[0] } else null,
         else => null,
@@ -236,10 +261,26 @@ fn allocationHasOnlyScalarUses(function: *const ssa.Function, values: []const Va
             for (op.uses) |use| {
                 if (use != allocation) continue;
                 switch (op.inst) {
-                    .iget, .iget_wide, .iget_object, .iget_boolean, .iget_byte, .iget_char, .iget_short,
-                    .iput, .iput_wide, .iput_object, .iput_boolean, .iput_byte, .iput_char, .iput_short,
-                    .iget_quick, .iget_wide_quick, .iget_object_quick,
-                    .iput_quick, .iput_wide_quick, .iput_object_quick,
+                    .iget,
+                    .iget_wide,
+                    .iget_object,
+                    .iget_boolean,
+                    .iget_byte,
+                    .iget_char,
+                    .iget_short,
+                    .iput,
+                    .iput_wide,
+                    .iput_object,
+                    .iput_boolean,
+                    .iput_byte,
+                    .iput_char,
+                    .iput_short,
+                    .iget_quick,
+                    .iget_wide_quick,
+                    .iget_object_quick,
+                    .iput_quick,
+                    .iput_wide_quick,
+                    .iput_object_quick,
                     .check_cast,
                     => {},
                     else => return false,
@@ -255,8 +296,14 @@ pub fn run(
     function: *const ssa.Function,
     types: *const typedir.Function,
 ) Error!Result {
-    function.verify() catch return error.InvalidInput;
-    types.verify() catch return error.InvalidInput;
+    function.verify() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidInput,
+    };
+    types.verify() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidInput,
+    };
     if (types.source != function) return error.InvalidInput;
 
     const values = try allocator.alloc(ValueInfo, function.values.len);

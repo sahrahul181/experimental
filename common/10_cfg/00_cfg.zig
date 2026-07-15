@@ -412,7 +412,6 @@ fn finishGraph(
 
     const keep_count = if (options.prune_unreachable) postorder.items.len else old_blocks.len;
     const order = try allocator.alloc(BlockId, keep_count);
-    errdefer allocator.free(order);
     defer allocator.free(order);
 
     if (options.order == .rpo) {
@@ -475,13 +474,14 @@ fn finishGraph(
         }
     }
     for (order, 0..) |old_id, new_id| {
+        const adjacency = try allocateBlockAdjacency(allocator, succ_counts[new_id], pred_counts[new_id]);
         blocks[new_id] = .{
             .id = @intCast(new_id),
             .start = old_blocks[old_id].start,
             .end = old_blocks[old_id].end,
             .rpo_index = if (options.order == .rpo) @intCast(new_id) else INVALID_BLOCK,
-            .successors = try allocator.alloc(BlockId, succ_counts[new_id]),
-            .predecessors = try allocator.alloc(BlockId, pred_counts[new_id]),
+            .successors = adjacency.successors,
+            .predecessors = adjacency.predecessors,
         };
         allocated_blocks += 1;
     }
@@ -544,6 +544,22 @@ pub fn buildWithTries(allocator: std.mem.Allocator, insts: []const Instruction, 
     return buildWithOptions(allocator, insts, tries, .{});
 }
 
+const BlockAdjacency = struct {
+    successors: []BlockId,
+    predecessors: []BlockId,
+};
+
+fn allocateBlockAdjacency(
+    allocator: std.mem.Allocator,
+    successor_count: usize,
+    predecessor_count: usize,
+) std.mem.Allocator.Error!BlockAdjacency {
+    const successors = try allocator.alloc(BlockId, successor_count);
+    errdefer allocator.free(successors);
+    const predecessors = try allocator.alloc(BlockId, predecessor_count);
+    return .{ .successors = successors, .predecessors = predecessors };
+}
+
 pub fn buildWithOptions(allocator: std.mem.Allocator, insts: []const Instruction, tries: []const TryBlock, options: Options) Error!Graph {
     if (insts.len == 0) return error.EmptyInstructionStream;
     if (insts.len > std.math.maxInt(u32)) return error.BadBranchTarget;
@@ -595,8 +611,9 @@ pub fn buildWithOptions(allocator: std.mem.Allocator, insts: []const Instruction
     }
 
     const old_blocks = try allocator.alloc(BasicBlock, raw_count);
+    var allocated_blocks: usize = 0;
     defer {
-        for (old_blocks) |block| {
+        for (old_blocks[0..allocated_blocks]) |block| {
             allocator.free(block.successors);
             allocator.free(block.predecessors);
         }
@@ -623,21 +640,15 @@ pub fn buildWithOptions(allocator: std.mem.Allocator, insts: []const Instruction
         }
     }
 
-    var allocated_blocks: usize = 0;
-    errdefer {
-        for (old_blocks[0..allocated_blocks]) |block| {
-            allocator.free(block.successors);
-            allocator.free(block.predecessors);
-        }
-    }
     for (raw_blocks[0..raw_count], 0..) |raw, id| {
+        const adjacency = try allocateBlockAdjacency(allocator, succ_counts[id], pred_counts[id]);
         old_blocks[id] = .{
             .id = @intCast(id),
             .start = raw.start,
             .end = raw.end,
             .rpo_index = INVALID_BLOCK,
-            .successors = try allocator.alloc(BlockId, succ_counts[id]),
-            .predecessors = try allocator.alloc(BlockId, pred_counts[id]),
+            .successors = adjacency.successors,
+            .predecessors = adjacency.predecessors,
         };
         allocated_blocks += 1;
     }

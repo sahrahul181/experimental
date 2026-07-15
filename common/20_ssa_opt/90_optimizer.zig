@@ -15,8 +15,10 @@ const typedir = @import("typedir");
 const typed_ir = @import("typed_ir");
 const loop_phase = @import("loop_phase");
 const memory_phase = @import("memory_phase");
+const barrier_phase = @import("barrier_phase");
 const lowering = @import("lowering");
 const machine_bridge = @import("machine_bridge");
+const derived_verify = @import("derived_verify");
 const instmod = @import("instructions");
 const Instruction = instmod.Instruction;
 const TryBlock = instmod.TryBlock;
@@ -102,6 +104,10 @@ pub const PipelineStats = struct {
     ssa_dead_ops: u32 = 0,
     loop_count: u32 = 0,
     memory_forwarded: u32 = 0,
+    handle_resolves: u32 = 0,
+    handle_resolve_reuses: u32 = 0,
+    loop_resolves_hoisted: u32 = 0,
+    derived_address_uses: u32 = 0,
     machine_insts: u32 = 0,
     machine_edge_moves: u32 = 0,
 };
@@ -118,13 +124,17 @@ pub const OptimizedFunction = struct {
     typed: typed_ir.Function,
     loops: loop_phase.Result,
     memory: memory_phase.Result,
+    barriers: barrier_phase.Result,
     lowered: lowering.Function,
     machine: machine_bridge.Function,
+    derived: derived_verify.Result,
     stats: PipelineStats,
 
     pub fn deinit(self: *OptimizedFunction) void {
+        self.derived.deinit();
         self.machine.deinit();
         self.lowered.deinit();
+        self.barriers.deinit();
         self.memory.deinit();
         self.loops.deinit();
         self.typed.deinit();
@@ -135,12 +145,13 @@ pub const OptimizedFunction = struct {
         self.tree.deinit();
         self.rewritten_cfg.deinit();
         self.original_cfg.deinit();
-        self.* = undefined;
+        const allocator = self.allocator;
+        allocator.destroy(self);
     }
 
     pub fn print(self: *const OptimizedFunction, writer: anytype) !void {
         try writer.print(
-            "optimizer_pipeline original_blocks={d} rewritten_blocks={d} lowered_insts={d} machine_insts={d} machine_edge_moves={d} cfg_removed={d} cfg_merged={d} ssa_constants={d} ssa_dead_ops={d} loops={d} memory_forwarded={d}\n",
+            "optimizer_pipeline original_blocks={d} rewritten_blocks={d} lowered_insts={d} machine_insts={d} machine_edge_moves={d} cfg_removed={d} cfg_merged={d} ssa_constants={d} ssa_dead_ops={d} loops={d} memory_forwarded={d} handle_resolves={d} handle_resolve_reuses={d} loop_resolve_hoists={d} derived_address_uses={d}\n",
             .{
                 self.stats.original_blocks,
                 self.stats.rewritten_blocks,
@@ -153,6 +164,10 @@ pub const OptimizedFunction = struct {
                 self.stats.ssa_dead_ops,
                 self.stats.loop_count,
                 self.stats.memory_forwarded,
+                self.stats.handle_resolves,
+                self.stats.handle_resolve_reuses,
+                self.stats.loop_resolves_hoisted,
+                self.stats.derived_address_uses,
             },
         );
         try writer.print("\n-- cfg rewrite --\n", .{});
@@ -167,10 +182,14 @@ pub const OptimizedFunction = struct {
         try self.loops.print(writer);
         try writer.print("\n-- memory --\n", .{});
         try self.memory.print(writer);
+        try writer.print("\n-- barriers --\n", .{});
+        try self.barriers.print(writer);
         try writer.print("\n-- lowering --\n", .{});
         try self.lowered.print(writer);
         try writer.print("\n-- machine bridge --\n", .{});
         try self.machine.print(writer);
+        try writer.print("\n-- derived pointer verification --\n", .{});
+        try self.derived.print(writer);
     }
 };
 
@@ -478,8 +497,17 @@ fn deriveOperationFacts(facts: []ValueFact, op: ssa.Operation) ?Constant {
             }
             return folded;
         },
-        .add_int, .sub_int, .mul_int, .div_int, .rem_int,
-        .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int,
+        .add_int,
+        .sub_int,
+        .mul_int,
+        .div_int,
+        .rem_int,
+        .and_int,
+        .or_int,
+        .xor_int,
+        .shl_int,
+        .shr_int,
+        .ushr_int,
         => {
             if (op.uses.len < 2 or op.defs.len < 1) return null;
             const a = intConst(facts, op.uses[0]) orelse return null;
@@ -488,8 +516,14 @@ fn deriveOperationFacts(facts: []ValueFact, op: ssa.Operation) ?Constant {
             facts[op.defs[0]] = .{ .ty = .int, .constant = .{ .int = folded } };
             return .{ .int = folded };
         },
-        .add_long, .sub_long, .mul_long, .div_long, .rem_long,
-        .and_long, .or_long, .xor_long,
+        .add_long,
+        .sub_long,
+        .mul_long,
+        .div_long,
+        .rem_long,
+        .and_long,
+        .or_long,
+        .xor_long,
         => {
             if (op.uses.len < 3 or op.defs.len < 1) return null;
             const a = wideConst(facts, op.uses[0]) orelse return null;
@@ -498,8 +532,14 @@ fn deriveOperationFacts(facts: []ValueFact, op: ssa.Operation) ?Constant {
             for (op.defs) |def| facts[def] = .{ .ty = .long, .constant = .{ .wide = folded } };
             return .{ .wide = folded };
         },
-        .add_int_lit16, .rsub_int_lit16, .mul_int_lit16, .div_int_lit16,
-        .rem_int_lit16, .and_int_lit16, .or_int_lit16, .xor_int_lit16,
+        .add_int_lit16,
+        .rsub_int_lit16,
+        .mul_int_lit16,
+        .div_int_lit16,
+        .rem_int_lit16,
+        .and_int_lit16,
+        .or_int_lit16,
+        .xor_int_lit16,
         => |inst| {
             if (op.uses.len < 1 or op.defs.len < 1) return null;
             const a = intConst(facts, op.uses[0]) orelse return null;
@@ -507,9 +547,17 @@ fn deriveOperationFacts(facts: []ValueFact, op: ssa.Operation) ?Constant {
             facts[op.defs[0]] = .{ .ty = .int, .constant = .{ .int = folded } };
             return .{ .int = folded };
         },
-        .add_int_lit8, .rsub_int_lit8, .mul_int_lit8, .div_int_lit8,
-        .rem_int_lit8, .and_int_lit8, .or_int_lit8, .xor_int_lit8,
-        .shl_int_lit8, .shr_int_lit8, .ushr_int_lit8,
+        .add_int_lit8,
+        .rsub_int_lit8,
+        .mul_int_lit8,
+        .div_int_lit8,
+        .rem_int_lit8,
+        .and_int_lit8,
+        .or_int_lit8,
+        .xor_int_lit8,
+        .shl_int_lit8,
+        .shr_int_lit8,
+        .ushr_int_lit8,
         => |inst| {
             if (op.uses.len < 1 or op.defs.len < 1) return null;
             const a = intConst(facts, op.uses[0]) orelse return null;
@@ -590,7 +638,10 @@ fn computeLiveness(
 }
 
 pub fn run(allocator: std.mem.Allocator, function: *const ssa.Function, options: Options) Error!Result {
-    function.verify() catch return error.InvalidSsa;
+    function.verify() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSsa,
+    };
 
     const facts = try allocator.alloc(ValueFact, function.values.len);
     errdefer allocator.free(facts);
@@ -673,77 +724,81 @@ pub fn optimize(
     insts: []const Instruction,
     tries: []const TryBlock,
     options: OptimizeOptions,
-) !OptimizedFunction {
-    var original_cfg = try cfg.buildWithOptions(allocator, insts, tries, options.cfg_options);
-    errdefer original_cfg.deinit();
+) !*OptimizedFunction {
+    const self = try allocator.create(OptimizedFunction);
+    errdefer allocator.destroy(self);
 
-    var rewritten_cfg = try cfg_rewrite.rewrite(allocator, &original_cfg, options.rewrite_options);
-    errdefer rewritten_cfg.deinit();
+    self.original_cfg = try cfg.buildWithOptions(allocator, insts, tries, options.cfg_options);
+    errdefer self.original_cfg.deinit();
 
-    var tree = try dom.build(allocator, &rewritten_cfg.graph);
-    errdefer tree.deinit();
+    self.rewritten_cfg = try cfg_rewrite.rewrite(allocator, &self.original_cfg, options.rewrite_options);
+    errdefer self.rewritten_cfg.deinit();
 
-    var function = try ssa.build(allocator, &rewritten_cfg.graph, &tree);
-    errdefer function.deinit();
+    self.tree = try dom.build(allocator, &self.rewritten_cfg.graph);
+    errdefer self.tree.deinit();
 
-    var ssa_facts = try ssa_phase.run(allocator, &function);
-    errdefer ssa_facts.deinit();
+    self.function = try ssa.build(allocator, &self.rewritten_cfg.graph, &self.tree);
+    errdefer self.function.deinit();
 
-    var facts = try run(allocator, &function, options.facts);
-    errdefer facts.deinit();
+    self.ssa_facts = try ssa_phase.run(allocator, &self.function);
+    errdefer self.ssa_facts.deinit();
 
-    var types = try typedir.build(allocator, &function);
-    errdefer types.deinit();
+    self.facts = try run(allocator, &self.function, options.facts);
+    errdefer self.facts.deinit();
 
-    var typed = try typed_ir.build(allocator, &function, &types, &facts);
-    errdefer typed.deinit();
+    self.types = try typedir.build(allocator, &self.function);
+    errdefer self.types.deinit();
 
-    var loops = try loop_phase.run(allocator, &function, &tree, &ssa_facts);
-    errdefer loops.deinit();
+    self.typed = try typed_ir.build(allocator, &self.function, &self.types, &self.facts);
+    errdefer self.typed.deinit();
 
-    var memory = try memory_phase.run(allocator, &function, &types);
-    errdefer memory.deinit();
+    self.loops = try loop_phase.run(allocator, &self.function, &self.tree, &self.ssa_facts);
+    errdefer self.loops.deinit();
 
-    var lowered = try lowering.build(allocator, .{
-        .function = &function,
-        .types = &types,
-        .typed = &typed,
-        .ssa_facts = &ssa_facts,
-        .memory = &memory,
+    self.memory = try memory_phase.run(allocator, &self.function, &self.types);
+    errdefer self.memory.deinit();
+
+    self.barriers = try barrier_phase.runWithOptions(allocator, &self.function, &self.types, .{
+        .loops = &self.loops,
     });
-    errdefer lowered.deinit();
+    errdefer self.barriers.deinit();
 
-    var machine = try machine_bridge.build(allocator, &lowered);
-    errdefer machine.deinit();
+    self.lowered = try lowering.build(allocator, .{
+        .function = &self.function,
+        .types = &self.types,
+        .typed = &self.typed,
+        .ssa_facts = &self.ssa_facts,
+        .memory = &self.memory,
+        .barriers = &self.barriers,
+    });
+    errdefer self.lowered.deinit();
 
-    return .{
-        .allocator = allocator,
-        .original_cfg = original_cfg,
-        .rewritten_cfg = rewritten_cfg,
-        .tree = tree,
-        .function = function,
-        .ssa_facts = ssa_facts,
-        .facts = facts,
-        .types = types,
-        .typed = typed,
-        .loops = loops,
-        .memory = memory,
-        .lowered = lowered,
-        .machine = machine,
-        .stats = .{
-            .original_blocks = @intCast(original_cfg.blocks.len),
-            .rewritten_blocks = @intCast(rewritten_cfg.graph.blocks.len),
-            .lowered_insts = lowered.stats.lowered,
-            .cfg_removed_blocks = rewritten_cfg.stats.removed_blocks,
-            .cfg_merged_blocks = rewritten_cfg.stats.merged_blocks,
-            .ssa_constants = ssa_facts.stats.constants,
-            .ssa_dead_ops = ssa_facts.stats.dead_ops,
-            .loop_count = loops.stats.loops,
-            .memory_forwarded = memory.stats.forwarded_fields,
-            .machine_insts = machine.stats.instructions,
-            .machine_edge_moves = machine.stats.edge_moves,
-        },
+    self.machine = try machine_bridge.build(allocator, &self.lowered);
+    errdefer self.machine.deinit();
+
+    self.derived = try derived_verify.run(allocator, &self.machine);
+    errdefer self.derived.deinit();
+
+    self.allocator = allocator;
+    self.stats = .{
+        .original_blocks = @intCast(self.original_cfg.blocks.len),
+        .rewritten_blocks = @intCast(self.rewritten_cfg.graph.blocks.len),
+        .lowered_insts = self.lowered.stats.lowered,
+        .cfg_removed_blocks = self.rewritten_cfg.stats.removed_blocks,
+        .cfg_merged_blocks = self.rewritten_cfg.stats.merged_blocks,
+        .ssa_constants = self.ssa_facts.stats.constants,
+        .ssa_dead_ops = self.ssa_facts.stats.dead_ops,
+        .loop_count = self.loops.stats.loops,
+        .memory_forwarded = self.memory.stats.forwarded_fields,
+        .handle_resolves = self.barriers.stats.resolves_inserted,
+        .handle_resolve_reuses = self.barriers.stats.resolves_reused,
+        .loop_resolves_hoisted = self.barriers.stats.loop_resolves_hoisted,
+        .derived_address_uses = self.derived.stats.address_uses,
+        .machine_insts = self.machine.stats.instructions,
+        .machine_edge_moves = self.machine.stats.edge_moves,
     };
+
+    return self;
 }
 
 test "optimizer folds integer constants through SSA values" {
@@ -868,10 +923,283 @@ test "optimizer orchestrates full pipeline into lowered IR" {
 
     try optimized.lowered.verify();
     try optimized.machine.verify();
+    try optimized.derived.verify();
     try std.testing.expect(optimized.stats.lowered_insts > 0);
     try std.testing.expect(optimized.stats.machine_insts > 0);
     try std.testing.expect(optimized.lowered.stats.null_checks_elided >= 1);
     try std.testing.expect(optimized.lowered.stats.bounds_checks_elided >= 1);
+}
+
+test "optimizer pipeline owns and verifies relocation barrier plan" {
+    const insts = [_]Instruction{
+        .{ .const_string = .{ .dest = 0, .index = 1 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 1, .obj = 0 } },
+        .{ .iget = .{ .field_idx = 2, .dest_or_src = 2, .obj = 0 } },
+        .return_void,
+    };
+    var optimized = try optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+
+    try optimized.barriers.verify();
+    try optimized.lowered.verify();
+    try optimized.machine.verify();
+    try std.testing.expectEqual(@as(u32, 1), optimized.stats.handle_resolves);
+    try std.testing.expectEqual(@as(u32, 1), optimized.stats.handle_resolve_reuses);
+    try std.testing.expectEqual(@as(u32, 1), optimized.lowered.stats.handle_resolves);
+    try std.testing.expectEqual(@as(u32, 2), optimized.lowered.stats.pointer_accesses);
+    try std.testing.expectEqual(@as(u32, 1), optimized.machine.stats.resolves);
+    try std.testing.expectEqual(@as(u32, 2), optimized.machine.stats.pointer_accesses);
+    try std.testing.expectEqual(@as(u32, 2), optimized.derived.stats.address_uses);
+    try std.testing.expectEqual(@as(usize, 1), optimized.lowered.resolve_values.len);
+
+    const address = optimized.lowered.resolve_values[0];
+    const handle = optimized.barriers.resolves[0].handle;
+    try std.testing.expect(optimized.lowered.isGcRoot(handle));
+    try std.testing.expect(!optimized.lowered.isGcRoot(address));
+    try std.testing.expect(optimized.machine.isGcRoot(handle));
+    try std.testing.expect(!optimized.machine.isGcRoot(address));
+
+    var resolves: u32 = 0;
+    var pointer_accesses: u32 = 0;
+    for (optimized.lowered.blocks) |block| {
+        for (block.insts) |inst| switch (inst.kind) {
+            .resolve_handle => {
+                resolves += 1;
+                try std.testing.expectEqual(address, inst.defs[0]);
+                try std.testing.expectEqual(@as(?lowering.RuntimeValueId, handle), inst.state_handle);
+            },
+            .field_load_ptr => {
+                pointer_accesses += 1;
+                try std.testing.expectEqual(@as(?lowering.RuntimeValueId, address), inst.address);
+                try std.testing.expectEqual(@as(?lowering.RuntimeValueId, handle), inst.state_handle);
+                try std.testing.expectEqual(@as(usize, 0), inst.uses.len);
+            },
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(u32, 1), resolves);
+    try std.testing.expectEqual(@as(u32, 2), pointer_accesses);
+}
+
+test "optimizer materializes guarded reference write barriers around pointer stores" {
+    const insts = [_]Instruction{
+        .{ .const_string = .{ .dest = 0, .index = 1 } },
+        .{ .const_string = .{ .dest = 1, .index = 2 } },
+        .{ .iput_object = .{ .field_idx = 3, .dest_or_src = 1, .obj = 0 } },
+        .return_void,
+    };
+    var optimized = try optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+
+    try optimized.lowered.verify();
+    try optimized.machine.verify();
+    try std.testing.expectEqual(@as(u32, 1), optimized.lowered.stats.handle_resolves);
+    try std.testing.expectEqual(@as(u32, 1), optimized.lowered.stats.pointer_accesses);
+    try std.testing.expectEqual(@as(u32, 1), optimized.lowered.stats.satb_barriers);
+    try std.testing.expectEqual(@as(u32, 1), optimized.lowered.stats.card_barriers);
+
+    var sequence: [4]lowering.Kind = undefined;
+    var count: usize = 0;
+    for (optimized.lowered.blocks) |block| {
+        for (block.insts) |inst| switch (inst.kind) {
+            .resolve_handle, .satb_pre_write, .field_store_ptr, .card_mark => {
+                if (count >= sequence.len) return error.TestUnexpectedResult;
+                sequence[count] = inst.kind;
+                count += 1;
+            },
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 4), count);
+    try std.testing.expectEqualSlices(lowering.Kind, &.{ .resolve_handle, .satb_pre_write, .field_store_ptr, .card_mark }, &sequence);
+}
+
+test "optimizer hoists invariant handle resolution out of a no-safepoint loop" {
+    const insts = [_]Instruction{
+        .{ .const_ = .{ .dest = 1, .value = 2 } },
+        .{ .goto_ = .{ .offset = 1 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 2, .obj = 0 } },
+        .{ .if_eqz = .{ .src = 1, .offset = 3 } },
+        .{ .add_int_lit8 = .{ .dest = 1, .src = 1, .lit = -1 } },
+        .{ .goto_ = .{ .offset = -3 } },
+        .{ .return_ = .{ .src = 2 } },
+    };
+    var optimized = try optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), optimized.loops.stats.loops);
+    try std.testing.expectEqual(@as(u32, 1), optimized.stats.handle_resolves);
+    try std.testing.expectEqual(@as(u32, 1), optimized.stats.loop_resolves_hoisted);
+    const loop = optimized.loops.loops[0];
+    const preheader = loop.preheader orelse return error.TestUnexpectedResult;
+    const resolve = optimized.barriers.resolves[0];
+    try std.testing.expect(resolve.hoisted);
+    try std.testing.expectEqual(preheader, resolve.placement_block);
+    try std.testing.expectEqual(loop.header, resolve.loop_header.?);
+    try std.testing.expectEqual(loop.header, resolve.defining_op.block);
+    try std.testing.expectEqual(@as(u32, 0), resolve.defining_op.index);
+    switch (optimized.barriers.ops[loop.header][0].resolve) {
+        .reuse => |id| try std.testing.expectEqual(@as(u32, 0), id),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var preheader_resolves: u32 = 0;
+    var header_resolves: u32 = 0;
+    var resolve_before_jump = false;
+    for (optimized.machine.blocks[preheader].insts, 0..) |inst, index| {
+        if (inst.opcode != .resolve_handle) continue;
+        preheader_resolves += 1;
+        for (optimized.machine.blocks[preheader].insts[index + 1 ..]) |later| {
+            if (later.opcode == .jump) resolve_before_jump = true;
+        }
+    }
+    for (optimized.machine.blocks[loop.header].insts) |inst| {
+        if (inst.opcode == .resolve_handle) header_resolves += 1;
+    }
+    try std.testing.expectEqual(@as(u32, 1), preheader_resolves);
+    try std.testing.expectEqual(@as(u32, 0), header_resolves);
+    try std.testing.expect(resolve_before_jump);
+    try optimized.barriers.verify();
+    try optimized.machine.verify();
+    try optimized.derived.verify();
+
+    const proof_op = &optimized.barriers.ops[loop.header][1];
+    const old_kill = proof_op.relocation_kill;
+    proof_op.relocation_kill = true;
+    try std.testing.expectError(error.InvalidPlan, optimized.barriers.verify());
+    proof_op.relocation_kill = old_kill;
+}
+
+test "optimizer keeps loop resolution local when a safepoint can relocate" {
+    var invoke = instmod.Invoke{
+        .class_name = "LRuntime;",
+        .method_name = "poll",
+        .signature = "()V",
+        .dest = null,
+        .kind = .static,
+    };
+    const insts = [_]Instruction{
+        .{ .const_ = .{ .dest = 1, .value = 2 } },
+        .{ .goto_ = .{ .offset = 1 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 2, .obj = 0 } },
+        .{ .if_eqz = .{ .src = 1, .offset = 4 } },
+        .{ .invoke = &invoke },
+        .{ .add_int_lit8 = .{ .dest = 1, .src = 1, .lit = -1 } },
+        .{ .goto_ = .{ .offset = -4 } },
+        .{ .return_ = .{ .src = 2 } },
+    };
+    var optimized = try optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), optimized.loops.stats.loops);
+    try std.testing.expectEqual(@as(u32, 0), optimized.stats.loop_resolves_hoisted);
+    const loop = optimized.loops.loops[0];
+    const resolve = optimized.barriers.resolves[0];
+    try std.testing.expect(!resolve.hoisted);
+    try std.testing.expectEqual(loop.header, resolve.placement_block);
+    switch (optimized.barriers.ops[loop.header][0].resolve) {
+        .define => |id| try std.testing.expectEqual(@as(u32, 0), id),
+        else => return error.TestUnexpectedResult,
+    }
+    try optimized.barriers.verify();
+    try optimized.derived.verify();
+}
+
+test "derived verifier rejects an address use moved before its definition" {
+    const insts = [_]Instruction{
+        .{ .const_string = .{ .dest = 0, .index = 1 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 1, .obj = 0 } },
+        .return_void,
+    };
+    var optimized = try optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+
+    const block = &optimized.machine.blocks[optimized.machine.source.source.graph.entry];
+    var resolve_index: ?usize = null;
+    var access_index: ?usize = null;
+    for (block.insts, 0..) |inst, index| switch (inst.opcode) {
+        .resolve_handle => resolve_index = index,
+        .field_load_ptr => access_index = index,
+        else => {},
+    };
+    const resolve = resolve_index orelse return error.TestUnexpectedResult;
+    const access = access_index orelse return error.TestUnexpectedResult;
+    std.mem.swap(machine_bridge.Inst, &block.insts[resolve], &block.insts[access]);
+    defer std.mem.swap(machine_bridge.Inst, &block.insts[resolve], &block.insts[access]);
+
+    try optimized.machine.verify();
+    try std.testing.expectError(error.AddressDefinitionNotDominating, optimized.derived.verify());
+}
+
+test "derived verifier rejects reuse forged across a relocation kill" {
+    var invoke = instmod.Invoke{
+        .class_name = "LRuntime;",
+        .method_name = "pollingCall",
+        .signature = "()V",
+        .dest = null,
+        .kind = .static,
+    };
+    const insts = [_]Instruction{
+        .{ .const_string = .{ .dest = 0, .index = 1 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 1, .obj = 0 } },
+        .{ .invoke = &invoke },
+        .{ .iget = .{ .field_idx = 2, .dest_or_src = 2, .obj = 0 } },
+        .return_void,
+    };
+    var optimized = try optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+
+    var first: ?*machine_bridge.Inst = null;
+    var second: ?*machine_bridge.Inst = null;
+    for (optimized.machine.blocks) |*block| {
+        for (block.insts) |*inst| {
+            if (inst.opcode != .field_load_ptr) continue;
+            if (first == null) {
+                first = inst;
+            } else {
+                second = inst;
+            }
+        }
+    }
+    const before = first orelse return error.TestUnexpectedResult;
+    const after = second orelse return error.TestUnexpectedResult;
+    const saved_address = after.address;
+    const saved_token = after.reloc_token;
+    const saved_resolve = after.resolve_id;
+    defer {
+        after.address = saved_address;
+        after.reloc_token = saved_token;
+        after.resolve_id = saved_resolve;
+    }
+    after.address = before.address;
+    after.reloc_token = before.reloc_token;
+    after.resolve_id = before.resolve_id;
+
+    try optimized.machine.verify();
+    try std.testing.expectError(error.InvalidPlan, optimized.derived.verify());
+}
+
+fn optimizerAllocationFailureProbe(allocator: std.mem.Allocator, insts: []const Instruction) !void {
+    var optimized = try optimize(allocator, insts, &.{}, .{});
+    defer optimized.deinit();
+    try optimized.barriers.verify();
+}
+
+test "optimizer stable ownership is leak-free at every allocation failure" {
+    const insts = [_]Instruction{
+        .{ .const_ = .{ .dest = 1, .value = 2 } },
+        .{ .goto_ = .{ .offset = 1 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 2, .obj = 0 } },
+        .{ .if_eqz = .{ .src = 1, .offset = 3 } },
+        .{ .add_int_lit8 = .{ .dest = 1, .src = 1, .lit = -1 } },
+        .{ .goto_ = .{ .offset = -3 } },
+        .{ .return_ = .{ .src = 2 } },
+    };
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        optimizerAllocationFailureProbe,
+        .{&insts},
+    );
 }
 
 test "optimizer orchestrator applies cfg rewrite before SSA" {
@@ -903,6 +1231,7 @@ test "optimizer pipeline print helper emits stable summary" {
     const output = stream.buffered();
 
     try std.testing.expect(std.mem.indexOf(u8, output, "optimizer_pipeline") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "-- barriers --") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "-- lowering --") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "-- machine bridge --") != null);
 }

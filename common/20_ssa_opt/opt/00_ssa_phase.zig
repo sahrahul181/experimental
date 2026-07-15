@@ -420,7 +420,10 @@ fn computeValueNumbers(allocator: std.mem.Allocator, function: *const ssa.Functi
 }
 
 pub fn run(allocator: std.mem.Allocator, function: *const ssa.Function) Error!Result {
-    function.verify() catch return error.InvalidSsa;
+    function.verify() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSsa,
+    };
     const values = try allocator.alloc(ValueFact, function.values.len);
     errdefer allocator.free(values);
     @memset(values, .{});

@@ -14,6 +14,7 @@ const ssa = @import("ssa");
 const ssa_phase = @import("ssa_phase");
 const typed_ir = @import("typed_ir");
 const typedir = @import("typedir");
+const barrier_phase = @import("barrier_phase");
 const instmod = @import("instructions");
 const Instruction = instmod.Instruction;
 
@@ -56,10 +57,19 @@ pub const Opcode = enum(u8) {
     f64_op,
     check_null,
     check_bounds,
+    resolve_handle,
     array_load,
     array_store,
     field_load,
     field_store,
+    array_load_ptr,
+    array_store_ptr,
+    field_load_ptr,
+    field_store_ptr,
+    satb_pre_write,
+    card_mark,
+    static_satb_pre_write,
+    static_root_post_write,
     static_load,
     static_store,
     call_direct,
@@ -101,6 +111,12 @@ pub const Inst = struct {
     condition: ?Condition = null,
     imm: i64 = 0,
     field_idx: ?u32 = null,
+    address: ?RegId = null,
+    state_handle: ?RegId = null,
+    reloc_token: ?u32 = null,
+    resolve_id: ?u32 = null,
+    pre_write: barrier_phase.PreWriteBarrier = .none,
+    post_write: barrier_phase.PostWriteBarrier = .none,
     flags: Flags = .{},
 };
 
@@ -129,6 +145,8 @@ pub const Stats = struct {
     branches: u32 = 0,
     calls: u32 = 0,
     checks: u32 = 0,
+    resolves: u32 = 0,
+    pointer_accesses: u32 = 0,
     forwarded: u32 = 0,
     cse: u32 = 0,
 };
@@ -139,6 +157,7 @@ pub const Function = struct {
     blocks: []Block,
     edges: []EdgeMoves,
     reg_types: []typedir.Type,
+    runtime_values: []lowering.RuntimeValueClass,
     value_kinds: []ssa.ValueKind,
     successors: [][]cfg.BlockId,
     stats: Stats,
@@ -158,11 +177,12 @@ pub const Function = struct {
         }
         self.allocator.free(self.blocks);
         self.allocator.free(self.reg_types);
+        self.allocator.free(self.runtime_values);
         self.* = undefined;
     }
 
     pub fn verify(self: *const Function) VerifyError!void {
-        if (self.reg_types.len != self.value_kinds.len or self.successors.len != self.blocks.len) return error.InvalidLowering;
+        if (self.reg_types.len != self.runtime_values.len or self.value_kinds.len != self.source.source.values.len or self.successors.len != self.blocks.len) return error.InvalidLowering;
 
         var defined = try self.allocator.alloc(bool, self.reg_types.len);
         defer self.allocator.free(defined);
@@ -201,20 +221,101 @@ pub const Function = struct {
                     if (use >= self.reg_types.len) return error.BadRegister;
                     if (!defined[use]) return error.UndefinedRegister;
                 }
+                if (inst.address) |address| {
+                    if (address >= self.reg_types.len) return error.BadRegister;
+                    if (!defined[address]) return error.UndefinedRegister;
+                }
+                if (inst.state_handle) |handle| {
+                    if (handle >= self.reg_types.len) return error.BadRegister;
+                    if (!defined[handle]) return error.UndefinedRegister;
+                }
                 for (inst.defs) |def| if (def >= self.reg_types.len) return error.BadRegister;
+                for (inst.defs) |def| switch (self.runtime_values[def]) {
+                    .dalvik => {},
+                    .derived_ptr => if (inst.opcode != .resolve_handle) return error.BadInstruction,
+                };
                 switch (inst.opcode) {
                     .jump => if (inst.target == null) return error.BadInstruction,
                     .branch => if (inst.target == null or inst.false_target == null or inst.uses.len == 0 or inst.condition == null) return error.BadInstruction,
-                    .field_load, .field_store, .static_load, .static_store => if (inst.field_idx == null) return error.BadInstruction,
+                    .field_load, .field_store, .static_load, .static_store, .static_satb_pre_write, .static_root_post_write => if (inst.field_idx == null) return error.BadInstruction,
+                    .resolve_handle => try self.verifyResolve(inst),
+                    .check_bounds, .field_load_ptr, .field_store_ptr, .array_load_ptr, .array_store_ptr, .satb_pre_write, .card_mark => if (inst.address != null) try self.verifyAddress(inst),
+                    .call_direct, .call_static, .call_virtual, .call_quick => if (inst.address != null) try self.verifyAddress(inst),
                     else => {},
                 }
+                for (inst.uses) |use| switch (self.runtime_values[use]) {
+                    .dalvik => {},
+                    .derived_ptr => return error.BadInstruction,
+                };
+                const permits_address = switch (inst.opcode) {
+                    .field_load_ptr,
+                    .field_store_ptr,
+                    .array_load_ptr,
+                    .array_store_ptr,
+                    .check_bounds,
+                    .satb_pre_write,
+                    .card_mark,
+                    .call_direct,
+                    .call_static,
+                    .call_virtual,
+                    .call_quick,
+                    => true,
+                    else => false,
+                };
+                if (inst.address != null and !permits_address) return error.BadInstruction;
+                if (inst.address == null and inst.state_handle != null and inst.opcode != .resolve_handle) return error.BadInstruction;
+                if (inst.address == null and inst.opcode != .resolve_handle and (inst.reloc_token != null or inst.resolve_id != null)) return error.BadInstruction;
+                const is_pre_write = inst.opcode == .satb_pre_write or inst.opcode == .static_satb_pre_write;
+                const is_post_write = inst.opcode == .card_mark or inst.opcode == .static_root_post_write;
+                if (is_pre_write != (inst.pre_write != .none)) return error.BadInstruction;
+                if (is_post_write != (inst.post_write != .none)) return error.BadInstruction;
+                if (inst.opcode == .satb_pre_write) {
+                    if (inst.field_idx == null and inst.uses.len != 1) return error.BadInstruction;
+                    if (inst.field_idx != null and inst.uses.len != 0) return error.BadInstruction;
+                }
+                if (inst.opcode == .static_satb_pre_write and (inst.uses.len != 0 or inst.pre_write != .satb_guarded)) return error.BadInstruction;
+                if (inst.opcode == .static_root_post_write and (inst.uses.len != 1 or inst.post_write != .root_guarded)) return error.BadInstruction;
             }
         }
     }
 
+    fn verifyResolve(self: *const Function, inst: Inst) VerifyError!void {
+        if (inst.defs.len != 1 or inst.uses.len != 1 or inst.address != null or inst.state_handle == null or inst.reloc_token == null or inst.resolve_id == null) return error.BadInstruction;
+        if (inst.state_handle.? != inst.uses[0]) return error.BadInstruction;
+        if (!self.isGcRoot(inst.state_handle.?)) return error.BadInstruction;
+        switch (self.runtime_values[inst.defs[0]]) {
+            .derived_ptr => |ptr| if (ptr.handle != inst.uses[0] or ptr.token != inst.reloc_token.? or ptr.resolve != inst.resolve_id.?) return error.BadInstruction,
+            .dalvik => return error.BadInstruction,
+        }
+    }
+
+    fn verifyAddress(self: *const Function, inst: Inst) VerifyError!void {
+        if ((inst.opcode == .field_load_ptr or inst.opcode == .field_store_ptr) and inst.field_idx == null) return error.BadInstruction;
+        const address = inst.address orelse return error.BadInstruction;
+        const handle = inst.state_handle orelse return error.BadInstruction;
+        const token = inst.reloc_token orelse return error.BadInstruction;
+        const resolve_id = inst.resolve_id orelse return error.BadInstruction;
+        if (!self.isGcRoot(handle)) return error.BadInstruction;
+        switch (self.runtime_values[address]) {
+            .derived_ptr => |ptr| {
+                if (ptr.token != token or ptr.resolve != resolve_id) return error.BadInstruction;
+                switch (self.runtime_values[handle]) {
+                    .dalvik => |value| if (value.value != ptr.handle) return error.BadInstruction,
+                    .derived_ptr => return error.BadInstruction,
+                }
+            },
+            .dalvik => return error.BadInstruction,
+        }
+    }
+
+    pub fn isGcRoot(self: *const Function, reg: RegId) bool {
+        if (reg >= self.runtime_values.len) return false;
+        return self.runtime_values[reg].isGcRoot();
+    }
+
     pub fn print(self: *const Function, writer: anytype) !void {
         try writer.print(
-            "machine_bridge blocks={d} regs={d} insts={d} edge_moves={d} consts={d} branches={d} calls={d} checks={d} forwarded={d} cse={d}\n",
+            "machine_bridge blocks={d} regs={d} insts={d} edge_moves={d} consts={d} branches={d} calls={d} checks={d} resolves={d} ptr_accesses={d} forwarded={d} cse={d}\n",
             .{
                 self.stats.blocks,
                 self.reg_types.len,
@@ -224,6 +325,8 @@ pub const Function = struct {
                 self.stats.branches,
                 self.stats.calls,
                 self.stats.checks,
+                self.stats.resolves,
+                self.stats.pointer_accesses,
                 self.stats.forwarded,
                 self.stats.cse,
             },
@@ -250,6 +353,10 @@ pub const Function = struct {
                 if (inst.false_target) |target| try writer.print(" false=b{d}", .{target});
                 if (inst.condition) |condition| try writer.print(" cond={s}", .{@tagName(condition)});
                 if (inst.field_idx) |field| try writer.print(" field={d}", .{field});
+                if (inst.address) |address| try writer.print(" address=r{d}", .{address});
+                if (inst.state_handle) |handle| try writer.print(" state=r{d}", .{handle});
+                if (inst.reloc_token) |token| try writer.print(" token={d}", .{token});
+                if (inst.resolve_id) |resolve| try writer.print(" resolve={d}", .{resolve});
                 if (inst.imm != 0 or inst.opcode == .const_i32 or inst.opcode == .const_i64) try writer.print(" imm={d}", .{inst.imm});
                 if (inst.flags.null_check_elided) try writer.print(" null_elided", .{});
                 if (inst.flags.bounds_check_elided) try writer.print(" bounds_elided", .{});
@@ -296,10 +403,19 @@ fn mapOpcode(kind: lowering.Kind) ?Opcode {
         .f64_op => .f64_op,
         .check_null => .check_null,
         .check_bounds => .check_bounds,
+        .resolve_handle => .resolve_handle,
         .array_load => .array_load,
         .array_store => .array_store,
         .field_load => .field_load,
         .field_store => .field_store,
+        .array_load_ptr => .array_load_ptr,
+        .array_store_ptr => .array_store_ptr,
+        .field_load_ptr => .field_load_ptr,
+        .field_store_ptr => .field_store_ptr,
+        .satb_pre_write => .satb_pre_write,
+        .card_mark => .card_mark,
+        .static_satb_pre_write => .static_satb_pre_write,
+        .static_root_post_write => .static_root_post_write,
         .static_load => .static_load,
         .static_store => .static_store,
         .call_direct => .call_direct,
@@ -320,6 +436,32 @@ fn toRegs(allocator: std.mem.Allocator, values: []const lowering.ValueId) ![]Reg
     const regs = try allocator.alloc(RegId, values.len);
     for (values, 0..) |value, i| regs[i] = value;
     return regs;
+}
+
+const OwnedRegs = struct {
+    defs: []RegId,
+    uses: []RegId,
+};
+
+fn ownRegs(
+    allocator: std.mem.Allocator,
+    defs: []const lowering.ValueId,
+    uses: []const lowering.ValueId,
+) !OwnedRegs {
+    const owned_defs = try toRegs(allocator, defs);
+    errdefer allocator.free(owned_defs);
+    return .{
+        .defs = owned_defs,
+        .uses = try toRegs(allocator, uses),
+    };
+}
+
+fn appendInst(allocator: std.mem.Allocator, list: *std.ArrayList(Inst), inst: Inst) !void {
+    list.append(allocator, inst) catch |err| {
+        allocator.free(inst.defs);
+        allocator.free(inst.uses);
+        return err;
+    };
 }
 
 fn flagsFrom(inst: lowering.Inst) Flags {
@@ -360,6 +502,8 @@ fn updateStats(inst: Inst, stats: *Stats) void {
         .jump, .branch, .switch_ => stats.branches += 1,
         .call_direct, .call_static, .call_virtual, .call_quick => stats.calls += 1,
         .check_null, .check_bounds => stats.checks += 1,
+        .resolve_handle => stats.resolves += 1,
+        .array_load_ptr, .array_store_ptr, .field_load_ptr, .field_store_ptr => stats.pointer_accesses += 1,
         else => {},
     }
     if (inst.flags.forwarded) stats.forwarded += 1;
@@ -367,10 +511,15 @@ fn updateStats(inst: Inst, stats: *Stats) void {
 }
 
 pub fn build(allocator: std.mem.Allocator, source: *const lowering.Function) Error!Function {
-    source.verify() catch return error.InvalidLowering;
+    source.verify() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidLowering,
+    };
 
     const reg_types = try allocator.dupe(typedir.Type, source.value_types);
     errdefer allocator.free(reg_types);
+    const runtime_values = try allocator.dupe(lowering.RuntimeValueClass, source.runtime_values);
+    errdefer allocator.free(runtime_values);
 
     const value_kinds = try allocator.alloc(ssa.ValueKind, source.source.values.len);
     errdefer allocator.free(value_kinds);
@@ -462,19 +611,26 @@ pub fn build(allocator: std.mem.Allocator, source: *const lowering.Function) Err
 
         for (block.insts) |lowered| {
             const opcode = mapOpcode(lowered.kind) orelse continue;
+            const regs = try ownRegs(allocator, lowered.defs, lowered.uses);
             const inst = Inst{
                 .opcode = opcode,
                 .pc = lowered.pc,
-                .defs = try toRegs(allocator, lowered.defs),
-                .uses = try toRegs(allocator, lowered.uses),
+                .defs = regs.defs,
+                .uses = regs.uses,
                 .target = lowered.target,
                 .false_target = lowered.false_target,
                 .condition = if (opcode == .branch) conditionForLowered(source, lowered) else null,
                 .imm = lowered.imm,
                 .field_idx = lowered.field_idx,
+                .address = lowered.address,
+                .state_handle = lowered.state_handle,
+                .reloc_token = lowered.reloc_token,
+                .resolve_id = lowered.resolve_id,
+                .pre_write = lowered.pre_write,
+                .post_write = lowered.post_write,
                 .flags = flagsFrom(lowered),
             };
-            try list.append(allocator, inst);
+            try appendInst(allocator, &list, inst);
             updateStats(inst, &stats);
         }
 
@@ -488,6 +644,7 @@ pub fn build(allocator: std.mem.Allocator, source: *const lowering.Function) Err
         .blocks = blocks,
         .edges = edges,
         .reg_types = reg_types,
+        .runtime_values = runtime_values,
         .value_kinds = value_kinds,
         .successors = successors,
         .stats = stats,

@@ -149,7 +149,10 @@ fn findPreheader(graph: *const cfg.Graph, loop_blocks: []const cfg.BlockId, head
         if (found != null) return null;
         found = pred;
     }
-    return found;
+    const preheader = found orelse return null;
+    const successors = graph.blocks[preheader].successors;
+    if (successors.len != 1 or successors[0] != header) return null;
+    return preheader;
 }
 
 fn opPure(inst: Instruction) bool {
@@ -283,14 +286,25 @@ pub fn run(
     tree: *const dom.Tree,
     facts: ?*const ssa_phase.Result,
 ) Error!Result {
-    function.verify() catch return error.InvalidInput;
+    function.verify() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidInput,
+    };
     if (tree.graph != function.graph) return error.InvalidInput;
     if (facts) |f| {
         if (f.function != function) return error.InvalidInput;
     }
 
     var loops_list: std.ArrayList(Loop) = .empty;
-    defer loops_list.deinit(allocator);
+    defer {
+        for (loops_list.items) |loop| {
+            allocator.free(loop.strength_reduction_ops);
+            allocator.free(loop.induction_values);
+            allocator.free(loop.invariant_ops);
+            allocator.free(loop.blocks);
+        }
+        loops_list.deinit(allocator);
+    }
 
     const ranges = try allocator.alloc(Range, function.values.len);
     errdefer allocator.free(ranges);
@@ -332,25 +346,32 @@ pub fn run(
         if (unroll > 1) stats.unroll_candidates += 1;
         if (delete_candidate) stats.delete_candidates += 1;
 
+        const invariant_ops = try invariants.toOwnedSlice(allocator);
+        errdefer allocator.free(invariant_ops);
+        const induction_values = try inductions.toOwnedSlice(allocator);
+        errdefer allocator.free(induction_values);
+        const strength_reduction_ops = try strengths.toOwnedSlice(allocator);
+        errdefer allocator.free(strength_reduction_ops);
         try loops_list.append(allocator, .{
             .header = edge.to,
             .latch = edge.from,
             .blocks = blocks,
             .preheader = findPreheader(function.graph, blocks, edge.to),
-            .invariant_ops = try invariants.toOwnedSlice(allocator),
-            .induction_values = try inductions.toOwnedSlice(allocator),
-            .strength_reduction_ops = try strengths.toOwnedSlice(allocator),
+            .invariant_ops = invariant_ops,
+            .induction_values = induction_values,
+            .strength_reduction_ops = strength_reduction_ops,
             .unroll_factor = unroll,
             .delete_candidate = delete_candidate,
         });
     }
 
+    const loops = try loops_list.toOwnedSlice(allocator);
     return .{
         .allocator = allocator,
         .function = function,
         .tree = tree,
         .ssa_facts = facts,
-        .loops = try loops_list.toOwnedSlice(allocator),
+        .loops = loops,
         .ranges = ranges,
         .stats = stats,
     };
@@ -437,6 +458,29 @@ test "loop_phase marks small pure loops for unrolling or deletion" {
 
     try std.testing.expect(result.stats.unroll_candidates >= 1);
     try std.testing.expect(result.stats.delete_candidates >= 1);
+}
+
+test "loop_phase rejects a branching outside predecessor as a preheader" {
+    const insts = [_]Instruction{
+        .{ .if_eqz = .{ .src = 0, .offset = 3 } },
+        .{ .if_eqz = .{ .src = 1, .offset = 2 } },
+        .{ .goto_ = .{ .offset = -1 } },
+        .return_void,
+    };
+    var graph: cfg.Graph = undefined;
+    var tree: dom.Tree = undefined;
+    var function: ssa.Function = undefined;
+    var facts: ssa_phase.Result = undefined;
+    try buildPipeline(&insts, &graph, &tree, &function, &facts);
+    defer facts.deinit();
+    defer function.deinit();
+    defer tree.deinit();
+    defer graph.deinit();
+    var result = try run(std.testing.allocator, &function, &tree, &facts);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), result.stats.loops);
+    try std.testing.expectEqual(@as(?cfg.BlockId, null), result.loops[0].preheader);
 }
 
 test "loop_phase computes constant ranges" {

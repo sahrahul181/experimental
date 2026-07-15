@@ -61,7 +61,10 @@ pub const Function = struct {
     }
 
     pub fn verify(self: *const Function) VerifyError!void {
-        self.source.verify() catch return error.InvalidSsa;
+        self.source.verify() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidSsa,
+        };
         if (self.values.len != self.source.values.len) return error.InvalidSsa;
 
         for (self.source.values, 0..) |value, i| {
@@ -367,7 +370,10 @@ fn applyPhiTypes(typed: *Function, phi: ssa.Phi) bool {
 }
 
 pub fn build(allocator: std.mem.Allocator, source: *const ssa.Function) Error!Function {
-    source.verify() catch return error.InvalidSsa;
+    source.verify() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidSsa,
+    };
 
     const values = try allocator.alloc(ValueInfo, source.values.len);
     errdefer allocator.free(values);

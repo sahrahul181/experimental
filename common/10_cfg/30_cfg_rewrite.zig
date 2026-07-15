@@ -251,13 +251,18 @@ pub fn rewrite(allocator: std.mem.Allocator, graph: *const cfg.Graph, options: O
         }
     }
     for (blocks, 0..) |*block, i| {
+        const successors = try allocator.alloc(cfg.BlockId, succ_counts[i]);
+        const predecessors = allocator.alloc(cfg.BlockId, pred_counts[i]) catch |err| {
+            allocator.free(successors);
+            return err;
+        };
         block.* = .{
             .id = @intCast(i),
             .start = min_start[i],
             .end = max_end[i],
             .rpo_index = cfg.INVALID_BLOCK,
-            .successors = try allocator.alloc(cfg.BlockId, succ_counts[i]),
-            .predecessors = try allocator.alloc(cfg.BlockId, pred_counts[i]),
+            .successors = successors,
+            .predecessors = predecessors,
         };
         built_blocks += 1;
     }

@@ -24,6 +24,7 @@ pub const VerifyError = error{
     BadLowering,
     BadNullElision,
     InvalidInput,
+    OutOfMemory,
 };
 
 pub const Nullness = enum(u8) {
@@ -110,8 +111,14 @@ pub const Function = struct {
     }
 
     pub fn verify(self: *const Function) VerifyError!void {
-        self.source.verify() catch return error.InvalidInput;
-        self.types.verify() catch return error.InvalidInput;
+        self.source.verify() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidInput,
+        };
+        self.types.verify() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidInput,
+        };
         if (self.values.len != self.source.values.len or self.ops.len != self.source.blocks.len) return error.InvalidInput;
         if (self.opt) |opt_result| {
             if (opt_result.function != self.source or opt_result.facts.len != self.source.values.len) return error.InvalidInput;
@@ -289,22 +296,78 @@ fn devirtHint(inst: Instruction) DevirtHint {
 fn loweringFor(op: ssa.Operation, types: *const typedir.Function) LoweringChoice {
     return switch (op.inst) {
         .nop => .none,
-        .goto_, .packed_switch, .sparse_switch,
-        .if_eq, .if_ne, .if_lt, .if_ge, .if_gt, .if_le,
-        .if_eqz, .if_nez, .if_ltz, .if_gez, .if_gtz, .if_lez,
+        .goto_,
+        .packed_switch,
+        .sparse_switch,
+        .if_eq,
+        .if_ne,
+        .if_lt,
+        .if_ge,
+        .if_gt,
+        .if_le,
+        .if_eqz,
+        .if_nez,
+        .if_ltz,
+        .if_gez,
+        .if_gtz,
+        .if_lez,
         => .branch,
         .return_void, .return_, .return_wide, .return_object => .return_path,
         .throw_ => .throw_path,
         .invoke, .invoke_virtual_quick, .invoke_super_quick => .call,
-        .aget, .aget_wide, .aget_object, .aget_boolean, .aget_byte, .aget_char, .aget_short,
-        .aput, .aput_wide, .aput_object, .aput_boolean, .aput_byte, .aput_char, .aput_short,
-        .iget, .iget_wide, .iget_object, .iget_boolean, .iget_byte, .iget_char, .iget_short,
-        .iput, .iput_wide, .iput_object, .iput_boolean, .iput_byte, .iput_char, .iput_short,
-        .sget, .sget_wide, .sget_object, .sget_boolean, .sget_byte, .sget_char, .sget_short,
-        .sput, .sput_wide, .sput_object, .sput_boolean, .sput_byte, .sput_char, .sput_short,
-        .iget_quick, .iget_wide_quick, .iget_object_quick,
-        .iput_quick, .iput_wide_quick, .iput_object_quick,
-        .array_length, .new_array, .fill_array_data, .new_instance, .filled_new_array,
+        .aget,
+        .aget_wide,
+        .aget_object,
+        .aget_boolean,
+        .aget_byte,
+        .aget_char,
+        .aget_short,
+        .aput,
+        .aput_wide,
+        .aput_object,
+        .aput_boolean,
+        .aput_byte,
+        .aput_char,
+        .aput_short,
+        .iget,
+        .iget_wide,
+        .iget_object,
+        .iget_boolean,
+        .iget_byte,
+        .iget_char,
+        .iget_short,
+        .iput,
+        .iput_wide,
+        .iput_object,
+        .iput_boolean,
+        .iput_byte,
+        .iput_char,
+        .iput_short,
+        .sget,
+        .sget_wide,
+        .sget_object,
+        .sget_boolean,
+        .sget_byte,
+        .sget_char,
+        .sget_short,
+        .sput,
+        .sput_wide,
+        .sput_object,
+        .sput_boolean,
+        .sput_byte,
+        .sput_char,
+        .sput_short,
+        .iget_quick,
+        .iget_wide_quick,
+        .iget_object_quick,
+        .iput_quick,
+        .iput_wide_quick,
+        .iput_object_quick,
+        .array_length,
+        .new_array,
+        .fill_array_data,
+        .new_instance,
+        .filled_new_array,
         => .memory,
         .monitor_enter, .monitor_exit, .check_cast => .reference,
         else => {
@@ -374,8 +437,14 @@ pub fn build(
     typed: *const typedir.Function,
     opt: ?*const optimizer.Result,
 ) Error!Function {
-    source.verify() catch return error.InvalidInput;
-    typed.verify() catch return error.InvalidInput;
+    source.verify() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidInput,
+    };
+    typed.verify() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidInput,
+    };
     if (typed.source != source) return error.InvalidInput;
     if (opt) |opt_result| {
         if (opt_result.function != source) return error.InvalidInput;

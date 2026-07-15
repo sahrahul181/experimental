@@ -29,22 +29,34 @@ pub fn build(b: *std.Build) void {
     const typed_ir = b.addModule("typed_ir", .{ .root_source_file = b.path("common/20_ssa_opt/opt/10_typed_ir.zig"), .target = target, .optimize = optimize_mode });
     const loop_phase = b.addModule("loop_phase", .{ .root_source_file = b.path("common/20_ssa_opt/opt/20_loop_phase.zig"), .target = target, .optimize = optimize_mode });
     const memory_phase = b.addModule("memory_phase", .{ .root_source_file = b.path("common/20_ssa_opt/opt/30_memory_phase.zig"), .target = target, .optimize = optimize_mode });
+    const barrier_phase = b.addModule("barrier_phase", .{ .root_source_file = b.path("common/20_ssa_opt/opt/40_barrier_phase.zig"), .target = target, .optimize = optimize_mode });
     const optimizer = b.addModule("optimizer", .{ .root_source_file = b.path("common/20_ssa_opt/90_optimizer.zig"), .target = target, .optimize = optimize_mode });
 
     const lowering = b.addModule("lowering", .{ .root_source_file = b.path("common/30_lowering/00_lowering.zig"), .target = target, .optimize = optimize_mode });
     const machine_bridge = b.addModule("machine_bridge", .{ .root_source_file = b.path("common/30_lowering/10_machine_bridge.zig"), .target = target, .optimize = optimize_mode });
+    const derived_verify = b.addModule("derived_verify", .{ .root_source_file = b.path("common/30_lowering/20_derived_verify.zig"), .target = target, .optimize = optimize_mode });
 
     const code_buffer = b.addModule("code_buffer", .{ .root_source_file = b.path("common/40_backend/00_code_buffer.zig"), .target = target, .optimize = optimize_mode });
     const register_encoder = b.addModule("register_encoder", .{ .root_source_file = b.path("common/40_backend/10_register_encoder.zig"), .target = target, .optimize = optimize_mode });
     const jit_memory = b.addModule("jit_memory", .{ .root_source_file = b.path("common/40_backend/20_jit_memory.zig"), .target = target, .optimize = optimize_mode });
     const x64_encoder = b.addModule("x64_encoder", .{ .root_source_file = b.path("common/40_backend/30_x64_encoder.zig"), .target = target, .optimize = optimize_mode });
     const x64_register_encoder = b.addModule("x64_register_encoder", .{ .root_source_file = b.path("common/40_backend/40_x64_register_encoder.zig"), .target = target, .optimize = optimize_mode });
+    const x64_runtime_shim = b.addModule("x64_runtime_shim", .{ .root_source_file = b.path("common/40_backend/50_x64_runtime_shim.zig"), .target = target, .optimize = optimize_mode });
 
     const liveness = b.addModule("liveness", .{ .root_source_file = b.path("common/50_regalloc/00_liveness.zig"), .target = target, .optimize = optimize_mode });
     const intervals = b.addModule("intervals", .{ .root_source_file = b.path("common/50_regalloc/10_intervals.zig"), .target = target, .optimize = optimize_mode });
     const linear_scan = b.addModule("linear_scan", .{ .root_source_file = b.path("common/50_regalloc/20_linear_scan.zig"), .target = target, .optimize = optimize_mode });
     const spill_rewrite = b.addModule("spill_rewrite", .{ .root_source_file = b.path("common/50_regalloc/30_spill_rewrite.zig"), .target = target, .optimize = optimize_mode });
     const regalloc = b.addModule("regalloc", .{ .root_source_file = b.path("common/50_regalloc/40_allocator.zig"), .target = target, .optimize = optimize_mode });
+    const post_derived_verify = b.addModule("post_derived_verify", .{ .root_source_file = b.path("common/50_regalloc/50_derived_verify.zig"), .target = target, .optimize = optimize_mode });
+
+    const runtime_value = b.addModule("runtime_value", .{ .root_source_file = b.path("common/60_runtime/00_value.zig"), .target = target, .optimize = optimize_mode });
+    const runtime_thread_registry = b.addModule("runtime_thread_registry", .{ .root_source_file = b.path("common/60_runtime/10_thread_registry.zig"), .target = target, .optimize = optimize_mode });
+    const runtime_heap = b.addModule("runtime_heap", .{ .root_source_file = b.path("common/60_runtime/20_heap.zig"), .target = target, .optimize = optimize_mode });
+    const runtime_gc = b.addModule("runtime_gc", .{ .root_source_file = b.path("common/60_runtime/25_gc.zig"), .target = target, .optimize = optimize_mode });
+    const runtime_stack_map = b.addModule("runtime_stack_map", .{ .root_source_file = b.path("common/60_runtime/30_stack_map.zig"), .target = target, .optimize = optimize_mode });
+    const runtime_jit = b.addModule("runtime_jit", .{ .root_source_file = b.path("common/60_runtime/40_jit_runtime.zig"), .target = target, .optimize = optimize_mode });
+    const runtime_interpreter = b.addModule("runtime_interpreter", .{ .root_source_file = b.path("common/60_runtime/45_interpreter_runtime.zig"), .target = target, .optimize = optimize_mode });
 
     const scheduler = b.addModule("scheduler", .{ .root_source_file = b.path("src/engine/scheduler.zig"), .target = target, .optimize = optimize_mode });
     const lock = b.addModule("lock", .{ .root_source_file = b.path("src/engine/lock.zig"), .target = target, .optimize = optimize_mode });
@@ -99,6 +111,12 @@ pub fn build(b: *std.Build) void {
     memory_phase.addImport("ssa", ssa);
     memory_phase.addImport("typedir", typedir);
     memory_phase.addImport("instructions", instructions);
+    barrier_phase.addImport("cfg", cfg);
+    barrier_phase.addImport("dominator", dominator);
+    barrier_phase.addImport("ssa", ssa);
+    barrier_phase.addImport("typedir", typedir);
+    barrier_phase.addImport("loop_phase", loop_phase);
+    barrier_phase.addImport("instructions", instructions);
 
     lowering.addImport("cfg", cfg);
     lowering.addImport("dominator", dominator);
@@ -108,8 +126,10 @@ pub fn build(b: *std.Build) void {
     lowering.addImport("typed_ir", typed_ir);
     lowering.addImport("optimizer", optimizer);
     lowering.addImport("memory_phase", memory_phase);
+    lowering.addImport("barrier_phase", barrier_phase);
     lowering.addImport("instructions", instructions);
     machine_bridge.addImport("cfg", cfg);
+    machine_bridge.addImport("barrier_phase", barrier_phase);
     machine_bridge.addImport("dominator", dominator);
     machine_bridge.addImport("lowering", lowering);
     machine_bridge.addImport("memory_phase", memory_phase);
@@ -118,6 +138,8 @@ pub fn build(b: *std.Build) void {
     machine_bridge.addImport("typed_ir", typed_ir);
     machine_bridge.addImport("typedir", typedir);
     machine_bridge.addImport("instructions", instructions);
+    derived_verify.addImport("barrier_phase", barrier_phase);
+    derived_verify.addImport("machine_bridge", machine_bridge);
 
     optimizer.addImport("cfg", cfg);
     optimizer.addImport("cfg_rewrite", cfg_rewrite);
@@ -128,8 +150,10 @@ pub fn build(b: *std.Build) void {
     optimizer.addImport("typed_ir", typed_ir);
     optimizer.addImport("loop_phase", loop_phase);
     optimizer.addImport("memory_phase", memory_phase);
+    optimizer.addImport("barrier_phase", barrier_phase);
     optimizer.addImport("lowering", lowering);
     optimizer.addImport("machine_bridge", machine_bridge);
+    optimizer.addImport("derived_verify", derived_verify);
     optimizer.addImport("instructions", instructions);
 
     register_encoder.addImport("cfg", cfg);
@@ -153,6 +177,8 @@ pub fn build(b: *std.Build) void {
     x64_register_encoder.addImport("machine_bridge", machine_bridge);
     x64_register_encoder.addImport("optimizer", optimizer);
     x64_register_encoder.addImport("regalloc", regalloc);
+    x64_register_encoder.addImport("runtime_stack_map", runtime_stack_map);
+    x64_register_encoder.addImport("runtime_value", runtime_value);
     x64_register_encoder.addImport("instructions", instructions);
 
     liveness.addImport("intervals", intervals);
@@ -172,11 +198,47 @@ pub fn build(b: *std.Build) void {
     spill_rewrite.addImport("typedir", typedir);
     spill_rewrite.addImport("optimizer", optimizer);
     spill_rewrite.addImport("instructions", instructions);
+    post_derived_verify.addImport("derived_verify", derived_verify);
+    post_derived_verify.addImport("intervals", intervals);
+    post_derived_verify.addImport("linear_scan", linear_scan);
+    post_derived_verify.addImport("spill_rewrite", spill_rewrite);
+    post_derived_verify.addImport("machine_bridge", machine_bridge);
+    post_derived_verify.addImport("optimizer", optimizer);
+    post_derived_verify.addImport("instructions", instructions);
     regalloc.addImport("linear_scan", linear_scan);
     regalloc.addImport("spill_rewrite", spill_rewrite);
+    regalloc.addImport("post_derived_verify", post_derived_verify);
     regalloc.addImport("machine_bridge", machine_bridge);
     regalloc.addImport("optimizer", optimizer);
     regalloc.addImport("instructions", instructions);
+
+    runtime_thread_registry.addImport("runtime_value", runtime_value);
+    runtime_heap.addImport("runtime_value", runtime_value);
+    runtime_heap.addImport("runtime_thread_registry", runtime_thread_registry);
+    runtime_gc.addImport("runtime_value", runtime_value);
+    runtime_gc.addImport("runtime_heap", runtime_heap);
+    runtime_gc.addImport("runtime_thread_registry", runtime_thread_registry);
+    runtime_stack_map.addImport("runtime_value", runtime_value);
+    runtime_jit.addImport("runtime_value", runtime_value);
+    runtime_jit.addImport("runtime_gc", runtime_gc);
+    runtime_jit.addImport("runtime_stack_map", runtime_stack_map);
+    runtime_jit.addImport("runtime_thread_registry", runtime_thread_registry);
+    runtime_interpreter.addImport("interpreter", interpreter);
+    runtime_interpreter.addImport("runtime_gc", runtime_gc);
+    runtime_interpreter.addImport("runtime_heap", runtime_heap);
+    runtime_interpreter.addImport("runtime_value", runtime_value);
+
+    x64_runtime_shim.addImport("code_buffer", code_buffer);
+    x64_runtime_shim.addImport("jit_memory", jit_memory);
+    x64_runtime_shim.addImport("optimizer", optimizer);
+    x64_runtime_shim.addImport("runtime_gc", runtime_gc);
+    x64_runtime_shim.addImport("runtime_heap", runtime_heap);
+    x64_runtime_shim.addImport("runtime_jit", runtime_jit);
+    x64_runtime_shim.addImport("runtime_stack_map", runtime_stack_map);
+    x64_runtime_shim.addImport("runtime_thread_registry", runtime_thread_registry);
+    x64_runtime_shim.addImport("runtime_value", runtime_value);
+    x64_runtime_shim.addImport("x64_register_encoder", x64_register_encoder);
+    x64_runtime_shim.addImport("instructions", instructions);
 
     storage.addImport("lock", lock);
     actor_runtime.addImport("scheduler", scheduler);
@@ -206,18 +268,29 @@ pub fn build(b: *std.Build) void {
         .{ .name = "typed_ir", .module = typed_ir },
         .{ .name = "loop_phase", .module = loop_phase },
         .{ .name = "memory_phase", .module = memory_phase },
+        .{ .name = "barrier_phase", .module = barrier_phase },
         .{ .name = "lowering", .module = lowering },
         .{ .name = "machine_bridge", .module = machine_bridge },
+        .{ .name = "derived_verify", .module = derived_verify },
         .{ .name = "code_buffer", .module = code_buffer },
         .{ .name = "register_encoder", .module = register_encoder },
         .{ .name = "jit_memory", .module = jit_memory },
         .{ .name = "x64_encoder", .module = x64_encoder },
         .{ .name = "x64_register_encoder", .module = x64_register_encoder },
+        .{ .name = "x64_runtime_shim", .module = x64_runtime_shim },
         .{ .name = "liveness", .module = liveness },
         .{ .name = "intervals", .module = intervals },
         .{ .name = "linear_scan", .module = linear_scan },
         .{ .name = "spill_rewrite", .module = spill_rewrite },
         .{ .name = "regalloc", .module = regalloc },
+        .{ .name = "post_derived_verify", .module = post_derived_verify },
+        .{ .name = "runtime_value", .module = runtime_value },
+        .{ .name = "runtime_thread_registry", .module = runtime_thread_registry },
+        .{ .name = "runtime_heap", .module = runtime_heap },
+        .{ .name = "runtime_gc", .module = runtime_gc },
+        .{ .name = "runtime_stack_map", .module = runtime_stack_map },
+        .{ .name = "runtime_jit", .module = runtime_jit },
+        .{ .name = "runtime_interpreter", .module = runtime_interpreter },
         .{ .name = "scheduler", .module = scheduler },
         .{ .name = "lock", .module = lock },
         .{ .name = "immix", .module = immix },

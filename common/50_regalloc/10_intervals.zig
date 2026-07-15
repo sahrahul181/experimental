@@ -129,6 +129,14 @@ pub fn build(allocator: std.mem.Allocator, function: *const machine.Function) Er
                 try touch(starts, ends, uses, reg, pos);
                 stats.uses += 1;
             }
+            if (inst.address) |reg| {
+                try touch(starts, ends, uses, reg, pos);
+                stats.uses += 1;
+            }
+            if (inst.state_handle) |reg| {
+                try touch(starts, ends, uses, reg, pos);
+                stats.uses += 1;
+            }
             for (inst.defs) |reg| {
                 try touch(starts, ends, defs, reg, pos);
                 stats.defs += 1;

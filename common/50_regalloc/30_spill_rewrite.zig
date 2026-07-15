@@ -116,6 +116,12 @@ pub fn build(allocator: std.mem.Allocator, allocation: *const linear_scan.Alloca
             for (inst.uses) |reg| {
                 if (isSpilled(allocation, reg)) stats.reloads += 1;
             }
+            if (inst.address) |reg| {
+                if (isSpilled(allocation, reg)) stats.reloads += 1;
+            }
+            if (inst.state_handle) |reg| {
+                if (isSpilled(allocation, reg)) stats.reloads += 1;
+            }
             for (inst.defs) |reg| {
                 if (isSpilled(allocation, reg)) stats.stores += 1;
             }

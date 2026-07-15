@@ -13,6 +13,7 @@ const typedir = @import("typedir");
 const typed_ir = @import("typed_ir");
 const optimizer = @import("optimizer");
 const memory_phase = @import("memory_phase");
+const barrier_phase = @import("barrier_phase");
 const instmod = @import("instructions");
 const Instruction = instmod.Instruction;
 
@@ -26,9 +27,32 @@ pub const VerifyError = error{
     BadInstruction,
     BadValue,
     InvalidInput,
+    OutOfMemory,
 };
 
-pub const ValueId = ssa.ValueId;
+pub const RuntimeValueId = u32;
+pub const ValueId = RuntimeValueId;
+pub const INVALID_RUNTIME_VALUE: RuntimeValueId = std.math.maxInt(RuntimeValueId);
+
+pub const RuntimeValueClass = union(enum) {
+    dalvik: struct {
+        value: ssa.ValueId,
+        ty: typedir.Type,
+        gc_root: bool,
+    },
+    derived_ptr: struct {
+        handle: ssa.ValueId,
+        token: barrier_phase.RelocTokenId,
+        resolve: barrier_phase.ResolveId,
+    },
+
+    pub fn isGcRoot(self: RuntimeValueClass) bool {
+        return switch (self) {
+            .dalvik => |value| value.gc_root,
+            .derived_ptr => false,
+        };
+    }
+};
 
 pub const Kind = enum(u8) {
     phi,
@@ -52,10 +76,19 @@ pub const Kind = enum(u8) {
     f64_op,
     check_null,
     check_bounds,
+    resolve_handle,
     array_load,
     array_store,
     field_load,
     field_store,
+    array_load_ptr,
+    array_store_ptr,
+    field_load_ptr,
+    field_store_ptr,
+    satb_pre_write,
+    card_mark,
+    static_satb_pre_write,
+    static_root_post_write,
     static_load,
     static_store,
     call_direct,
@@ -88,6 +121,12 @@ pub const Inst = struct {
     false_target: ?cfg.BlockId = null,
     imm: i64 = 0,
     field_idx: ?u32 = null,
+    address: ?RuntimeValueId = null,
+    state_handle: ?RuntimeValueId = null,
+    reloc_token: ?barrier_phase.RelocTokenId = null,
+    resolve_id: ?barrier_phase.ResolveId = null,
+    pre_write: barrier_phase.PreWriteBarrier = .none,
+    post_write: barrier_phase.PostWriteBarrier = .none,
     flags: Flags = .{},
 };
 
@@ -102,6 +141,7 @@ pub const Inputs = struct {
     typed: *const typed_ir.Function,
     ssa_facts: ?*const ssa_phase.Result = null,
     memory: ?*const memory_phase.Result = null,
+    barriers: ?*const barrier_phase.Result = null,
 };
 
 pub const Stats = struct {
@@ -112,6 +152,12 @@ pub const Stats = struct {
     bounds_checks_elided: u32 = 0,
     forwarded_loads: u32 = 0,
     direct_calls: u32 = 0,
+    runtime_values: u32 = 0,
+    handle_resolves: u32 = 0,
+    pointer_accesses: u32 = 0,
+    satb_barriers: u32 = 0,
+    card_barriers: u32 = 0,
+    static_root_barriers: u32 = 0,
 };
 
 pub const Function = struct {
@@ -119,6 +165,9 @@ pub const Function = struct {
     source: *const ssa.Function,
     blocks: []Block,
     value_types: []typedir.Type,
+    runtime_values: []RuntimeValueClass,
+    resolve_values: []RuntimeValueId,
+    barriers: ?*const barrier_phase.Result,
     stats: Stats,
 
     pub fn deinit(self: *Function) void {
@@ -131,32 +180,151 @@ pub const Function = struct {
         }
         self.allocator.free(self.blocks);
         self.allocator.free(self.value_types);
+        self.allocator.free(self.runtime_values);
+        self.allocator.free(self.resolve_values);
         self.* = undefined;
     }
 
     pub fn verify(self: *const Function) VerifyError!void {
-        if (self.blocks.len != self.source.blocks.len or self.value_types.len != self.source.values.len) return error.InvalidInput;
+        if (self.blocks.len != self.source.blocks.len or self.value_types.len != self.runtime_values.len) return error.InvalidInput;
+        if (self.runtime_values.len < self.source.values.len) return error.InvalidInput;
+        for (self.source.values, 0..) |value, i| {
+            switch (self.runtime_values[i]) {
+                .dalvik => |runtime| {
+                    if (runtime.value != value.id or runtime.ty != self.value_types[i]) return error.BadValue;
+                },
+                .derived_ptr => return error.BadValue,
+            }
+        }
+        if (self.barriers) |barriers| {
+            if (barriers.function != self.source or self.resolve_values.len != barriers.resolves.len or self.runtime_values.len != self.source.values.len + barriers.resolves.len) return error.InvalidInput;
+            for (barriers.resolves, 0..) |resolve, resolve_index| {
+                const value = self.resolve_values[resolve_index];
+                const expected_value: RuntimeValueId = @intCast(self.source.values.len + resolve_index);
+                const expected_resolve: barrier_phase.ResolveId = @intCast(resolve_index);
+                if (value != expected_value) return error.BadValue;
+                switch (self.runtime_values[value]) {
+                    .derived_ptr => |ptr| if (ptr.handle != resolve.handle or ptr.token != resolve.token or ptr.resolve != expected_resolve) return error.BadValue,
+                    .dalvik => return error.BadValue,
+                }
+                if (!self.isGcRoot(resolve.handle)) return error.BadValue;
+            }
+        } else if (self.resolve_values.len != 0 or self.runtime_values.len != self.source.values.len) {
+            return error.InvalidInput;
+        }
         for (self.blocks, 0..) |block, i| {
             if (block.id != i) return error.BadBlock;
             for (block.insts) |inst| {
-                for (inst.defs) |def| if (def >= self.value_types.len) return error.BadValue;
+                for (inst.defs) |def| {
+                    if (def >= self.value_types.len) return error.BadValue;
+                    switch (self.runtime_values[def]) {
+                        .dalvik => {},
+                        .derived_ptr => if (inst.kind != .resolve_handle) return error.BadInstruction,
+                    }
+                }
                 for (inst.uses) |use| if (use >= self.value_types.len) return error.BadValue;
+                if (inst.address) |address| if (address >= self.runtime_values.len) return error.BadValue;
+                if (inst.state_handle) |handle| if (handle >= self.runtime_values.len) return error.BadValue;
                 switch (inst.kind) {
                     .branch => if (inst.target == null) return error.BadInstruction,
                     .cond_branch => if (inst.target == null or inst.false_target == null or inst.uses.len == 0) return error.BadInstruction,
-                    .field_load, .field_store, .static_load, .static_store => if (inst.field_idx == null) return error.BadInstruction,
+                    .field_load, .field_store, .static_load, .static_store, .static_satb_pre_write, .static_root_post_write => if (inst.field_idx == null) return error.BadInstruction,
+                    .resolve_handle => try self.verifyResolve(inst),
+                    .check_bounds, .field_load_ptr, .field_store_ptr, .array_load_ptr, .array_store_ptr, .satb_pre_write, .card_mark => if (inst.address != null) try self.verifyAddress(inst),
+                    .call_direct, .call_static, .call_virtual, .call_quick => if (inst.address != null) try self.verifyAddress(inst),
                     else => {},
                 }
+                for (inst.uses) |use| switch (self.runtime_values[use]) {
+                    .dalvik => {},
+                    .derived_ptr => return error.BadInstruction,
+                };
+                if (inst.address == null and inst.state_handle != null and inst.kind != .resolve_handle) return error.BadInstruction;
+                const permits_address = switch (inst.kind) {
+                    .field_load_ptr,
+                    .field_store_ptr,
+                    .array_load_ptr,
+                    .array_store_ptr,
+                    .check_bounds,
+                    .satb_pre_write,
+                    .card_mark,
+                    .call_direct,
+                    .call_static,
+                    .call_virtual,
+                    .call_quick,
+                    => true,
+                    else => false,
+                };
+                if (inst.address != null and !permits_address) return error.BadInstruction;
+                if (inst.address == null and inst.kind != .resolve_handle and (inst.reloc_token != null or inst.resolve_id != null)) return error.BadInstruction;
+                const is_pre_write = inst.kind == .satb_pre_write or inst.kind == .static_satb_pre_write;
+                const is_post_write = inst.kind == .card_mark or inst.kind == .static_root_post_write;
+                if (is_pre_write != (inst.pre_write != .none)) return error.BadInstruction;
+                if (is_post_write != (inst.post_write != .none)) return error.BadInstruction;
+                if (inst.kind == .satb_pre_write) {
+                    if (inst.field_idx == null and inst.uses.len != 1) return error.BadInstruction;
+                    if (inst.field_idx != null and inst.uses.len != 0) return error.BadInstruction;
+                }
+                if (inst.kind == .static_satb_pre_write and (inst.uses.len != 0 or inst.pre_write != .satb_guarded)) return error.BadInstruction;
+                if (inst.kind == .static_root_post_write and (inst.uses.len != 1 or inst.post_write != .root_guarded)) return error.BadInstruction;
             }
         }
     }
 
+    fn verifyResolve(self: *const Function, inst: Inst) VerifyError!void {
+        if (inst.defs.len != 1 or inst.uses.len != 1 or inst.address != null or inst.state_handle == null or inst.reloc_token == null or inst.resolve_id == null) return error.BadInstruction;
+        if (inst.state_handle.? != inst.uses[0]) return error.BadInstruction;
+        if (!self.isGcRoot(inst.state_handle.?)) return error.BadInstruction;
+        const barriers = self.barriers orelse return error.BadInstruction;
+        const resolve_id = inst.resolve_id.?;
+        if (resolve_id >= barriers.resolves.len or self.resolve_values[resolve_id] != inst.defs[0]) return error.BadInstruction;
+        const resolve = barriers.resolves[resolve_id];
+        if (resolve.token != inst.reloc_token.?) return error.BadInstruction;
+        switch (self.runtime_values[inst.defs[0]]) {
+            .derived_ptr => |ptr| if (ptr.handle != resolve.handle or ptr.token != resolve.token or ptr.resolve != resolve_id) return error.BadInstruction,
+            .dalvik => return error.BadInstruction,
+        }
+        switch (self.runtime_values[inst.uses[0]]) {
+            .dalvik => |value| if (value.value != resolve.handle or (value.ty != .object and value.ty != .unknown)) return error.BadInstruction,
+            .derived_ptr => return error.BadInstruction,
+        }
+    }
+
+    fn verifyAddress(self: *const Function, inst: Inst) VerifyError!void {
+        if ((inst.kind == .field_load_ptr or inst.kind == .field_store_ptr) and inst.field_idx == null) return error.BadInstruction;
+        const address = inst.address orelse return error.BadInstruction;
+        const state_handle = inst.state_handle orelse return error.BadInstruction;
+        const token = inst.reloc_token orelse return error.BadInstruction;
+        const resolve_id = inst.resolve_id orelse return error.BadInstruction;
+        if (!self.isGcRoot(state_handle)) return error.BadInstruction;
+        switch (self.runtime_values[address]) {
+            .derived_ptr => |ptr| {
+                if (ptr.token != token or ptr.resolve != resolve_id) return error.BadInstruction;
+                switch (self.runtime_values[state_handle]) {
+                    .dalvik => |handle| if (handle.value != ptr.handle or (handle.ty != .object and handle.ty != .unknown)) return error.BadInstruction,
+                    .derived_ptr => return error.BadInstruction,
+                }
+            },
+            .dalvik => return error.BadInstruction,
+        }
+    }
+
+    pub fn runtimeValue(self: *const Function, value: RuntimeValueId) ?RuntimeValueClass {
+        if (value >= self.runtime_values.len) return null;
+        return self.runtime_values[value];
+    }
+
+    pub fn isGcRoot(self: *const Function, value: RuntimeValueId) bool {
+        const class = self.runtimeValue(value) orelse return false;
+        return class.isGcRoot();
+    }
+
     pub fn print(self: *const Function, writer: anytype) !void {
         try writer.print(
-            "lowering blocks={d} values={d} lowered={d} skipped_dead={d} consts={d} null_elided={d} bounds_elided={d} forwarded={d} direct_calls={d}\n",
+            "lowering blocks={d} values={d} runtime_values={d} lowered={d} skipped_dead={d} consts={d} null_elided={d} bounds_elided={d} forwarded={d} direct_calls={d} resolves={d} ptr_accesses={d} satb={d} cards={d}\n",
             .{
                 self.blocks.len,
                 self.value_types.len,
+                self.stats.runtime_values,
                 self.stats.lowered,
                 self.stats.skipped_dead,
                 self.stats.constants_materialized,
@@ -164,6 +332,10 @@ pub const Function = struct {
                 self.stats.bounds_checks_elided,
                 self.stats.forwarded_loads,
                 self.stats.direct_calls,
+                self.stats.handle_resolves,
+                self.stats.pointer_accesses,
+                self.stats.satb_barriers,
+                self.stats.card_barriers,
             },
         );
         for (self.blocks) |block| {
@@ -182,6 +354,10 @@ pub const Function = struct {
                 if (inst.target) |target| try writer.print(" target=b{d}", .{target});
                 if (inst.false_target) |target| try writer.print(" false=b{d}", .{target});
                 if (inst.field_idx) |field| try writer.print(" field={d}", .{field});
+                if (inst.address) |address| try writer.print(" address=rv{d}", .{address});
+                if (inst.state_handle) |handle| try writer.print(" state=rv{d}", .{handle});
+                if (inst.reloc_token) |token| try writer.print(" token={d}", .{token});
+                if (inst.resolve_id) |resolve| try writer.print(" resolve={d}", .{resolve});
                 if (inst.imm != 0 or inst.kind == .const_i32 or inst.kind == .const_i64) try writer.print(" imm={d}", .{inst.imm});
                 if (inst.flags.null_check_elided) try writer.print(" null_elided", .{});
                 if (inst.flags.bounds_check_elided) try writer.print(" bounds_elided", .{});
@@ -198,8 +374,25 @@ fn dupeValues(allocator: std.mem.Allocator, values: []const ValueId) ![]ValueId 
 }
 
 fn appendInst(list: *std.ArrayList(Inst), allocator: std.mem.Allocator, inst: Inst, stats: *Stats) !void {
-    try list.append(allocator, inst);
+    list.append(allocator, inst) catch |err| {
+        allocator.free(inst.defs);
+        allocator.free(inst.uses);
+        return err;
+    };
     stats.lowered += 1;
+}
+
+fn ownOperands(
+    allocator: std.mem.Allocator,
+    template: Inst,
+    defs: []const ValueId,
+    uses: []const ValueId,
+) !Inst {
+    var inst = template;
+    inst.defs = try dupeValues(allocator, defs);
+    errdefer allocator.free(inst.defs);
+    inst.uses = try dupeValues(allocator, uses);
+    return inst;
 }
 
 fn foldedConstant(inputs: Inputs, op: ssa.Operation) ?ssa_phase.Constant {
@@ -225,15 +418,231 @@ fn typedInfo(inputs: Inputs, block_id: cfg.BlockId, index: usize) typed_ir.OpInf
     return inputs.typed.opInfo(block_id, index) orelse .{};
 }
 
+const AccessState = struct {
+    address: RuntimeValueId,
+    handle: RuntimeValueId,
+    token: barrier_phase.RelocTokenId,
+    resolve: barrier_phase.ResolveId,
+    defines: bool,
+    pre_write: barrier_phase.PreWriteBarrier,
+    post_write: barrier_phase.PostWriteBarrier,
+};
+
+fn accessState(inputs: Inputs, block_id: cfg.BlockId, op_index: usize) ?AccessState {
+    const barriers = inputs.barriers orelse return null;
+    if (block_id >= barriers.ops.len or op_index >= barriers.ops[block_id].len) return null;
+    const plan = barriers.ops[block_id][op_index];
+    const handle = plan.base_handle orelse return null;
+    const resolved = switch (plan.resolve) {
+        .none => return null,
+        .define => |id| .{ id, true },
+        .reuse => |id| .{ id, false },
+    };
+    const base: u64 = inputs.function.values.len;
+    const address: u64 = base + resolved[0];
+    if (address >= std.math.maxInt(RuntimeValueId)) return null;
+    return .{
+        .address = @intCast(address),
+        .handle = handle,
+        .token = plan.token_in,
+        .resolve = resolved[0],
+        .defines = resolved[1],
+        .pre_write = plan.pre_write,
+        .post_write = plan.post_write,
+    };
+}
+
+fn emitResolve(
+    allocator: std.mem.Allocator,
+    access: AccessState,
+    pc: ?u32,
+    list: *std.ArrayList(Inst),
+    stats: *Stats,
+) !void {
+    if (!access.defines) return;
+    try appendInst(list, allocator, try ownOperands(allocator, .{
+        .kind = .resolve_handle,
+        .pc = pc,
+        .state_handle = access.handle,
+        .reloc_token = access.token,
+        .resolve_id = access.resolve,
+    }, &.{access.address}, &.{access.handle}), stats);
+    stats.handle_resolves += 1;
+}
+
+fn emitHoistedResolves(
+    allocator: std.mem.Allocator,
+    inputs: Inputs,
+    block_id: cfg.BlockId,
+    list: *std.ArrayList(Inst),
+    stats: *Stats,
+) !void {
+    const barriers = inputs.barriers orelse return;
+    for (barriers.resolves, 0..) |resolve, resolve_index| {
+        if (!resolve.hoisted or resolve.placement_block != block_id) continue;
+        if (resolve.defining_op.block >= inputs.function.blocks.len or
+            resolve.defining_op.index >= inputs.function.blocks[resolve.defining_op.block].ops.len) return error.InvalidInput;
+        const pc = inputs.function.blocks[resolve.defining_op.block].ops[resolve.defining_op.index].pc;
+        const address_value: u64 = inputs.function.values.len + resolve_index;
+        if (address_value >= std.math.maxInt(RuntimeValueId)) return error.InvalidInput;
+        try appendInst(list, allocator, try ownOperands(allocator, .{
+            .kind = .resolve_handle,
+            .pc = pc,
+            .state_handle = resolve.handle,
+            .reloc_token = resolve.token,
+            .resolve_id = @intCast(resolve_index),
+        }, &.{@as(RuntimeValueId, @intCast(address_value))}, &.{resolve.handle}), stats);
+        stats.handle_resolves += 1;
+    }
+}
+
+fn isControlTransfer(inst: Instruction) bool {
+    return switch (inst) {
+        .goto_,
+        .if_eq,
+        .if_ne,
+        .if_lt,
+        .if_ge,
+        .if_gt,
+        .if_le,
+        .if_eqz,
+        .if_nez,
+        .if_ltz,
+        .if_gez,
+        .if_gtz,
+        .if_lez,
+        .packed_switch,
+        .sparse_switch,
+        .return_void,
+        .return_,
+        .return_wide,
+        .return_object,
+        .throw_,
+        => true,
+        else => false,
+    };
+}
+
+fn emitPreWrite(
+    allocator: std.mem.Allocator,
+    access: AccessState,
+    field_idx: ?u32,
+    array_index: ?RuntimeValueId,
+    pc: ?u32,
+    list: *std.ArrayList(Inst),
+    stats: *Stats,
+) !void {
+    if (access.pre_write == .none) return;
+    const uses = if (array_index) |index| &[_]RuntimeValueId{index} else &.{};
+    try appendInst(list, allocator, .{
+        .kind = .satb_pre_write,
+        .pc = pc,
+        .uses = try dupeValues(allocator, uses),
+        .field_idx = field_idx,
+        .address = access.address,
+        .state_handle = access.handle,
+        .reloc_token = access.token,
+        .resolve_id = access.resolve,
+        .pre_write = access.pre_write,
+    }, stats);
+    stats.satb_barriers += 1;
+}
+
+fn emitPostWrite(
+    allocator: std.mem.Allocator,
+    access: AccessState,
+    value_uses: []const RuntimeValueId,
+    pc: ?u32,
+    list: *std.ArrayList(Inst),
+    stats: *Stats,
+) !void {
+    if (access.post_write == .none) return;
+    try appendInst(list, allocator, .{
+        .kind = .card_mark,
+        .pc = pc,
+        .uses = try dupeValues(allocator, value_uses),
+        .address = access.address,
+        .state_handle = access.handle,
+        .reloc_token = access.token,
+        .resolve_id = access.resolve,
+        .post_write = access.post_write,
+    }, stats);
+    stats.card_barriers += 1;
+}
+
+fn emitStaticReferenceStore(
+    allocator: std.mem.Allocator,
+    field_idx: u32,
+    value: RuntimeValueId,
+    pre_write: barrier_phase.PreWriteBarrier,
+    post_write: barrier_phase.PostWriteBarrier,
+    pc: ?u32,
+    flags: Flags,
+    list: *std.ArrayList(Inst),
+    stats: *Stats,
+) !void {
+    if (pre_write != .satb_guarded or post_write != .root_guarded) return error.InvalidInput;
+    try appendInst(list, allocator, .{
+        .kind = .static_satb_pre_write,
+        .pc = pc,
+        .field_idx = field_idx,
+        .pre_write = pre_write,
+    }, stats);
+    stats.satb_barriers += 1;
+    try appendInst(list, allocator, .{
+        .kind = .static_store,
+        .pc = pc,
+        .uses = try dupeValues(allocator, &[_]RuntimeValueId{value}),
+        .field_idx = field_idx,
+        .flags = flags,
+    }, stats);
+    try appendInst(list, allocator, .{
+        .kind = .static_root_post_write,
+        .pc = pc,
+        .uses = try dupeValues(allocator, &[_]RuntimeValueId{value}),
+        .field_idx = field_idx,
+        .post_write = post_write,
+    }, stats);
+    stats.static_root_barriers += 1;
+}
+
 fn fieldIndex(inst: Instruction) ?u32 {
     return switch (inst) {
-        .iget, .iget_wide, .iget_object, .iget_boolean, .iget_byte, .iget_char, .iget_short,
-        .iput, .iput_wide, .iput_object, .iput_boolean, .iput_byte, .iput_char, .iput_short,
-        .iget_quick, .iget_wide_quick, .iget_object_quick,
-        .iput_quick, .iput_wide_quick, .iput_object_quick,
+        .iget,
+        .iget_wide,
+        .iget_object,
+        .iget_boolean,
+        .iget_byte,
+        .iget_char,
+        .iget_short,
+        .iput,
+        .iput_wide,
+        .iput_object,
+        .iput_boolean,
+        .iput_byte,
+        .iput_char,
+        .iput_short,
+        .iget_quick,
+        .iget_wide_quick,
+        .iget_object_quick,
+        .iput_quick,
+        .iput_wide_quick,
+        .iput_object_quick,
         => |op| op.field_idx,
-        .sget, .sget_wide, .sget_object, .sget_boolean, .sget_byte, .sget_char, .sget_short,
-        .sput, .sput_wide, .sput_object, .sput_boolean, .sput_byte, .sput_char, .sput_short,
+        .sget,
+        .sget_wide,
+        .sget_object,
+        .sget_boolean,
+        .sget_byte,
+        .sget_char,
+        .sget_short,
+        .sput,
+        .sput_wide,
+        .sput_object,
+        .sput_boolean,
+        .sput_byte,
+        .sput_char,
+        .sput_short,
         => |op| op.field_idx,
         else => null,
     };
@@ -306,6 +715,7 @@ fn lowerOperation(
 
     const tinfo = typedInfo(inputs, block_id, op_index);
     const minfo = memInfo(inputs, block_id, op_index);
+    const access = accessState(inputs, block_id, op_index);
     const flags = Flags{
         .null_check_elided = tinfo.null_check_elided,
         .bounds_check_elided = tinfo.bounds_check_elided,
@@ -348,7 +758,7 @@ fn lowerOperation(
             stats.constants_materialized += 1;
         },
         .move, .move_wide, .move_object => {
-            try appendInst(list, allocator, .{ .kind = .copy, .pc = op.pc, .defs = try dupeValues(allocator, op.defs), .uses = try dupeValues(allocator, op.uses), .flags = flags }, stats);
+            try appendInst(list, allocator, try ownOperands(allocator, .{ .kind = .copy, .pc = op.pc, .flags = flags }, op.defs, op.uses), stats);
         },
         .return_void, .return_, .return_wide, .return_object => {
             try appendInst(list, allocator, .{ .kind = .ret, .pc = op.pc, .uses = try dupeValues(allocator, op.uses), .flags = flags }, stats);
@@ -374,48 +784,222 @@ fn lowerOperation(
         },
         .aget, .aget_wide, .aget_object, .aget_boolean, .aget_byte, .aget_char, .aget_short => {
             if (!flags.null_check_elided) try appendInst(list, allocator, .{ .kind = .check_null, .pc = op.pc, .uses = try dupeValues(allocator, op.uses[0..1]) }, stats);
-            if (!flags.bounds_check_elided) try appendInst(list, allocator, .{ .kind = .check_bounds, .pc = op.pc, .uses = try dupeValues(allocator, op.uses[0..2]) }, stats);
-            try appendInst(list, allocator, .{ .kind = .array_load, .pc = op.pc, .defs = try dupeValues(allocator, op.defs), .uses = try dupeValues(allocator, op.uses), .flags = flags }, stats);
+            if (access) |state| {
+                try emitResolve(allocator, state, op.pc, list, stats);
+                if (!flags.bounds_check_elided) try appendInst(list, allocator, .{
+                    .kind = .check_bounds,
+                    .pc = op.pc,
+                    .uses = try dupeValues(allocator, op.uses[1..2]),
+                    .address = state.address,
+                    .state_handle = state.handle,
+                    .reloc_token = state.token,
+                    .resolve_id = state.resolve,
+                }, stats);
+                try appendInst(list, allocator, try ownOperands(allocator, .{
+                    .kind = .array_load_ptr,
+                    .pc = op.pc,
+                    .address = state.address,
+                    .state_handle = state.handle,
+                    .reloc_token = state.token,
+                    .resolve_id = state.resolve,
+                    .flags = flags,
+                }, op.defs, op.uses[1..]), stats);
+                stats.pointer_accesses += 1;
+            } else {
+                if (!flags.bounds_check_elided) try appendInst(list, allocator, .{ .kind = .check_bounds, .pc = op.pc, .uses = try dupeValues(allocator, op.uses[0..2]) }, stats);
+                try appendInst(list, allocator, try ownOperands(allocator, .{ .kind = .array_load, .pc = op.pc, .flags = flags }, op.defs, op.uses), stats);
+            }
         },
         .aput, .aput_wide, .aput_object, .aput_boolean, .aput_byte, .aput_char, .aput_short => {
-            try appendInst(list, allocator, .{ .kind = .array_store, .pc = op.pc, .uses = try dupeValues(allocator, op.uses), .flags = flags }, stats);
+            const array_and_index = op.uses[op.uses.len - 2 ..];
+            const index = op.uses[op.uses.len - 1];
+            if (!flags.null_check_elided) try appendInst(list, allocator, .{ .kind = .check_null, .pc = op.pc, .uses = try dupeValues(allocator, array_and_index[0..1]) }, stats);
+            if (access) |state| {
+                try emitResolve(allocator, state, op.pc, list, stats);
+                if (!flags.bounds_check_elided) try appendInst(list, allocator, .{
+                    .kind = .check_bounds,
+                    .pc = op.pc,
+                    .uses = try dupeValues(allocator, &[_]RuntimeValueId{index}),
+                    .address = state.address,
+                    .state_handle = state.handle,
+                    .reloc_token = state.token,
+                    .resolve_id = state.resolve,
+                }, stats);
+                try emitPreWrite(allocator, state, null, index, op.pc, list, stats);
+                const uses = [_]RuntimeValueId{ op.uses[0], index };
+                try appendInst(list, allocator, .{
+                    .kind = .array_store_ptr,
+                    .pc = op.pc,
+                    .uses = try dupeValues(allocator, &uses),
+                    .address = state.address,
+                    .state_handle = state.handle,
+                    .reloc_token = state.token,
+                    .resolve_id = state.resolve,
+                    .flags = flags,
+                }, stats);
+                stats.pointer_accesses += 1;
+                try emitPostWrite(allocator, state, op.uses[0..1], op.pc, list, stats);
+            } else {
+                if (!flags.bounds_check_elided) try appendInst(list, allocator, .{ .kind = .check_bounds, .pc = op.pc, .uses = try dupeValues(allocator, array_and_index) }, stats);
+                try appendInst(list, allocator, .{ .kind = .array_store, .pc = op.pc, .uses = try dupeValues(allocator, op.uses), .flags = flags }, stats);
+            }
         },
         .iget, .iget_wide, .iget_object, .iget_boolean, .iget_byte, .iget_char, .iget_short, .iget_quick, .iget_wide_quick, .iget_object_quick => {
             if (!flags.null_check_elided) try appendInst(list, allocator, .{ .kind = .check_null, .pc = op.pc, .uses = try dupeValues(allocator, op.uses[0..1]) }, stats);
-            try appendInst(list, allocator, .{ .kind = .field_load, .pc = op.pc, .defs = try dupeValues(allocator, op.defs), .uses = try dupeValues(allocator, op.uses), .field_idx = fieldIndex(op.inst), .flags = flags }, stats);
+            if (access) |state| {
+                try emitResolve(allocator, state, op.pc, list, stats);
+                try appendInst(list, allocator, try ownOperands(allocator, .{
+                    .kind = .field_load_ptr,
+                    .pc = op.pc,
+                    .field_idx = fieldIndex(op.inst),
+                    .address = state.address,
+                    .state_handle = state.handle,
+                    .reloc_token = state.token,
+                    .resolve_id = state.resolve,
+                    .flags = flags,
+                }, op.defs, &.{}), stats);
+                stats.pointer_accesses += 1;
+            } else {
+                try appendInst(list, allocator, try ownOperands(allocator, .{ .kind = .field_load, .pc = op.pc, .field_idx = fieldIndex(op.inst), .flags = flags }, op.defs, op.uses), stats);
+            }
         },
         .iput, .iput_wide, .iput_object, .iput_boolean, .iput_byte, .iput_char, .iput_short, .iput_quick, .iput_wide_quick, .iput_object_quick => {
-            try appendInst(list, allocator, .{ .kind = .field_store, .pc = op.pc, .uses = try dupeValues(allocator, op.uses), .field_idx = fieldIndex(op.inst), .flags = flags }, stats);
+            if (access) |state| {
+                try emitResolve(allocator, state, op.pc, list, stats);
+                try emitPreWrite(allocator, state, fieldIndex(op.inst), null, op.pc, list, stats);
+                try appendInst(list, allocator, .{
+                    .kind = .field_store_ptr,
+                    .pc = op.pc,
+                    .uses = try dupeValues(allocator, op.uses[0 .. op.uses.len - 1]),
+                    .field_idx = fieldIndex(op.inst),
+                    .address = state.address,
+                    .state_handle = state.handle,
+                    .reloc_token = state.token,
+                    .resolve_id = state.resolve,
+                    .flags = flags,
+                }, stats);
+                stats.pointer_accesses += 1;
+                try emitPostWrite(allocator, state, op.uses[0..1], op.pc, list, stats);
+            } else {
+                try appendInst(list, allocator, .{ .kind = .field_store, .pc = op.pc, .uses = try dupeValues(allocator, op.uses), .field_idx = fieldIndex(op.inst), .flags = flags }, stats);
+            }
         },
         .sget, .sget_wide, .sget_object, .sget_boolean, .sget_byte, .sget_char, .sget_short => {
             try appendInst(list, allocator, .{ .kind = .static_load, .pc = op.pc, .defs = try dupeValues(allocator, op.defs), .field_idx = fieldIndex(op.inst), .flags = flags }, stats);
         },
-        .sput, .sput_wide, .sput_object, .sput_boolean, .sput_byte, .sput_char, .sput_short => {
+        .sput_object => {
+            const plan = inputs.barriers orelse return error.InvalidInput;
+            const barrier = plan.ops[block_id][op_index];
+            const index = fieldIndex(op.inst) orelse return error.InvalidInput;
+            if (op.uses.len != 1) return error.InvalidInput;
+            try emitStaticReferenceStore(allocator, index, op.uses[0], barrier.pre_write, barrier.post_write, op.pc, flags, list, stats);
+        },
+        .sput, .sput_wide, .sput_boolean, .sput_byte, .sput_char, .sput_short => {
             try appendInst(list, allocator, .{ .kind = .static_store, .pc = op.pc, .uses = try dupeValues(allocator, op.uses), .field_idx = fieldIndex(op.inst), .flags = flags }, stats);
         },
         .invoke, .invoke_virtual_quick, .invoke_super_quick => {
             const kind = lowerCallKind(op.inst, tinfo);
             if (kind == .call_direct or kind == .call_static or kind == .call_quick) stats.direct_calls += 1;
-            try appendInst(list, allocator, .{ .kind = kind, .pc = op.pc, .defs = try dupeValues(allocator, op.defs), .uses = try dupeValues(allocator, op.uses), .flags = flags }, stats);
+            if (access) |state| {
+                try emitResolve(allocator, state, op.pc, list, stats);
+                const call = try ownOperands(allocator, .{
+                    .kind = kind,
+                    .pc = op.pc,
+                    .address = state.address,
+                    .state_handle = state.handle,
+                    .reloc_token = state.token,
+                    .resolve_id = state.resolve,
+                    .flags = flags,
+                }, op.defs, op.uses);
+                try appendInst(list, allocator, call, stats);
+            } else {
+                try appendInst(list, allocator, try ownOperands(allocator, .{ .kind = kind, .pc = op.pc, .flags = flags }, op.defs, op.uses), stats);
+            }
         },
         else => {
             const kind = lowerArithmetic(op.inst, tinfo.lowering);
-            try appendInst(list, allocator, .{ .kind = kind, .pc = op.pc, .defs = try dupeValues(allocator, op.defs), .uses = try dupeValues(allocator, op.uses), .field_idx = fieldIndex(op.inst), .flags = flags }, stats);
+            try appendInst(list, allocator, try ownOperands(allocator, .{ .kind = kind, .pc = op.pc, .field_idx = fieldIndex(op.inst), .flags = flags }, op.defs, op.uses), stats);
         },
     }
 }
 
 pub fn build(allocator: std.mem.Allocator, inputs: Inputs) Error!Function {
-    inputs.function.verify() catch return error.InvalidInput;
-    inputs.types.verify() catch return error.InvalidInput;
-    inputs.typed.verify() catch return error.InvalidInput;
+    inputs.function.verify() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidInput,
+    };
+    inputs.types.verify() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidInput,
+    };
+    inputs.typed.verify() catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.InvalidInput,
+    };
     if (inputs.types.source != inputs.function or inputs.typed.source != inputs.function) return error.InvalidInput;
     if (inputs.ssa_facts) |facts| if (facts.function != inputs.function) return error.InvalidInput;
     if (inputs.memory) |memory| if (memory.function != inputs.function) return error.InvalidInput;
+    if (inputs.barriers) |barriers| {
+        barriers.verify() catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidInput,
+        };
+        if (barriers.function != inputs.function or barriers.types != inputs.types) return error.InvalidInput;
+    }
 
-    const value_types = try allocator.alloc(typedir.Type, inputs.function.values.len);
+    const resolve_count = if (inputs.barriers) |barriers| barriers.resolves.len else 0;
+    if (resolve_count > std.math.maxInt(RuntimeValueId) - inputs.function.values.len) return error.InvalidInput;
+    const runtime_value_count = inputs.function.values.len + resolve_count;
+
+    const value_types = try allocator.alloc(typedir.Type, runtime_value_count);
     errdefer allocator.free(value_types);
-    for (value_types, 0..) |*slot, i| slot.* = inputs.types.typeOf(@intCast(i)) orelse .unknown;
+    const runtime_values = try allocator.alloc(RuntimeValueClass, runtime_value_count);
+    errdefer allocator.free(runtime_values);
+    const resolve_values = try allocator.alloc(RuntimeValueId, resolve_count);
+    errdefer allocator.free(resolve_values);
+    for (inputs.function.values, 0..) |value, i| {
+        const ty = inputs.types.typeOf(value.id) orelse .unknown;
+        value_types[i] = ty;
+        runtime_values[i] = .{ .dalvik = .{ .value = value.id, .ty = ty, .gc_root = ty == .object } };
+    }
+    // Directional type inference intentionally leaves write-only parameters
+    // unknown. Object-store opcodes nevertheless prove that their first use is
+    // a Handle, so keep it visible to root maps and native barrier lowering.
+    for (inputs.function.blocks) |block| {
+        for (block.ops) |op| switch (op.inst) {
+            .iput_object,
+            .iput_object_quick,
+            .aput_object,
+            .sput_object,
+            => {
+                if (op.uses.len == 0) return error.InvalidInput;
+                const value = op.uses[0];
+                if (value >= inputs.function.values.len) return error.InvalidInput;
+                switch (runtime_values[value]) {
+                    .dalvik => |*stored| stored.gc_root = true,
+                    .derived_ptr => return error.InvalidInput,
+                }
+            },
+            else => {},
+        };
+    }
+    if (inputs.barriers) |barriers| {
+        for (barriers.resolves, 0..) |resolve, i| {
+            const value: RuntimeValueId = @intCast(inputs.function.values.len + i);
+            resolve_values[i] = value;
+            value_types[value] = .long;
+            runtime_values[value] = .{ .derived_ptr = .{
+                .handle = resolve.handle,
+                .token = resolve.token,
+                .resolve = @intCast(i),
+            } };
+            const handle_class = &runtime_values[resolve.handle];
+            switch (handle_class.*) {
+                .dalvik => |*handle| handle.gc_root = true,
+                .derived_ptr => return error.InvalidInput,
+            }
+        }
+    }
 
     const blocks = try allocator.alloc(Block, inputs.function.blocks.len);
     errdefer allocator.free(blocks);
@@ -430,7 +1014,7 @@ pub fn build(allocator: std.mem.Allocator, inputs: Inputs) Error!Function {
         }
     }
 
-    var stats: Stats = .{};
+    var stats: Stats = .{ .runtime_values = @intCast(runtime_value_count) };
     for (inputs.function.blocks, 0..) |block, block_i| {
         var list: std.ArrayList(Inst) = .empty;
         errdefer {
@@ -448,9 +1032,15 @@ pub fn build(allocator: std.mem.Allocator, inputs: Inputs) Error!Function {
             }, &stats);
         }
 
+        var emitted_hoists = false;
         for (block.ops, 0..) |op, op_i| {
+            if (!emitted_hoists and isControlTransfer(op.inst)) {
+                try emitHoistedResolves(allocator, inputs, @intCast(block_i), &list, &stats);
+                emitted_hoists = true;
+            }
             try lowerOperation(allocator, inputs, @intCast(block_i), op_i, op, &list, &stats);
         }
+        if (!emitted_hoists) try emitHoistedResolves(allocator, inputs, @intCast(block_i), &list, &stats);
 
         blocks[block_i] = .{ .id = @intCast(block_i), .insts = try list.toOwnedSlice(allocator) };
         built_blocks += 1;
@@ -461,6 +1051,9 @@ pub fn build(allocator: std.mem.Allocator, inputs: Inputs) Error!Function {
         .source = inputs.function,
         .blocks = blocks,
         .value_types = value_types,
+        .runtime_values = runtime_values,
+        .resolve_values = resolve_values,
+        .barriers = inputs.barriers,
         .stats = stats,
     };
 }

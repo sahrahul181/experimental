@@ -1,8 +1,6 @@
-//! Pure Interpreter: ALU, Conversions, and Control Flow
-//! No heap, no object model, no runtime dependencies.
-//! Runtime-dependent opcodes (invoke, field, array, object, exception,
-//! monitor) all return error.UnimplementedOpcode and are handled by a
-//! higher-level VM driver layer.
+//! Compact interpreter with an optional type-erased managed-memory attachment.
+//! The frontend remains independent of a concrete heap/collector; a VM driver
+//! supplies allocation-free callbacks for managed reference accesses.
 
 const std = @import("std");
 const instmod = @import("instructions");
@@ -25,6 +23,29 @@ pub const RuntimeError = error{
     UnimplementedOpcode,
     UnexpectedEndOfCode,
     OutOfMemory,
+    ManagedMemoryFailure,
+    NullReference,
+    ArrayIndexOutOfBounds,
+    MissingManagedMemory,
+    InvalidFrame,
+};
+
+pub const ManagedMemoryStatus = enum(u8) {
+    ok,
+    null_reference,
+    array_index_out_of_bounds,
+    failure,
+};
+
+pub const ManagedMemoryVTable = struct {
+    store_instance_reference: *const fn (*anyopaque, u64, u32, u64) ManagedMemoryStatus,
+    store_array_reference: *const fn (*anyopaque, u64, i32, u64) ManagedMemoryStatus,
+    store_static_reference: *const fn (*anyopaque, u32, u64) ManagedMemoryStatus,
+};
+
+pub const ManagedMemory = struct {
+    context: *anyopaque,
+    vtable: *const ManagedMemoryVTable,
 };
 
 pub const ExecutionFrame = struct {
@@ -32,7 +53,12 @@ pub const ExecutionFrame = struct {
     registers: []u32,
     instructions: []const Instruction,
     result_register: [2]u32 = .{ 0, 0 },
+    result_reference: u64 = 0,
     register_is_ref: []bool = &.{},
+    /// Full-width managed handles indexed by Dalvik register. Scalar values
+    /// remain in `registers`; this sidecar preserves handle generation bits.
+    reference_registers: []u64 = &.{},
+    managed_memory: ?ManagedMemory = null,
 
     // --- Helper Methods for Type Punning ---
     // Dalvik registers are untyped 32-bit slots. These helpers safely cast
@@ -161,7 +187,36 @@ inline fn setRefWide(regs_is_ref: []bool, reg: u16, val: bool) void {
     }
 }
 
+inline fn referenceBits(frame: *const ExecutionFrame, reg: u16) u64 {
+    if (frame.reference_registers.len != 0) return frame.reference_registers[reg];
+    return frame.registers[reg];
+}
+
+inline fn setReferenceBits(frame: *ExecutionFrame, reg: u16, bits: u64) void {
+    frame.registers[reg] = @truncate(bits);
+    if (frame.reference_registers.len != 0) frame.reference_registers[reg] = bits;
+    setRef(frame.register_is_ref, reg, true);
+}
+
+fn managedStatus(status: ManagedMemoryStatus) RuntimeError!void {
+    return switch (status) {
+        .ok => {},
+        .null_reference => error.NullReference,
+        .array_index_out_of_bounds => error.ArrayIndexOutOfBounds,
+        .failure => error.ManagedMemoryFailure,
+    };
+}
+
+fn managedMemory(frame: *const ExecutionFrame) RuntimeError!ManagedMemory {
+    return frame.managed_memory orelse error.MissingManagedMemory;
+}
+
 pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
+    if ((frame.register_is_ref.len != 0 and frame.register_is_ref.len != frame.registers.len) or
+        (frame.reference_registers.len != 0 and frame.reference_registers.len != frame.registers.len))
+    {
+        return error.InvalidFrame;
+    }
     // OPTIMIZATION 5: Safety Stripping
     // We explicitly disable runtime bounds checking inside the hot loop.
     // The DEX parser/verifier guarantees that `pc` and register indices are bounds-safe.
@@ -218,8 +273,7 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
                 setRefWide(regs_is_ref, op.dest, false);
             },
             .move_object => |op| {
-                regs[op.dest] = regs[op.src];
-                setRef(regs_is_ref, op.dest, if (regs_is_ref.len > 0) regs_is_ref[op.src] else true);
+                setReferenceBits(frame, op.dest, referenceBits(frame, op.src));
             },
 
             .move_result => |op| {
@@ -227,8 +281,7 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
                 setRef(regs_is_ref, op.dest, false);
             },
             .move_result_object => |op| {
-                regs[op.dest] = frame.result_register[0];
-                setRef(regs_is_ref, op.dest, true);
+                setReferenceBits(frame, op.dest, if (frame.reference_registers.len != 0) frame.result_reference else frame.result_register[0]);
             },
             .move_result_wide => |op| {
                 const ptr: *u64 = @ptrCast(@alignCast(&frame.result_register));
@@ -777,7 +830,14 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
 
             .sput => return error.UnimplementedOpcode,
             .sput_wide => return error.UnimplementedOpcode,
-            .sput_object => return error.UnimplementedOpcode,
+            .sput_object => |op| {
+                const memory = try managedMemory(frame);
+                try managedStatus(memory.vtable.store_static_reference(
+                    memory.context,
+                    op.field_idx,
+                    referenceBits(frame, op.dest_or_src),
+                ));
+            },
             .sput_boolean => return error.UnimplementedOpcode,
             .sput_byte => return error.UnimplementedOpcode,
             .sput_char => return error.UnimplementedOpcode,
@@ -794,7 +854,15 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
 
             .iput => return error.UnimplementedOpcode,
             .iput_wide => return error.UnimplementedOpcode,
-            .iput_object => return error.UnimplementedOpcode,
+            .iput_object => |op| {
+                const memory = try managedMemory(frame);
+                try managedStatus(memory.vtable.store_instance_reference(
+                    memory.context,
+                    referenceBits(frame, op.obj),
+                    op.field_idx,
+                    referenceBits(frame, op.dest_or_src),
+                ));
+            },
             .iput_boolean => return error.UnimplementedOpcode,
             .iput_byte => return error.UnimplementedOpcode,
             .iput_char => return error.UnimplementedOpcode,
@@ -806,7 +874,15 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
             .iget_object_quick => return error.UnimplementedOpcode,
             .iput_quick => return error.UnimplementedOpcode,
             .iput_wide_quick => return error.UnimplementedOpcode,
-            .iput_object_quick => return error.UnimplementedOpcode,
+            .iput_object_quick => |op| {
+                const memory = try managedMemory(frame);
+                try managedStatus(memory.vtable.store_instance_reference(
+                    memory.context,
+                    referenceBits(frame, op.obj),
+                    op.field_idx,
+                    referenceBits(frame, op.dest_or_src),
+                ));
+            },
 
             // ==========================================
             // PHASE 7: Method Invocation
@@ -843,7 +919,15 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
 
             .aput => return error.UnimplementedOpcode,
             .aput_wide => return error.UnimplementedOpcode,
-            .aput_object => return error.UnimplementedOpcode,
+            .aput_object => |op| {
+                const memory = try managedMemory(frame);
+                try managedStatus(memory.vtable.store_array_reference(
+                    memory.context,
+                    referenceBits(frame, op.array),
+                    getInt(regs, op.index),
+                    referenceBits(frame, op.dest_or_src),
+                ));
+            },
             .aput_boolean => return error.UnimplementedOpcode,
             .aput_byte => return error.UnimplementedOpcode,
             .aput_char => return error.UnimplementedOpcode,
@@ -866,7 +950,8 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
             },
             .return_object => |op| {
                 frame.pc = pc;
-                return ExecutionResult{ .kind = .object, .value32 = regs[op.src] };
+                const bits = referenceBits(frame, op.src);
+                return ExecutionResult{ .kind = .object, .value32 = @truncate(bits), .value64 = bits };
             },
         }
     }
@@ -881,6 +966,63 @@ fn testExecute(insts: []const Instruction, regs: []u32) RuntimeError!ExecutionRe
         .instructions = insts,
     };
     return execute(&frame);
+}
+
+const TestManagedMemory = struct {
+    instance: [3]u64 = @splat(0),
+    array: [3]u64 = @splat(0),
+    static: [2]u64 = @splat(0),
+
+    fn storeInstance(raw: *anyopaque, object: u64, field: u32, value: u64) ManagedMemoryStatus {
+        const self: *TestManagedMemory = @ptrCast(@alignCast(raw));
+        self.instance = .{ object, field, value };
+        return .ok;
+    }
+
+    fn storeArray(raw: *anyopaque, array: u64, index: i32, value: u64) ManagedMemoryStatus {
+        const self: *TestManagedMemory = @ptrCast(@alignCast(raw));
+        self.array = .{ array, @bitCast(@as(i64, index)), value };
+        return .ok;
+    }
+
+    fn storeStatic(raw: *anyopaque, field: u32, value: u64) ManagedMemoryStatus {
+        const self: *TestManagedMemory = @ptrCast(@alignCast(raw));
+        self.static = .{ field, value };
+        return .ok;
+    }
+
+    const table = ManagedMemoryVTable{
+        .store_instance_reference = storeInstance,
+        .store_array_reference = storeArray,
+        .store_static_reference = storeStatic,
+    };
+};
+
+test "interpreter reference stores preserve full handles through managed callbacks" {
+    const object_bits: u64 = 0x1122_3344_5566_7788;
+    const value_bits: u64 = 0x8877_6655_4433_2211;
+    var registers = [_]u32{ 0, 0, 0, 2 };
+    var references = [_]u64{ object_bits, value_bits, object_bits, 0 };
+    var reference_bits = [_]bool{ true, true, true, false };
+    var memory: TestManagedMemory = .{};
+    const insts = [_]Instruction{
+        .{ .iput_object = .{ .field_idx = 7, .dest_or_src = 1, .obj = 0 } },
+        .{ .aput_object = .{ .dest_or_src = 1, .array = 2, .index = 3 } },
+        .{ .sput_object = .{ .field_idx = 9, .dest_or_src = 1 } },
+        .return_void,
+    };
+    var frame = ExecutionFrame{
+        .pc = 0,
+        .registers = &registers,
+        .instructions = &insts,
+        .register_is_ref = &reference_bits,
+        .reference_registers = &references,
+        .managed_memory = .{ .context = &memory, .vtable = &TestManagedMemory.table },
+    };
+    _ = try execute(&frame);
+    try std.testing.expectEqualSlices(u64, &.{ object_bits, 7, value_bits }, &memory.instance);
+    try std.testing.expectEqualSlices(u64, &.{ object_bits, 2, value_bits }, &memory.array);
+    try std.testing.expectEqualSlices(u64, &.{ 9, value_bits }, &memory.static);
 }
 
 test "ExecutionFrame register helpers" {

@@ -362,11 +362,18 @@ fn collectUsesDefs(allocator: std.mem.Allocator, inst: Instruction, uses: *std.A
             if (invoke.dest) |dest| try appendReg(defs, allocator, dest);
         },
 
-        .neg_int, .not_int, .neg_float,
-        .int_to_float, .int_to_double,
-        .float_to_int, .float_to_double,
-        .double_to_int, .double_to_float,
-        .int_to_byte, .int_to_char, .int_to_short,
+        .neg_int,
+        .not_int,
+        .neg_float,
+        .int_to_float,
+        .int_to_double,
+        .float_to_int,
+        .float_to_double,
+        .double_to_int,
+        .double_to_float,
+        .int_to_byte,
+        .int_to_char,
+        .int_to_short,
         => |op| {
             try appendReg(uses, allocator, op.src);
             try appendReg(defs, allocator, op.dest);
@@ -375,8 +382,12 @@ fn collectUsesDefs(allocator: std.mem.Allocator, inst: Instruction, uses: *std.A
             try appendReg(uses, allocator, op.src);
             try appendWide(defs, allocator, op.dest);
         },
-        .neg_long, .not_long, .neg_double,
-        .long_to_int, .long_to_float, .long_to_double,
+        .neg_long,
+        .not_long,
+        .neg_double,
+        .long_to_int,
+        .long_to_float,
+        .long_to_double,
         .double_to_long,
         => |op| {
             try appendWide(uses, allocator, op.src);
@@ -387,17 +398,40 @@ fn collectUsesDefs(allocator: std.mem.Allocator, inst: Instruction, uses: *std.A
             }
         },
 
-        .add_int, .sub_int, .mul_int, .div_int, .rem_int,
-        .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int,
-        .add_float, .sub_float, .mul_float, .div_float, .rem_float,
+        .add_int,
+        .sub_int,
+        .mul_int,
+        .div_int,
+        .rem_int,
+        .and_int,
+        .or_int,
+        .xor_int,
+        .shl_int,
+        .shr_int,
+        .ushr_int,
+        .add_float,
+        .sub_float,
+        .mul_float,
+        .div_float,
+        .rem_float,
         => |op| {
             try appendReg(uses, allocator, op.src1);
             try appendReg(uses, allocator, op.src2);
             try appendReg(defs, allocator, op.dest);
         },
-        .add_long, .sub_long, .mul_long, .div_long, .rem_long,
-        .and_long, .or_long, .xor_long,
-        .add_double, .sub_double, .mul_double, .div_double, .rem_double,
+        .add_long,
+        .sub_long,
+        .mul_long,
+        .div_long,
+        .rem_long,
+        .and_long,
+        .or_long,
+        .xor_long,
+        .add_double,
+        .sub_double,
+        .mul_double,
+        .div_double,
+        .rem_double,
         => |op| {
             try appendWide(uses, allocator, op.src1);
             try appendWide(uses, allocator, op.src2);
@@ -409,15 +443,29 @@ fn collectUsesDefs(allocator: std.mem.Allocator, inst: Instruction, uses: *std.A
             try appendWide(defs, allocator, op.dest);
         },
 
-        .add_int_lit16, .rsub_int_lit16, .mul_int_lit16, .div_int_lit16,
-        .rem_int_lit16, .and_int_lit16, .or_int_lit16, .xor_int_lit16,
+        .add_int_lit16,
+        .rsub_int_lit16,
+        .mul_int_lit16,
+        .div_int_lit16,
+        .rem_int_lit16,
+        .and_int_lit16,
+        .or_int_lit16,
+        .xor_int_lit16,
         => |op| {
             try appendReg(uses, allocator, op.src);
             try appendReg(defs, allocator, op.dest);
         },
-        .add_int_lit8, .rsub_int_lit8, .mul_int_lit8, .div_int_lit8,
-        .rem_int_lit8, .and_int_lit8, .or_int_lit8, .xor_int_lit8,
-        .shl_int_lit8, .shr_int_lit8, .ushr_int_lit8,
+        .add_int_lit8,
+        .rsub_int_lit8,
+        .mul_int_lit8,
+        .div_int_lit8,
+        .rem_int_lit8,
+        .and_int_lit8,
+        .or_int_lit8,
+        .xor_int_lit8,
+        .shl_int_lit8,
+        .shr_int_lit8,
+        .ushr_int_lit8,
         => |op| {
             try appendReg(uses, allocator, op.src);
             try appendReg(defs, allocator, op.dest);
@@ -680,13 +728,18 @@ pub fn build(allocator: std.mem.Allocator, graph: *const cfg.Graph, tree: *const
 
     for (0..block_count) |block_id| {
         const phi_slice = try allocator.alloc(Phi, mutable_phis[block_id].items.len);
-        errdefer allocator.free(phi_slice);
+        var phis_built: usize = 0;
+        errdefer {
+            for (phi_slice[0..phis_built]) |phi| allocator.free(phi.incoming);
+            allocator.free(phi_slice);
+        }
         for (mutable_phis[block_id].items, 0..) |*phi, i| {
             phi_slice[i] = .{
                 .reg = phi.reg,
                 .dest = phi.dest,
                 .incoming = try phi.incoming.toOwnedSlice(allocator),
             };
+            phis_built += 1;
         }
 
         const op_slice = try op_lists[block_id].toOwnedSlice(allocator);

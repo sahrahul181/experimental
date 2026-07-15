@@ -6,9 +6,10 @@
 const std = @import("std");
 const linear_scan = @import("linear_scan");
 const spill_rewrite = @import("spill_rewrite");
+const post_derived_verify = @import("post_derived_verify");
 const machine = @import("machine_bridge");
 
-pub const Error = linear_scan.Error || spill_rewrite.Error;
+pub const Error = linear_scan.Error || spill_rewrite.Error || post_derived_verify.Error;
 pub const RegClass = linear_scan.RegClass;
 pub const PhysReg = linear_scan.PhysReg;
 pub const Location = linear_scan.Location;
@@ -21,6 +22,7 @@ pub const SpillSlot = spill_rewrite.SpillSlot;
 pub const Result = struct {
     allocation: Allocation,
     spill_plan: SpillPlan,
+    derived_stats: post_derived_verify.Stats,
 
     pub fn deinit(self: *Result) void {
         self.spill_plan.deinit();
@@ -31,21 +33,35 @@ pub const Result = struct {
     pub fn verify(self: *const Result) Error!void {
         try self.allocation.verify();
         try self.spill_plan.verify();
+        _ = try post_derived_verify.verify(self.allocation.allocator, &self.allocation, &self.spill_plan);
     }
 
     pub fn print(self: *const Result, writer: anytype) !void {
         try writer.print("regalloc_pipeline\n", .{});
         try self.allocation.print(writer);
         try self.spill_plan.print(writer);
+        try writer.print(
+            "post_derived_verify derived={d} physical={d} state_uses={d} root_spills={d} overlap_pairs={d}\n",
+            .{
+                self.derived_stats.derived_intervals,
+                self.derived_stats.physical_derived,
+                self.derived_stats.canonical_handle_uses,
+                self.derived_stats.root_spills_checked,
+                self.derived_stats.overlap_pairs_checked,
+            },
+        );
     }
 };
 
 pub fn allocate(allocator: std.mem.Allocator, function: *const machine.Function, options: Options) Error!Allocation {
-    return linear_scan.allocate(allocator, function, options);
+    var allocation = try linear_scan.allocate(allocator, function, options);
+    errdefer allocation.deinit();
+    _ = try post_derived_verify.verify(allocator, &allocation, null);
+    return allocation;
 }
 
 pub fn allocateDefault(allocator: std.mem.Allocator, function: *const machine.Function) Error!Allocation {
-    return linear_scan.allocateDefault(allocator, function);
+    return allocate(allocator, function, .{});
 }
 
 pub fn build(allocator: std.mem.Allocator, function: *const machine.Function, options: Options) Error!Result {
@@ -53,10 +69,12 @@ pub fn build(allocator: std.mem.Allocator, function: *const machine.Function, op
     errdefer allocation.deinit();
     var spill_plan = try spill_rewrite.build(allocator, &allocation);
     errdefer spill_plan.deinit();
+    const derived_stats = try post_derived_verify.verify(allocator, &allocation, &spill_plan);
 
     var result = Result{
         .allocation = allocation,
         .spill_plan = spill_plan,
+        .derived_stats = derived_stats,
     };
     try result.verify();
     return result;

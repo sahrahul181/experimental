@@ -20,6 +20,9 @@ pub const Error = code_buffer.Error || error{
 const MAGIC = [_]u8{ 'R', 'M', 'C', '1' };
 const NO_PC: u32 = std.math.maxInt(u32);
 const NO_FIELD: u32 = std.math.maxInt(u32);
+const NO_REG: u32 = std.math.maxInt(u32);
+const NO_TOKEN: u32 = std.math.maxInt(u32);
+const NO_RESOLVE: u32 = std.math.maxInt(u32);
 
 const Record = enum(u8) {
     header = 0x01,
@@ -110,7 +113,7 @@ fn emitRegList(buffer: *code_buffer.Buffer, regs: []const machine.RegId) Error!v
 fn emitHeader(buffer: *code_buffer.Buffer, function: *const machine.Function) Error!void {
     try buffer.emitU8(@intFromEnum(Record.header));
     try buffer.emitBytes(&MAGIC);
-    try buffer.emitU16(1);
+    try buffer.emitU16(2);
     try buffer.emitU32(@intCast(function.reg_types.len));
     try buffer.emitU32(@intCast(function.blocks.len));
 }
@@ -152,6 +155,10 @@ fn emitInst(buffer: *code_buffer.Buffer, labels: []const code_buffer.LabelId, in
     try emitRegList(buffer, inst.uses);
     try emitI64(buffer, inst.imm);
     try buffer.emitU32(inst.field_idx orelse NO_FIELD);
+    try buffer.emitU32(inst.address orelse NO_REG);
+    try buffer.emitU32(inst.state_handle orelse NO_REG);
+    try buffer.emitU32(inst.reloc_token orelse NO_TOKEN);
+    try buffer.emitU32(inst.resolve_id orelse NO_RESOLVE);
 
     switch (inst.opcode) {
         .jump => try emitTarget(buffer, try checkedLabel(labels, inst.target), stats),

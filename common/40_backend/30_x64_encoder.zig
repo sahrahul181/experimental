@@ -530,7 +530,7 @@ pub fn encode(allocator: std.mem.Allocator, source: *const machine.Function) Err
     };
 }
 
-fn optimizedMachine(allocator: std.mem.Allocator, insts: []const Instruction) !optimizer.OptimizedFunction {
+fn optimizedMachine(allocator: std.mem.Allocator, insts: []const Instruction) !*optimizer.OptimizedFunction {
     return try optimizer.optimize(allocator, insts, &.{}, .{});
 }
 
