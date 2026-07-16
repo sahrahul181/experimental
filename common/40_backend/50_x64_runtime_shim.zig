@@ -49,10 +49,18 @@ pub const CallFrame = extern struct {
     gp_args: [6]usize = @splat(0),
 };
 
+pub const OsrCallFrame = extern struct {
+    image: runtime_jit.RegisterImage,
+    target: usize,
+    gp: [16]u64 = @splat(0),
+};
+
 pub const EncodedShims = struct {
     allocator: std.mem.Allocator,
     entry: []u8,
+    osr_entry: []u8,
     slow_helper: []u8,
+    deopt_helper: []u8,
     bounds_exception_helper: []u8,
     satb_pre_write_helper: []u8,
     card_mark_helper: []u8,
@@ -66,7 +74,9 @@ pub const EncodedShims = struct {
         self.allocator.free(self.satb_pre_write_helper);
         self.allocator.free(self.bounds_exception_helper);
         self.allocator.free(self.slow_helper);
+        self.allocator.free(self.deopt_helper);
         self.allocator.free(self.entry);
+        self.allocator.free(self.osr_entry);
         self.* = undefined;
     }
 };
@@ -213,6 +223,33 @@ fn emitSlowHelper(buffer: *code_buffer.Buffer, bridge_address: usize) Error!void
     try buffer.emitU8(0xc3);
     try buffer.bindLabel(failed);
     try buffer.emitBytes(&.{ 0x0f, 0x0b }); // fail closed: ud2
+}
+
+fn emitDeoptHelper(buffer: *code_buffer.Buffer, bridge_address: usize) Error!void {
+    try emitCapturedGpRegisters(buffer);
+    try emitSavedManagedRegisters(buffer);
+    const home_bytes: u32 = if (builtin.os.tag == .windows) 32 else 0;
+    const alignment_bytes: u32 = 8;
+    const frame_bytes = home_bytes + xmm_save_bytes + alignment_bytes;
+    try emitAdjustStack(buffer, true, frame_bytes);
+    try emitSavedXmmRegisters(buffer, home_bytes);
+
+    if (builtin.os.tag == .windows) {
+        try emitMovRegReg(buffer, rcx, r15);
+        try emitMovRegReg(buffer, rdx, r10);
+    } else {
+        try emitMovRegReg(buffer, rdi, r15);
+        try emitMovRegReg(buffer, rsi, r10);
+    }
+    try emitMovRegImm64(buffer, rax, bridge_address);
+    try emitCall(buffer, rax);
+    try emitMovRegReg(buffer, r10, rax);
+    try emitMovRegMem(buffer, r12, r15, @offsetOf(runtime_jit.NativeThreadState, "acknowledged_epoch"));
+
+    try emitRestoredXmmRegisters(buffer, home_bytes);
+    try emitAdjustStack(buffer, false, frame_bytes);
+    try emitRestoredManagedRegisters(buffer);
+    try buffer.emitU8(0xc3);
 }
 
 fn emitBarrierHelper(buffer: *code_buffer.Buffer, bridge_address: usize) Error!void {
@@ -415,6 +452,29 @@ fn emitEntry(buffer: *code_buffer.Buffer) Error!void {
     try buffer.emitU8(0xc3);
 }
 
+fn osrGpOffset(register: u4) u32 {
+    return @offsetOf(OsrCallFrame, "gp") + @as(u32, register) * @sizeOf(u64);
+}
+
+fn emitOsrEntry(buffer: *code_buffer.Buffer) Error!void {
+    const platform_frame = if (builtin.os.tag == .windows) rcx else rdi;
+    try emitReservedSave(buffer);
+    try emitAdjustStack(buffer, true, if (builtin.os.tag == .windows) 40 else 8);
+    try emitMovRegReg(buffer, r13, platform_frame);
+    try emitMovRegMem(buffer, r10, r13, @offsetOf(OsrCallFrame, "target"));
+    try emitMovRegMem(buffer, r14, r13, @offsetOf(OsrCallFrame, "image") + @offsetOf(runtime_jit.RegisterImage, "r14_descriptor_base"));
+    try emitMovRegMem(buffer, r15, r13, @offsetOf(OsrCallFrame, "image") + @offsetOf(runtime_jit.RegisterImage, "r15_thread_state"));
+    for ([_]u4{ rax, rcx, rdx, rsi, rdi, r8, r9 }) |register| {
+        try emitMovRegMem(buffer, register, r13, osrGpOffset(register));
+    }
+    try emitMovRegMem(buffer, r12, r13, @offsetOf(OsrCallFrame, "image") + @offsetOf(runtime_jit.RegisterImage, "r12_acknowledged_epoch"));
+    try emitMovRegMem(buffer, r13, r13, @offsetOf(OsrCallFrame, "image") + @offsetOf(runtime_jit.RegisterImage, "r13_region_bases"));
+    try emitCall(buffer, r10);
+    try emitAdjustStack(buffer, false, if (builtin.os.tag == .windows) 40 else 8);
+    try emitReservedRestore(buffer);
+    try buffer.emitU8(0xc3);
+}
+
 pub fn encode(allocator: std.mem.Allocator, bridge_address: usize) Error!EncodedShims {
     if (builtin.cpu.arch != .x86_64) return error.UnsupportedArchitecture;
     var entry_buffer = code_buffer.Buffer.init(allocator);
@@ -423,11 +483,23 @@ pub fn encode(allocator: std.mem.Allocator, bridge_address: usize) Error!Encoded
     const entry = try entry_buffer.finalize();
     errdefer allocator.free(entry);
 
+    var osr_entry_buffer = code_buffer.Buffer.init(allocator);
+    defer osr_entry_buffer.deinit();
+    try emitOsrEntry(&osr_entry_buffer);
+    const osr_entry = try osr_entry_buffer.finalize();
+    errdefer allocator.free(osr_entry);
+
     var helper_buffer = code_buffer.Buffer.init(allocator);
     defer helper_buffer.deinit();
     try emitSlowHelper(&helper_buffer, bridge_address);
     const slow_helper = try helper_buffer.finalize();
     errdefer allocator.free(slow_helper);
+
+    var deopt_buffer = code_buffer.Buffer.init(allocator);
+    defer deopt_buffer.deinit();
+    try emitDeoptHelper(&deopt_buffer, @intFromPtr(&runtime_jit.midFunctionDeoptBridge));
+    const deopt_helper = try deopt_buffer.finalize();
+    errdefer allocator.free(deopt_helper);
 
     var bounds_buffer = code_buffer.Buffer.init(allocator);
     defer bounds_buffer.deinit();
@@ -460,7 +532,9 @@ pub fn encode(allocator: std.mem.Allocator, bridge_address: usize) Error!Encoded
     return .{
         .allocator = allocator,
         .entry = entry,
+        .osr_entry = osr_entry,
         .slow_helper = slow_helper,
+        .deopt_helper = deopt_helper,
         .bounds_exception_helper = bounds_exception_helper,
         .satb_pre_write_helper = satb_pre_write_helper,
         .card_mark_helper = card_mark_helper,
@@ -2282,6 +2356,355 @@ test "x64 deoptimization entry publishes captured references during handshake" {
     try std.testing.expectEqual(@as(u64, 1), runtime.stats().handshake_polls);
     try std.testing.expectEqual(@as(u64, 1), runtime.stats().deoptimizations);
     try std.testing.expectEqual(@as(u64, 0), manager.stats().active_leases);
+}
+
+test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+
+    var storage: [64]u8 align(runtime_value.object_alignment) = @splat(0);
+    const regions = [_]runtime_value.Region{try runtime_value.Region.fromSlice(&storage)};
+    var handles = try runtime_value.HandleTable.init(std.testing.allocator, 2, &regions);
+    defer handles.deinit();
+    var registry = try runtime_thread_registry.Registry.init(std.testing.allocator, std.testing.io, 1);
+    defer registry.deinit() catch unreachable;
+    var context = try runtime_thread_registry.ThreadContext.init(std.testing.allocator, 4);
+    defer context.deinit();
+    try registry.register(&context);
+    defer registry.unregister(&context) catch unreachable;
+
+    var shims = try encode(std.testing.allocator, @intFromPtr(&runtime_jit.slowResolveBridge));
+    defer shims.deinit();
+    var stable_cache = jit_memory.Cache.init(std.testing.allocator);
+    defer stable_cache.deinit();
+    const entry_code = try stable_cache.addBytes(shims.entry);
+    const slow_code = try stable_cache.addBytes(shims.slow_helper);
+    const deopt_code = try stable_cache.addBytes(shims.deopt_helper);
+
+    const insts = [_]Instruction{
+        .{ .iget = .{ .field_idx = 0, .dest_or_src = 1, .obj = 0 } },
+        .{ .return_ = .{ .src = 1 } },
+    };
+    var optimized = try optimizer.optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+    var handle_reg: ?u32 = null;
+    var site_id: ?u32 = null;
+    for (optimized.machine.blocks) |block| for (block.insts) |inst| {
+        if (inst.opcode == .resolve_handle and inst.pc == 0) {
+            handle_reg = inst.state_handle;
+            site_id = inst.resolve_id;
+        }
+    };
+    const point_values = [_]x64_encoder.DeoptValueSpec{
+        .{ .vreg = 0, .kind = .reference, .source = .{ .machine_register = handle_reg orelse return error.TestUnexpectedResult } },
+        .{ .vreg = 1, .kind = .scalar32, .source = .{ .constant = 0 } },
+    };
+    const points = [_]x64_encoder.DeoptPointSpec{.{
+        .id = 5,
+        .safepoint_id = site_id orelse return error.TestUnexpectedResult,
+        .method_id = 0,
+        .dex_pc = 0,
+        .values = &point_values,
+    }};
+    var dependency_epoch = std.atomic.Value(u64).init(1);
+    const layouts = [_]x64_encoder.FieldLayout{.{ .offset = 8, .storage = .i32 }};
+    var native = try x64_encoder.encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = .{
+            .handle_capacity = handles.entryCapacity(),
+            .region_count = handles.regionCount(),
+            .slow_resolve_helper = slow_code.entryAddress(),
+            .deopt_epoch_address = @intFromPtr(&dependency_epoch),
+            .compiled_deopt_epoch = 1,
+            .deopt_helper = deopt_code.entryAddress(),
+            .field_layouts = &layouts,
+        },
+        .deopt = .{ .points = &points, .register_count = 2, .max_dex_pc = 1 },
+    });
+    defer native.deinit();
+    try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_guards);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_traps);
+    const native_bytes = try native.finalize();
+    defer std.testing.allocator.free(native_bytes);
+    const maps = if (native.root_maps) |*value| value else return error.TestUnexpectedResult;
+    const deopt_table = if (native.deopt_table) |*value| value else return error.TestUnexpectedResult;
+
+    const MetadataOwner = struct {
+        references: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.references.fetchAdd(1, .acq_rel);
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const previous = self.references.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 1);
+        }
+    };
+    var metadata_owner = MetadataOwner{};
+    var manager = try runtime_code_manager.Manager.init(std.testing.allocator, 1, 1, 1);
+    defer manager.deinit() catch unreachable;
+    var candidate = try manager.prepareWithMetadata(native_bytes, .{
+        .context = &metadata_owner,
+        .stack_maps = @intFromPtr(maps),
+        .deopt_table = @intFromPtr(deopt_table),
+        .retain = MetadataOwner.retain,
+        .release = MetadataOwner.release,
+    });
+    defer candidate.deinit();
+    try manager.publish(0, &candidate);
+    try std.testing.expectEqual(@as(u32, 2), metadata_owner.references.load(.acquire));
+
+    var runtime = try runtime_jit.Runtime.init(std.testing.allocator, &handles, &registry);
+    defer runtime.deinit() catch unreachable;
+    try runtime.installCodeManager(&manager);
+    var registers: [2]u32 = @splat(0);
+    var references: [2]u64 = @splat(@as(u64, @bitCast(runtime_value.Handle.none)));
+    var reference_kinds: [2]bool = @splat(false);
+    var reconstructed = runtime_deopt.Frame{ .execution = .{
+        .pc = 0,
+        .registers = &registers,
+        .instructions = &.{},
+        .register_is_ref = &reference_kinds,
+        .reference_registers = &references,
+    } };
+    var scratch: [2]u64 = undefined;
+    var stack_anchor: u64 = 0;
+    const Resume = struct {
+        called: bool = false,
+
+        fn run(raw: *anyopaque, frame: *runtime_deopt.Frame) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.called = frame.active and frame.execution.register_is_ref[0];
+            return if (self.called) 77 else 0;
+        }
+    };
+    var resume_state = Resume{};
+    var request = runtime_deopt.Request{
+        .table = deopt_table,
+        .point_id = 5,
+        .destination = .{ .frame = &reconstructed, .scratch = &scratch },
+        .stack_base = @ptrCast(&stack_anchor),
+        .stack_max_offset = @sizeOf(@TypeOf(stack_anchor)),
+        .resume_context = &resume_state,
+        .resume_fn = Resume.run,
+    };
+    var managed = try runtime.enter(&context);
+    defer managed.deinit();
+    var frame = CallFrame{
+        .image = try managed.registerImage(),
+        .target = 0,
+        .deopt_request = @intFromPtr(&request),
+        .method_id = 0,
+    };
+    const handle = runtime_value.Handle{ .index = 0, .generation = 1 };
+    frame.gp_args[0] = @bitCast(handle);
+    dependency_epoch.store(2, .release);
+    const EntryFn = fn (*const CallFrame) callconv(.c) usize;
+    try std.testing.expectEqual(@as(usize, 77), entry_code.typedEntry(EntryFn)(&frame));
+    try std.testing.expect(resume_state.called);
+    try std.testing.expectEqual(runtime_jit.CodeDispatchStatus.deoptimized, managed.native_state.last_code_dispatch);
+    try std.testing.expectEqual(@as(u64, 0), manager.stats().active_leases);
+    try std.testing.expect(try manager.invalidate(0));
+    try std.testing.expectEqual(@as(u32, 1), try manager.reclaim());
+    try std.testing.expectEqual(@as(u32, 1), metadata_owner.references.load(.acquire));
+}
+
+test "x64 OSR entry installs the exported physical GP image" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var shims = try encode(std.testing.allocator, @intFromPtr(&runtime_jit.slowResolveBridge));
+    defer shims.deinit();
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const osr_entry = try cache.addBytes(shims.osr_entry);
+    // mov rax, r9; ret -- observes an allocator-visible register directly.
+    const target = try cache.addBytes(&.{ 0x4c, 0x89, 0xc8, 0xc3 });
+    var frame = OsrCallFrame{
+        .image = .{
+            .r12_acknowledged_epoch = 0,
+            .r13_region_bases = 0,
+            .r14_descriptor_base = 0,
+            .r15_thread_state = 0,
+            .handle_capacity = 0,
+            .region_count = 0,
+            .descriptor_stride = 0,
+        },
+        .target = target.entryAddress(),
+    };
+    frame.gp[r9] = 0x8877665544332211;
+    const EntryFn = fn (*const OsrCallFrame) callconv(.c) usize;
+    try std.testing.expectEqual(@as(usize, 0x8877665544332211), osr_entry.typedEntry(EntryFn)(&frame));
+}
+
+test "x64 compiler-owned OSR label executes under its code-version lease" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var object_space: [64]u8 align(runtime_value.object_alignment) = @splat(0);
+    std.mem.writeInt(i32, object_space[16..20], 0, .little);
+    const regions = [_]runtime_value.Region{try runtime_value.Region.fromSlice(&object_space)};
+    var handles = try runtime_value.HandleTable.init(std.testing.allocator, 2, &regions);
+    defer handles.deinit();
+    const handle = try handles.reserve(0, 0);
+    try handles.publish(handle, 0, @ptrCast(&object_space[8]));
+
+    var registry = try runtime_thread_registry.Registry.init(std.testing.allocator, std.testing.io, 1);
+    defer registry.deinit() catch unreachable;
+    var context = try runtime_thread_registry.ThreadContext.init(std.testing.allocator, 2);
+    defer context.deinit();
+    try registry.register(&context);
+    defer registry.unregister(&context) catch unreachable;
+
+    var shims = try encode(std.testing.allocator, @intFromPtr(&runtime_jit.slowResolveBridge));
+    defer shims.deinit();
+    var shim_cache = jit_memory.Cache.init(std.testing.allocator);
+    defer shim_cache.deinit();
+    const slow_helper = try shim_cache.addBytes(shims.slow_helper);
+    const deopt_helper = try shim_cache.addBytes(shims.deopt_helper);
+    const osr_adapter = try shim_cache.addBytes(shims.osr_entry);
+
+    const insts = [_]Instruction{
+        .{ .const_ = .{ .dest = 1, .value = 2 } },
+        .{ .goto_ = .{ .offset = 1 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 2, .obj = 0 } },
+        .{ .if_eqz = .{ .src = 1, .offset = 3 } },
+        .{ .add_int_lit8 = .{ .dest = 1, .src = 1, .lit = -1 } },
+        .{ .goto_ = .{ .offset = -3 } },
+        .{ .return_ = .{ .src = 2 } },
+    };
+    var optimized = try optimizer.optimize(std.testing.allocator, &insts, &.{}, .{
+        .enable_loop_resolve_hoisting = false,
+    });
+    defer optimized.deinit();
+    var site: ?u32 = null;
+    var dex_pc: ?u32 = null;
+    var header: ?u32 = null;
+    for (optimized.machine.blocks) |block| {
+        for (block.insts) |inst| {
+            if (inst.opcode != .resolve_handle) continue;
+            site = inst.resolve_id;
+            dex_pc = inst.pc;
+            header = block.id;
+        }
+    }
+    const safepoint = site orelse return error.TestUnexpectedResult;
+    const point_pc = dex_pc orelse return error.TestUnexpectedResult;
+    const loop_header = header orelse return error.TestUnexpectedResult;
+    const required = try x64_encoder.osrRequiredRegistersAtSite(std.testing.allocator, &optimized.machine, safepoint);
+    defer std.testing.allocator.free(required);
+    var values: [3]x64_encoder.DeoptValueSpec = undefined;
+    var assigned = [_]bool{false} ** 3;
+    for (required) |reg| {
+        const runtime_class = optimized.machine.runtime_values[reg];
+        const value_id = switch (runtime_class) {
+            .dalvik => |value| value.value,
+            .derived_ptr => return error.TestUnexpectedResult,
+        };
+        const vreg = optimized.function.values[value_id].reg;
+        if (vreg >= values.len or assigned[vreg]) return error.TestUnexpectedResult;
+        values[vreg] = .{
+            .vreg = vreg,
+            .kind = if (optimized.machine.isGcRoot(reg)) .reference else .scalar32,
+            .source = .{ .machine_register = reg },
+        };
+        assigned[vreg] = true;
+    }
+    if (!assigned[0]) return error.TestUnexpectedResult;
+    for (assigned, 0..) |is_assigned, vreg| {
+        if (is_assigned) continue;
+        if (vreg == 0) return error.TestUnexpectedResult;
+        values[vreg] = .{ .vreg = @intCast(vreg), .kind = .scalar32, .source = .{ .constant = 0 } };
+    }
+    const points = [_]x64_encoder.DeoptPointSpec{.{
+        .id = 51,
+        .safepoint_id = safepoint,
+        .method_id = 0,
+        .dex_pc = point_pc,
+        .values = &values,
+    }};
+    const osr_specs = [_]x64_encoder.OsrEntrySpec{.{ .point_id = 51, .block = loop_header }};
+    var dependency_epoch = std.atomic.Value(u64).init(0);
+    const layouts = [_]x64_encoder.FieldLayout{
+        .{ .offset = 0, .storage = .i32 },
+        .{ .offset = 8, .storage = .i32 },
+    };
+    var native = try x64_encoder.encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = .{
+            .handle_capacity = handles.entryCapacity(),
+            .region_count = handles.regionCount(),
+            .slow_resolve_helper = slow_helper.entryAddress(),
+            .deopt_epoch_address = @intFromPtr(&dependency_epoch),
+            .compiled_deopt_epoch = 0,
+            .deopt_helper = deopt_helper.entryAddress(),
+            .field_layouts = &layouts,
+        },
+        .deopt = .{ .points = &points, .register_count = 3, .max_dex_pc = 6 },
+        .osr_entries = &osr_specs,
+    });
+    defer native.deinit();
+    const stack_maps = if (native.root_maps) |*table| table else return error.TestUnexpectedResult;
+    const deopt_table = if (native.deopt_table) |*table| table else return error.TestUnexpectedResult;
+    const native_bytes = try native.finalize();
+    defer std.testing.allocator.free(native_bytes);
+
+    const Owner = struct {
+        references: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.references.fetchAdd(1, .acq_rel);
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.references.fetchSub(1, .acq_rel);
+        }
+    };
+    var owner: Owner = .{};
+    var manager = try runtime_code_manager.Manager.init(std.testing.allocator, 1, 1, 1);
+    defer manager.deinit() catch unreachable;
+    var candidate = try manager.prepareWithMetadata(native_bytes, .{
+        .context = @ptrCast(&owner),
+        .stack_maps = @intFromPtr(stack_maps),
+        .deopt_table = @intFromPtr(deopt_table),
+        .osr_entries = @intFromPtr(native.osr_entries.ptr),
+        .osr_entry_count = @intCast(native.osr_entries.len),
+        .retain = Owner.retain,
+        .release = Owner.release,
+    });
+    try manager.publish(0, &candidate);
+
+    var runtime = try runtime_jit.Runtime.init(std.testing.allocator, &handles, &registry);
+    defer runtime.deinit() catch unreachable;
+    try runtime.installCodeManager(&manager);
+    {
+        var managed = try runtime.enter(&context);
+        defer managed.deinit();
+        try managed.installRootMaps(stack_maps);
+        var frame_registers: [3]u32 = .{ 0, 2, 0 };
+        var frame_references: [3]u64 = .{ @bitCast(handle), @bitCast(runtime_value.Handle.none), @bitCast(runtime_value.Handle.none) };
+        var frame_reference_kinds: [3]bool = .{ true, false, false };
+        var interpreter_frame = runtime_deopt.Frame{
+            .method_id = 0,
+            .active = true,
+            .execution = .{
+                .pc = point_pc,
+                .registers = &frame_registers,
+                .instructions = &.{},
+                .register_is_ref = &frame_reference_kinds,
+                .reference_registers = &frame_references,
+            },
+        };
+        var gp: [16]u64 = @splat(0);
+        var scratch: [19]u64 = undefined;
+        try deopt_table.exportOsr(51, &interpreter_frame, .{ .native_registers = &gp, .scratch = &scratch });
+        const target = runtime_jit.codeOsrEnterBridge(&managed.native_state, 0, 0, 51);
+        var call_frame = OsrCallFrame{ .image = try managed.registerImage(), .target = target, .gp = gp };
+        const EntryFn = fn (*const OsrCallFrame) callconv(.c) usize;
+        const result = osr_adapter.typedEntry(EntryFn)(&call_frame);
+        try std.testing.expectEqual(@as(usize, 0), result);
+        try std.testing.expectEqual(@as(usize, 0), runtime_jit.codeLeaseExitBridge(&managed.native_state, result));
+        try std.testing.expectEqual(@as(u64, 0), manager.stats().active_leases);
+    }
+    try std.testing.expect(try manager.invalidate(0));
+    try std.testing.expectEqual(@as(u32, 1), try manager.reclaim());
+    try std.testing.expectEqual(@as(u32, 1), owner.references.load(.acquire));
 }
 
 test "x64 shim encoding is leak-free at every allocation failure" {

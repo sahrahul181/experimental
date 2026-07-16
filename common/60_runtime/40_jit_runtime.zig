@@ -38,6 +38,12 @@ pub const CodeDispatchStatus = enum(u32) {
     active_lease,
     deoptimized,
     deopt_failed,
+    fallback_osr_metadata,
+};
+
+pub const OsrEntry = extern struct {
+    point_id: u32,
+    code_offset: u32,
 };
 
 pub const ManagedExceptionKind = enum(u32) {
@@ -450,10 +456,48 @@ pub fn codeLeaseEnterBridge(
         error.NoCode => return codeFallback(state, .fallback_no_code, fallback_target),
         else => return codeFallback(state, .fallback_runtime_error, fallback_target),
     };
-    state.deopt_request = 0;
     state.last_code_dispatch = .ok;
     _ = state.runtime.counters.code_entries.fetchAdd(1, .monotonic);
     return lease_slot.*.?.entryAddress();
+}
+
+/// Acquires the same code-version lease as normal managed entry, then resolves
+/// a compiler-verified no-prologue OSR label owned by that exact version.
+/// Missing, malformed, or out-of-range metadata closes the lease and falls
+/// back without exposing an interior executable address.
+pub fn codeOsrEnterBridge(
+    state: *NativeThreadState,
+    fallback_target: usize,
+    method: u32,
+    point_id: u32,
+) callconv(.c) usize {
+    const base = codeLeaseEnterBridge(state, fallback_target, method, 0);
+    if (state.code_lease_slot == 0) return base;
+    const lease_slot: *?runtime_code_manager.Lease = @ptrFromInt(state.code_lease_slot);
+    const lease = if (lease_slot.*) |*value| value else return base;
+    const metadata = lease.metadata() orelse {
+        _ = codeLeaseExitBridge(state, 0);
+        return codeFallback(state, .fallback_osr_metadata, fallback_target);
+    };
+    if (metadata.osr_entries == 0 or metadata.osr_entry_count == 0) {
+        _ = codeLeaseExitBridge(state, 0);
+        return codeFallback(state, .fallback_osr_metadata, fallback_target);
+    }
+    const entries: [*]const OsrEntry = @ptrFromInt(metadata.osr_entries);
+    var previous: ?u32 = null;
+    for (entries[0..metadata.osr_entry_count]) |entry| {
+        if (previous) |id| if (entry.point_id <= id) break;
+        previous = entry.point_id;
+        if (entry.point_id < point_id) continue;
+        if (entry.point_id != point_id or entry.code_offset == 0 or entry.code_offset >= lease.codeSize() or
+            !std.mem.isAligned(entry.code_offset, 16) or entry.code_offset > std.math.maxInt(usize) - base)
+        {
+            break;
+        }
+        return base + entry.code_offset;
+    }
+    _ = codeLeaseExitBridge(state, 0);
+    return codeFallback(state, .fallback_osr_metadata, fallback_target);
 }
 
 /// Stable fallback ABI selected by the entry trampoline after invalidation.
@@ -468,12 +512,28 @@ pub fn deoptResumeBridge(
     _: usize,
 ) callconv(.c) usize {
     if (state.active == 0 or state.deopt_request == 0) {
-        state.last_code_dispatch = .deopt_failed;
-        _ = state.runtime.counters.deopt_failures.fetchAdd(1, .monotonic);
-        _ = state.runtime.counters.code_failures.fetchAdd(1, .monotonic);
-        return 0;
+        return deoptFailure(state, null);
     }
     const request: *runtime_deopt.Request = @ptrFromInt(state.deopt_request);
+    const result = resumeDeoptPoint(state, request, request.table, request.point_id);
+    state.deopt_request = 0;
+    return result;
+}
+
+fn deoptFailure(state: *NativeThreadState, frame: ?*runtime_deopt.Frame) usize {
+    if (frame) |value| value.active = false;
+    state.last_code_dispatch = .deopt_failed;
+    _ = state.runtime.counters.deopt_failures.fetchAdd(1, .monotonic);
+    _ = state.runtime.counters.code_failures.fetchAdd(1, .monotonic);
+    return 0;
+}
+
+fn resumeDeoptPoint(
+    state: *NativeThreadState,
+    request: *runtime_deopt.Request,
+    table: *const runtime_deopt.Table,
+    point_id: u32,
+) usize {
     const exception = if (state.pending_exception.kind == .none)
         request.exception
     else
@@ -483,8 +543,8 @@ pub fn deoptResumeBridge(
             .payload0 = @bitCast(@as(i64, state.pending_exception.index)),
             .payload1 = state.pending_exception.length,
         };
-    const frame = request.table.reconstruct(
-        request.point_id,
+    const frame = table.reconstruct(
+        point_id,
         .{
             .native_registers = &state.captured_gp,
             .stack_base = request.stack_base,
@@ -494,36 +554,37 @@ pub fn deoptResumeBridge(
         request.destination,
         request.reason,
         exception,
-    ) catch {
-        state.deopt_request = 0;
-        state.last_code_dispatch = .deopt_failed;
-        _ = state.runtime.counters.deopt_failures.fetchAdd(1, .monotonic);
-        _ = state.runtime.counters.code_failures.fetchAdd(1, .monotonic);
-        return 0;
-    };
-    state.deopt_request = 0;
+    ) catch return deoptFailure(state, null);
     state.pending_exception = .{};
-    var resumed_roots = state.context.beginRootScope() catch {
-        frame.active = false;
-        state.last_code_dispatch = .deopt_failed;
-        _ = state.runtime.counters.deopt_failures.fetchAdd(1, .monotonic);
-        _ = state.runtime.counters.code_failures.fetchAdd(1, .monotonic);
-        return 0;
-    };
+    var resumed_roots = state.context.beginRootScope() catch return deoptFailure(state, frame);
     defer resumed_roots.deinit();
     for (frame.execution.register_is_ref, 0..) |is_reference, register| {
         if (!is_reference) continue;
-        resumed_roots.add(@ptrCast(&frame.execution.reference_registers[register])) catch {
-            frame.active = false;
-            state.last_code_dispatch = .deopt_failed;
-            _ = state.runtime.counters.deopt_failures.fetchAdd(1, .monotonic);
-            _ = state.runtime.counters.code_failures.fetchAdd(1, .monotonic);
-            return 0;
-        };
+        resumed_roots.add(@ptrCast(&frame.execution.reference_registers[register])) catch return deoptFailure(state, frame);
     }
     state.last_code_dispatch = .deoptimized;
     _ = state.runtime.counters.deoptimizations.fetchAdd(1, .monotonic);
     return request.resume_fn(request.resume_context, frame);
+}
+
+/// Preserve-all target used by a generated dependency-epoch cold edge. The
+/// active code lease pins both RX bytes and immutable metadata until the outer
+/// entry trampoline closes it after this call returns from compiled code.
+pub fn midFunctionDeoptBridge(state: *NativeThreadState, site_id: u32) callconv(.c) usize {
+    if (state.active == 0 or state.deopt_request == 0 or state.code_lease_slot == 0) {
+        return deoptFailure(state, null);
+    }
+    const lease_slot: *?runtime_code_manager.Lease = @ptrFromInt(state.code_lease_slot);
+    const lease = if (lease_slot.*) |*value| value else return deoptFailure(state, null);
+    const metadata = lease.metadata() orelse return deoptFailure(state, null);
+    if (metadata.stack_maps == 0 or metadata.deopt_table == 0) return deoptFailure(state, null);
+    const stack_maps: *const runtime_stack_map.Table = @ptrFromInt(metadata.stack_maps);
+    const deopt_table: *const runtime_deopt.Table = @ptrFromInt(metadata.deopt_table);
+    const stack_record = stack_maps.find(site_id) catch return deoptFailure(state, null);
+    if (stack_record.deopt_id == runtime_stack_map.no_deopt) return deoptFailure(state, null);
+    const request: *runtime_deopt.Request = @ptrFromInt(state.deopt_request);
+    if (request.table != deopt_table) return deoptFailure(state, null);
+    return resumeDeoptPoint(state, request, deopt_table, stack_record.deopt_id);
 }
 
 /// Normal-return edge for both compiled and fallback targets. Returning the
@@ -534,7 +595,71 @@ pub fn codeLeaseExitBridge(state: *NativeThreadState, result: usize) callconv(.c
     const lease_slot: *?runtime_code_manager.Lease = @ptrFromInt(state.code_lease_slot);
     if (lease_slot.*) |*lease| lease.deinit();
     lease_slot.* = null;
+    state.deopt_request = 0;
     return result;
+}
+
+test "code OSR entry resolves a version-owned interior label under one lease" {
+    var storage: [64]u8 align(runtime_value.object_alignment) = @splat(0);
+    const regions = [_]runtime_value.Region{try runtime_value.Region.fromSlice(&storage)};
+    var handles = try runtime_value.HandleTable.init(std.testing.allocator, 2, &regions);
+    defer handles.deinit();
+    var registry = try thread_registry.Registry.init(std.testing.allocator, std.testing.io, 1);
+    defer registry.deinit() catch unreachable;
+    var context = try thread_registry.ThreadContext.init(std.testing.allocator, 2);
+    defer context.deinit();
+    try registry.register(&context);
+    defer registry.unregister(&context) catch unreachable;
+
+    var manager = try runtime_code_manager.Manager.init(std.testing.allocator, 1, 1, 1);
+    defer manager.deinit() catch unreachable;
+    const Owner = struct {
+        references: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.references.fetchAdd(1, .acq_rel);
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.references.fetchSub(1, .acq_rel);
+        }
+    };
+    var owner: Owner = .{};
+    const entries = [_]OsrEntry{.{ .point_id = 9, .code_offset = 16 }};
+    const code = [_]u8{0x90} ** 31 ++ .{0xc3};
+    var candidate = try manager.prepareWithMetadata(&code, .{
+        .context = @ptrCast(&owner),
+        .osr_entries = @intFromPtr(&entries),
+        .osr_entry_count = entries.len,
+        .retain = Owner.retain,
+        .release = Owner.release,
+    });
+    try manager.publish(0, &candidate);
+
+    var runtime = try Runtime.init(std.testing.allocator, &handles, &registry);
+    defer runtime.deinit() catch unreachable;
+    try runtime.installCodeManager(&manager);
+    {
+        var managed = try runtime.enter(&context);
+        defer managed.deinit();
+        _ = try managed.registerImage();
+        const target = codeOsrEnterBridge(&managed.native_state, 0x1234, 0, 9);
+        const lease = if (managed.code_lease) |*value| value else return error.TestUnexpectedResult;
+        try std.testing.expectEqual(lease.entryAddress() + 16, target);
+        try std.testing.expectEqual(CodeDispatchStatus.ok, managed.native_state.last_code_dispatch);
+        try std.testing.expectEqual(@as(u64, 1), manager.stats().active_leases);
+        try std.testing.expectEqual(@as(usize, 77), codeLeaseExitBridge(&managed.native_state, 77));
+        try std.testing.expectEqual(@as(u64, 0), manager.stats().active_leases);
+
+        try std.testing.expectEqual(@as(usize, 0x1234), codeOsrEnterBridge(&managed.native_state, 0x1234, 0, 10));
+        try std.testing.expectEqual(CodeDispatchStatus.fallback_osr_metadata, managed.native_state.last_code_dispatch);
+        try std.testing.expectEqual(@as(u64, 0), manager.stats().active_leases);
+    }
+    try std.testing.expect(try manager.invalidate(0));
+    try std.testing.expectEqual(@as(u32, 1), try manager.reclaim());
+    try std.testing.expectEqual(@as(u32, 1), owner.references.load(.acquire));
 }
 
 fn statusFor(err: Error) SlowResolveStatus {

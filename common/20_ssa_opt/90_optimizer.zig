@@ -92,6 +92,7 @@ pub const OptimizeOptions = struct {
     cfg_options: cfg.Options = .{},
     rewrite_options: cfg_rewrite.Options = .{},
     facts: Options = .{},
+    enable_loop_resolve_hoisting: bool = true,
 };
 
 pub const PipelineStats = struct {
@@ -764,6 +765,7 @@ pub fn optimize(
 
     self.barriers = try barrier_phase.runWithOptions(allocator, &self.function, &self.types, .{
         .loops = &self.loops,
+        .enable_loop_resolve_hoisting = options.enable_loop_resolve_hoisting,
     });
     errdefer self.barriers.deinit();
 
@@ -1071,12 +1073,16 @@ test "optimizer hoists invariant handle resolution out of a no-safepoint loop" {
     try std.testing.expectEqual(@as(u32, 1), optimized.stats.loop_epoch_guards);
     const loop = optimized.loops.loops[0];
     const preheader = loop.preheader orelse return error.TestUnexpectedResult;
-    const resolve = optimized.barriers.resolves[0];
+    try std.testing.expectEqual(@as(usize, 1), loop.latches.len);
+    const latch = loop.latches[0];
+    const reuse = optimized.barriers.loop_reuses[0];
+    const resolve = optimized.barriers.resolves[reuse.resolve];
     try std.testing.expect(resolve.hoisted);
     try std.testing.expectEqual(preheader, resolve.placement_block);
-    try std.testing.expectEqual(loop.header, resolve.loop_header.?);
-    try std.testing.expectEqual(loop.latch, resolve.loop_latch.?);
-    try std.testing.expectEqual(@as(u32, 0), resolve.guard_id.?);
+    try std.testing.expectEqual(loop.header, reuse.header);
+    try std.testing.expectEqual(preheader, reuse.preheader);
+    try std.testing.expectEqualSlices(cfg.BlockId, loop.latches, reuse.latches);
+    try std.testing.expectEqual(@as(u32, 0), reuse.guard_start);
     try std.testing.expectEqual(loop.header, resolve.defining_op.block);
     try std.testing.expectEqual(@as(u32, 0), resolve.defining_op.index);
     switch (optimized.barriers.ops[loop.header][0].resolve) {
@@ -1100,12 +1106,12 @@ test "optimizer hoists invariant handle resolution out of a no-safepoint loop" {
     for (optimized.machine.blocks[loop.header].insts) |inst| {
         if (inst.opcode == .resolve_handle) header_resolves += 1;
     }
-    for (optimized.machine.blocks[loop.latch].insts, 0..) |inst, index| {
+    for (optimized.machine.blocks[latch].insts, 0..) |inst, index| {
         if (inst.opcode != .loop_epoch_guard) continue;
         latch_guards += 1;
         guard_inst_index = index;
         try std.testing.expectEqual(@as(u32, @intCast(optimized.barriers.resolves.len)), inst.guard_site_id.?);
-        for (optimized.machine.blocks[loop.latch].insts[index + 1 ..]) |later| {
+        for (optimized.machine.blocks[latch].insts[index + 1 ..]) |later| {
             if (later.opcode == .jump) guard_before_jump = true;
         }
     }
@@ -1119,7 +1125,7 @@ test "optimizer hoists invariant handle resolution out of a no-safepoint loop" {
     try optimized.machine.verify();
     try optimized.derived.verify();
 
-    const machine_guard = &optimized.machine.blocks[loop.latch].insts[guard_inst_index orelse return error.TestUnexpectedResult];
+    const machine_guard = &optimized.machine.blocks[latch].insts[guard_inst_index orelse return error.TestUnexpectedResult];
     const old_guard_site = machine_guard.guard_site_id;
     machine_guard.guard_site_id = std.math.maxInt(u32);
     try std.testing.expectError(error.BadInstruction, optimized.machine.verify());
@@ -1130,6 +1136,69 @@ test "optimizer hoists invariant handle resolution out of a no-safepoint loop" {
     proof_op.relocation_kill = true;
     try std.testing.expectError(error.InvalidPlan, optimized.barriers.verify());
     proof_op.relocation_kill = old_kill;
+}
+
+test "optimizer guards every backedge of one multi-latch natural loop" {
+    const insts = [_]Instruction{
+        .{ .const_ = .{ .dest = 1, .value = 3 } },
+        .{ .goto_ = .{ .offset = 1 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 3, .obj = 0 } },
+        .{ .if_eqz = .{ .src = 3, .offset = 6 } },
+        .{ .if_eqz = .{ .src = 2, .offset = 3 } },
+        .{ .add_int_lit8 = .{ .dest = 1, .src = 1, .lit = -1 } },
+        .{ .goto_ = .{ .offset = -4 } },
+        .{ .add_int_lit8 = .{ .dest = 2, .src = 2, .lit = 1 } },
+        .{ .goto_ = .{ .offset = -6 } },
+        .{ .return_ = .{ .src = 3 } },
+    };
+    var optimized = try optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+
+    try std.testing.expectEqual(@as(u32, 1), optimized.loops.stats.loops);
+    const loop = optimized.loops.loops[0];
+    try std.testing.expectEqual(@as(usize, 2), loop.latches.len);
+    try std.testing.expectEqual(@as(u32, 1), optimized.stats.loop_resolves_hoisted);
+    try std.testing.expectEqual(@as(u32, 2), optimized.stats.loop_epoch_guards);
+    try std.testing.expectEqual(@as(usize, 1), optimized.barriers.loop_reuses.len);
+    const reuse = optimized.barriers.loop_reuses[0];
+    try std.testing.expectEqualSlices(cfg.BlockId, loop.latches, reuse.latches);
+    try std.testing.expectEqual(@as(u32, 0), reuse.guard_start);
+
+    var guards_seen = [_]bool{false} ** 2;
+    for (loop.latches, 0..) |latch, latch_index| {
+        var guards_in_latch: u32 = 0;
+        for (optimized.machine.blocks[latch].insts) |inst| {
+            if (inst.opcode != .loop_epoch_guard) continue;
+            guards_in_latch += 1;
+            const expected_site: u32 = @intCast(optimized.barriers.resolves.len + latch_index);
+            try std.testing.expectEqual(expected_site, inst.guard_site_id.?);
+            guards_seen[latch_index] = true;
+        }
+        try std.testing.expectEqual(@as(u32, 1), guards_in_latch);
+    }
+    try std.testing.expect(guards_seen[0] and guards_seen[1]);
+    try std.testing.expectEqual(@as(u32, 2), optimized.derived.stats.loop_epoch_guards_checked);
+    try optimized.barriers.verify();
+    try optimized.lowered.verify();
+    try optimized.machine.verify();
+    try optimized.derived.verify();
+
+    const original_latches = optimized.barriers.loop_reuses[0].latches;
+    optimized.barriers.loop_reuses[0].latches = original_latches[0..1];
+    try std.testing.expectError(error.InvalidPlan, optimized.barriers.verify());
+    optimized.barriers.loop_reuses[0].latches = original_latches;
+
+    var forged = false;
+    for (optimized.machine.blocks[loop.latches[1]].insts) |*inst| {
+        if (inst.opcode != .loop_epoch_guard) continue;
+        const original_site = inst.guard_site_id;
+        inst.guard_site_id = @intCast(optimized.barriers.resolves.len);
+        try std.testing.expectError(error.BadInstruction, optimized.machine.verify());
+        inst.guard_site_id = original_site;
+        forged = true;
+        break;
+    }
+    try std.testing.expect(forged);
 }
 
 test "optimizer keeps loop resolution local when a safepoint can relocate" {

@@ -106,6 +106,13 @@ pub const Buffer = struct {
         self.patched = false;
     }
 
+    pub fn labelOffset(self: *const Buffer, label: LabelId) Error!u32 {
+        if (label >= self.labels.items.len) return error.BadLabel;
+        const value = self.labels.items[label];
+        if (!value.bound) return error.UnboundLabel;
+        return value.offset;
+    }
+
     pub fn emitU8(self: *Buffer, value: u8) Error!void {
         try self.bytes.append(self.allocator, value);
         self.stats.bytes = self.len();

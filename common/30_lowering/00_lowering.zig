@@ -221,6 +221,10 @@ pub const Function = struct {
             std.math.add(u32, @intCast(barriers.resolves.len), barriers.stats.loop_epoch_guards) catch return error.BadInstruction
         else
             0;
+        const loop_guard_count: u32 = if (self.barriers) |barriers| barriers.stats.loop_epoch_guards else 0;
+        const loop_guard_seen = try self.allocator.alloc(bool, loop_guard_count);
+        defer self.allocator.free(loop_guard_seen);
+        @memset(loop_guard_seen, false);
         var verified_exception_sites: u32 = 0;
         for (self.blocks, 0..) |block, i| {
             if (block.id != i) return error.BadBlock;
@@ -240,7 +244,11 @@ pub const Function = struct {
                     .cond_branch => if (inst.target == null or inst.false_target == null or inst.uses.len == 0) return error.BadInstruction,
                     .field_load, .field_store, .static_load, .static_store, .static_satb_pre_write, .static_root_post_write => if (inst.field_idx == null) return error.BadInstruction,
                     .resolve_handle => try self.verifyResolve(inst),
-                    .loop_epoch_guard => try self.verifyLoopEpochGuard(block.id, inst),
+                    .loop_epoch_guard => {
+                        const guard_id = try self.verifyLoopEpochGuard(block.id, inst);
+                        if (guard_id >= loop_guard_seen.len or loop_guard_seen[guard_id]) return error.BadInstruction;
+                        loop_guard_seen[guard_id] = true;
+                    },
                     .check_bounds, .field_load_ptr, .field_store_ptr, .array_load_ptr, .array_store_ptr, .satb_pre_write, .card_mark => if (inst.address != null) try self.verifyAddress(inst),
                     .call_direct, .call_static, .call_virtual, .call_quick => if (inst.address != null) try self.verifyAddress(inst),
                     else => {},
@@ -288,6 +296,8 @@ pub const Function = struct {
                 if (inst.kind == .static_root_post_write and (inst.uses.len != 1 or inst.post_write != .root_guarded)) return error.BadInstruction;
             }
         }
+        for (loop_guard_seen) |seen| if (!seen) return error.BadInstruction;
+        if (loop_guard_count != self.stats.loop_epoch_guards) return error.BadInstruction;
         if (verified_exception_sites != self.stats.bounds_exception_sites) return error.BadInstruction;
     }
 
@@ -329,7 +339,7 @@ pub const Function = struct {
         }
     }
 
-    fn verifyLoopEpochGuard(self: *const Function, block_id: cfg.BlockId, inst: Inst) VerifyError!void {
+    fn verifyLoopEpochGuard(self: *const Function, block_id: cfg.BlockId, inst: Inst) VerifyError!u32 {
         if (inst.defs.len != 0 or inst.uses.len != 0 or inst.field_idx != null or
             inst.pre_write != .none or inst.post_write != .none) return error.BadInstruction;
         try self.verifyAddress(inst);
@@ -337,11 +347,19 @@ pub const Function = struct {
         const resolve_id = inst.resolve_id orelse return error.BadInstruction;
         if (resolve_id >= barriers.resolves.len) return error.BadInstruction;
         const resolve = barriers.resolves[resolve_id];
-        const guard_id = resolve.guard_id orelse return error.BadInstruction;
-        if (!resolve.hoisted or resolve.loop_latch != block_id or resolve.handle != inst.state_handle.? or
-            resolve.token != inst.reloc_token.?) return error.BadInstruction;
-        const expected_site: u64 = @as(u64, @intCast(barriers.resolves.len)) + guard_id;
-        if (expected_site > std.math.maxInt(u32) or inst.guard_site_id.? != expected_site) return error.BadInstruction;
+        if (resolve.handle != inst.state_handle.? or resolve.token != inst.reloc_token.?) return error.BadInstruction;
+        const site_id = inst.guard_site_id.?;
+        if (site_id < barriers.resolves.len) return error.BadInstruction;
+        const guard_id: u32 = @intCast(site_id - barriers.resolves.len);
+        if (guard_id >= barriers.stats.loop_epoch_guards) return error.BadInstruction;
+        for (barriers.loop_reuses) |reuse| {
+            if (reuse.resolve != resolve_id or guard_id < reuse.guard_start) continue;
+            const offset = guard_id - reuse.guard_start;
+            if (offset >= reuse.latches.len) continue;
+            if (reuse.latches[offset] != block_id) return error.BadInstruction;
+            return guard_id;
+        }
+        return error.BadInstruction;
     }
 
     pub fn runtimeValue(self: *const Function, value: RuntimeValueId) ?RuntimeValueClass {
@@ -543,10 +561,20 @@ fn emitLoopEpochGuards(
     stats: *Stats,
 ) !void {
     const barriers = inputs.barriers orelse return;
-    for (barriers.resolves, 0..) |resolve, resolve_index| {
-        if (!resolve.hoisted or resolve.loop_latch != block_id) continue;
-        const guard_id = resolve.guard_id orelse return error.InvalidInput;
+    for (barriers.loop_reuses) |reuse| {
+        var latch_offset: ?u32 = null;
+        for (reuse.latches, 0..) |latch, index| {
+            if (latch == block_id) {
+                latch_offset = @intCast(index);
+                break;
+            }
+        }
+        const offset = latch_offset orelse continue;
+        if (reuse.resolve >= barriers.resolves.len) return error.InvalidInput;
+        const resolve = barriers.resolves[reuse.resolve];
+        const guard_id = std.math.add(u32, reuse.guard_start, offset) catch return error.InvalidInput;
         const site_value: u64 = @as(u64, @intCast(barriers.resolves.len)) + guard_id;
+        const resolve_index = reuse.resolve;
         const address_value: u64 = inputs.function.values.len + resolve_index;
         if (site_value > std.math.maxInt(u32) or address_value >= std.math.maxInt(RuntimeValueId)) return error.InvalidInput;
         if (resolve.defining_op.block >= inputs.function.blocks.len or

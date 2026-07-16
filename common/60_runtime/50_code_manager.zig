@@ -59,6 +59,29 @@ const VersionSlot = struct {
     entry_address: usize = 0,
     publish_epoch: u64 = 0,
     retire_epoch: u64 = 0,
+    metadata: ?Metadata = null,
+};
+
+/// Immutable metadata retained for exactly the lifetime of one code version.
+/// Callbacks must be allocation-free, non-blocking, and thread-safe. Pointer
+/// fields are opaque here so the code manager remains independent of compiler
+/// and runtime module types.
+pub const Metadata = struct {
+    context: *anyopaque,
+    stack_maps: usize = 0,
+    deopt_table: usize = 0,
+    osr_entries: usize = 0,
+    osr_entry_count: u32 = 0,
+    retain: *const fn (*anyopaque) void,
+    release: *const fn (*anyopaque) void,
+
+    fn acquire(self: Metadata) void {
+        self.retain(self.context);
+    }
+
+    fn drop(self: Metadata) void {
+        self.release(self.context);
+    }
 };
 
 pub const Stats = struct {
@@ -70,6 +93,7 @@ pub const Stats = struct {
     reclaimed: u64,
     active_leases: u64,
     executable_versions: u32,
+    metadata_versions: u32,
 };
 
 pub const MethodToken = struct {
@@ -83,6 +107,7 @@ const Counters = struct {
     retired: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     reclaimed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     active_leases: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    metadata_versions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
 pub const Manager = struct {
@@ -133,6 +158,13 @@ pub const Manager = struct {
             const state = version.state.load(.acquire);
             if (state == .constructing or state == .candidate) return error.ActiveCandidate;
         }
+        for (self.versions) |*version| {
+            if (version.metadata) |metadata| {
+                metadata.drop();
+                _ = self.counters.metadata_versions.fetchSub(1, .release);
+            }
+            version.metadata = null;
+        }
         self.cache.deinit();
         self.allocator.free(self.versions);
         self.allocator.free(self.readers);
@@ -141,6 +173,10 @@ pub const Manager = struct {
     }
 
     pub fn prepare(self: *Manager, code: []const u8) Error!Candidate {
+        return self.prepareWithMetadata(code, null);
+    }
+
+    pub fn prepareWithMetadata(self: *Manager, code: []const u8, metadata: ?Metadata) Error!Candidate {
         const claimed = self.claimVersion() orelse return error.NoFreeVersion;
         const slot = &self.versions[claimed.index];
         const allocation = blk: {
@@ -155,6 +191,11 @@ pub const Manager = struct {
         slot.entry_address = allocation.entryAddress();
         slot.publish_epoch = 0;
         slot.retire_epoch = 0;
+        if (metadata) |value| {
+            value.acquire();
+            _ = self.counters.metadata_versions.fetchAdd(1, .monotonic);
+        }
+        slot.metadata = metadata;
         slot.state.store(.candidate, .release);
         _ = self.counters.prepared.fetchAdd(1, .monotonic);
         return .{
@@ -294,6 +335,11 @@ pub const Manager = struct {
             version.entry_address = 0;
             version.publish_epoch = 0;
             version.retire_epoch = 0;
+            if (version.metadata) |metadata| {
+                metadata.drop();
+                _ = self.counters.metadata_versions.fetchSub(1, .release);
+            }
+            version.metadata = null;
             version.state.store(.free, .release);
             reclaimed += 1;
             _ = self.counters.reclaimed.fetchAdd(1, .monotonic);
@@ -311,6 +357,7 @@ pub const Manager = struct {
             .reclaimed = self.counters.reclaimed.load(.acquire),
             .active_leases = self.counters.active_leases.load(.acquire),
             .executable_versions = self.cache.stats.functions,
+            .metadata_versions = self.counters.metadata_versions.load(.acquire),
         };
     }
 
@@ -322,7 +369,7 @@ pub const Manager = struct {
             const state = version.state.load(.acquire);
             const owns_allocation = version.allocation != null;
             switch (state) {
-                .free => if (owns_allocation or version.entry_address != 0 or version.retire_epoch != 0) return error.CorruptState,
+                .free => if (owns_allocation or version.entry_address != 0 or version.retire_epoch != 0 or version.metadata != null) return error.CorruptState,
                 .constructing => {},
                 .candidate, .live, .retired, .reclaiming => if (!owns_allocation or version.entry_address == 0) return error.CorruptState,
             }
@@ -383,6 +430,11 @@ pub const Manager = struct {
         unlock(&self.cache_guard);
         slot.allocation = null;
         slot.entry_address = 0;
+        if (slot.metadata) |metadata| {
+            metadata.drop();
+            _ = self.counters.metadata_versions.fetchSub(1, .release);
+        }
+        slot.metadata = null;
         slot.state.store(.free, .release);
         candidate.active = false;
     }
@@ -457,6 +509,15 @@ pub const Lease = struct {
 
     pub fn typedEntry(self: *const Lease, comptime Fn: type) *const Fn {
         return @ptrFromInt(self.entryAddress());
+    }
+
+    pub fn codeSize(self: *const Lease) u32 {
+        const allocation = self.version.allocation orelse return 0;
+        return @intCast(allocation.bytes().len);
+    }
+
+    pub fn metadata(self: *const Lease) ?Metadata {
+        return self.version.metadata;
     }
 
     pub fn deinit(self: *Lease) void {
@@ -540,6 +601,49 @@ test "code manager rejects active reader teardown and cancels candidates" {
     try std.testing.expectEqual(@as(u32, 0), manager.stats().executable_versions);
     try std.testing.expectError(error.ReadersRegistered, manager.deinit());
     reader.deinit();
+}
+
+test "code manager retains metadata through lease quiescence" {
+    const Owner = struct {
+        references: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.references.fetchAdd(1, .acq_rel);
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const previous = self.references.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 1);
+        }
+    };
+    var owner = Owner{};
+    const metadata = Metadata{
+        .context = &owner,
+        .stack_maps = 0x1111,
+        .deopt_table = 0x2222,
+        .retain = Owner.retain,
+        .release = Owner.release,
+    };
+    var manager = try Manager.init(std.testing.allocator, 1, 1, 2);
+    defer manager.deinit() catch unreachable;
+    var reader = try manager.registerReader();
+    defer reader.deinit();
+    const code = returnI32(9);
+    var candidate = try manager.prepareWithMetadata(&code, metadata);
+    defer candidate.deinit();
+    try std.testing.expectEqual(@as(u32, 2), owner.references.load(.acquire));
+    try manager.publish(0, &candidate);
+    var lease = try manager.enter(&reader, 0);
+    try std.testing.expectEqual(@as(usize, 0x1111), lease.metadata().?.stack_maps);
+    try std.testing.expect(try manager.invalidate(0));
+    try std.testing.expectEqual(@as(u32, 0), try manager.reclaim());
+    try std.testing.expectEqual(@as(u32, 2), owner.references.load(.acquire));
+    lease.deinit();
+    try std.testing.expectEqual(@as(u32, 1), try manager.reclaim());
+    try std.testing.expectEqual(@as(u32, 1), owner.references.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), manager.stats().metadata_versions);
 }
 
 test "code manager races lock-free dispatch against publication invalidation and reclamation" {
@@ -635,6 +739,37 @@ fn allocationFailureProbe(allocator: std.mem.Allocator) !void {
     defer candidate.deinit();
 }
 
+const MetadataProbeOwner = struct {
+    references: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+
+    fn retain(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        _ = self.references.fetchAdd(1, .acq_rel);
+    }
+
+    fn release(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 1);
+    }
+};
+
+fn metadataAllocationFailureProbe(allocator: std.mem.Allocator, owner: *MetadataProbeOwner) !void {
+    var manager = try Manager.init(allocator, 1, 1, 1);
+    defer manager.deinit() catch unreachable;
+    const code = returnI32(3);
+    var candidate = try manager.prepareWithMetadata(&code, .{
+        .context = owner,
+        .retain = MetadataProbeOwner.retain,
+        .release = MetadataProbeOwner.release,
+    });
+    defer candidate.deinit();
+    if (owner.references.load(.acquire) != 2) return error.TestUnexpectedResult;
+}
+
 test "code manager initialization and W^X preparation are allocation-failure safe" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFailureProbe, .{});
+    var owner = MetadataProbeOwner{};
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, metadataAllocationFailureProbe, .{&owner});
+    try std.testing.expectEqual(@as(u32, 1), owner.references.load(.acquire));
 }

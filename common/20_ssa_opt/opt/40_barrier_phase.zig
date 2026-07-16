@@ -42,6 +42,9 @@ pub const Options = struct {
     /// Optional natural-loop analysis enables strictly proven preheader
     /// placement. The result must describe this exact SSA function/tree.
     loops: ?*const loop_phase.Result = null,
+    /// OSR-capable compilations may keep loop-header resolves local so an
+    /// interior entry never depends on a derived address made in a preheader.
+    enable_loop_resolve_hoisting: bool = true,
 };
 
 pub const PreWriteBarrier = enum(u2) {
@@ -97,15 +100,21 @@ pub const Resolve = struct {
     token: RelocTokenId,
     defining_op: ssa.OpRef,
     placement_block: cfg.BlockId,
+    /// True only when lowering must materialize a synthetic definition at the
+    /// placement-block tail. A pre-existing dominating resolve may also feed
+    /// one or more guarded loops without being synthetic.
     hoisted: bool = false,
-    loop_header: ?cfg.BlockId = null,
-    /// Backedge that must compare the thread's acknowledged relocation epoch
-    /// with the current request epoch before another iteration can reuse this
-    /// derived address.
-    loop_latch: ?cfg.BlockId = null,
-    /// Dense id among guarded loop polling sites. Runtime stack-map ids place
-    /// these after ordinary resolve ids.
-    guard_id: ?u32 = null,
+};
+
+/// A loop-scoped reuse of a dominating resolved address. Every latch receives
+/// a distinct dense guard id beginning at `guard_start`; this permits one
+/// physical resolve to safely serve multi-latch and nested loops.
+pub const LoopReuse = struct {
+    resolve: ResolveId,
+    header: cfg.BlockId,
+    preheader: cfg.BlockId,
+    latches: []const cfg.BlockId,
+    guard_start: u32,
 };
 
 pub const Stats = struct {
@@ -130,6 +139,7 @@ pub const Result = struct {
     loops: ?*const loop_phase.Result,
     ops: [][]OpPlan,
     resolves: []Resolve,
+    loop_reuses: []LoopReuse,
     canonical_handles: []ssa.ValueId,
     block_in: []RelocTokenId,
     block_out: []RelocTokenId,
@@ -140,6 +150,7 @@ pub const Result = struct {
         self.allocator.free(self.block_out);
         self.allocator.free(self.block_in);
         self.allocator.free(self.canonical_handles);
+        self.allocator.free(self.loop_reuses);
         self.allocator.free(self.resolves);
         for (self.ops) |plans| self.allocator.free(plans);
         self.allocator.free(self.ops);
@@ -171,6 +182,9 @@ pub const Result = struct {
         const defined = try self.allocator.alloc(bool, self.resolves.len);
         defer self.allocator.free(defined);
         @memset(defined, false);
+        const synthetic_referenced = try self.allocator.alloc(bool, self.resolves.len);
+        defer self.allocator.free(synthetic_referenced);
+        @memset(synthetic_referenced, false);
 
         var inserted: u32 = 0;
         var reused: u32 = 0;
@@ -185,49 +199,62 @@ pub const Result = struct {
         var loop_guards: u32 = 0;
 
         for (self.resolves, 0..) |resolve, resolve_index| {
-            if (!resolve.hoisted) {
-                if (resolve.loop_header != null or resolve.loop_latch != null or resolve.guard_id != null) return error.InvalidPlan;
-                continue;
+            if (!resolve.hoisted) continue;
+            defined[resolve_index] = true;
+            inserted += 1;
+        }
+
+        for (self.loop_reuses, 0..) |reuse, reuse_index| {
+            if (reuse.resolve >= self.resolves.len or reuse.latches.len == 0 or reuse.guard_start != loop_guards) {
+                return error.InvalidPlan;
             }
-            const header = resolve.loop_header orelse return error.InvalidPlan;
-            const latch = resolve.loop_latch orelse return error.InvalidPlan;
-            const guard_id = resolve.guard_id orelse return error.InvalidPlan;
-            if (guard_id != loop_guards) return error.InvalidPlan;
+            for (self.loop_reuses[0..reuse_index]) |previous| {
+                if (previous.resolve == reuse.resolve and previous.header == reuse.header and previous.preheader == reuse.preheader) {
+                    return error.InvalidPlan;
+                }
+            }
+            const resolve = self.resolves[reuse.resolve];
             const analysis = self.loops orelse return error.InvalidPlan;
             var matched_loop: ?loop_phase.Loop = null;
             for (analysis.loops) |loop| {
-                if (loop.header == header and loop.latch == latch and loop.preheader == resolve.placement_block) {
+                if (loop.header == reuse.header and loop.preheader == reuse.preheader) {
                     matched_loop = loop;
                     break;
                 }
             }
             const loop = matched_loop orelse return error.InvalidPlan;
-            if (resolve.defining_op.block != header or resolve.defining_op.index != 0 or
-                !self.function.tree.dominates(resolve.placement_block, header) or
-                hasOutgoingException(self.function, header)) return error.InvalidPlan;
-            const successors = self.function.graph.blocks[resolve.placement_block].successors;
-            if (successors.len != 1 or successors[0] != header) return error.InvalidPlan;
-            if (self.function.blocks[header].ops.len == 0) return error.InvalidPlan;
-            const op = self.function.blocks[header].ops[0];
+            if (!std.mem.eql(cfg.BlockId, loop.latches, reuse.latches) or
+                !self.function.tree.dominates(resolve.placement_block, reuse.preheader) or
+                hasOutgoingException(self.function, reuse.header)) return error.InvalidPlan;
+            const successors = self.function.graph.blocks[reuse.preheader].successors;
+            if (successors.len != 1 or successors[0] != reuse.header) return error.InvalidPlan;
+            if (self.function.blocks[reuse.header].ops.len == 0) return error.InvalidPlan;
+            const op = self.function.blocks[reuse.header].ops[0];
             const raw_handle = rawBaseHandle(op) orelse return error.InvalidPlan;
             if (raw_handle >= self.canonical_handles.len or self.canonical_handles[raw_handle] != resolve.handle or
-                !valueAvailableAtPlacement(self.function, resolve.handle, resolve.placement_block) or
+                !valueAvailableAtPlacement(self.function, resolve.handle, reuse.preheader) or
                 loopContainsBlock(loop, self.function.values[resolve.handle].block)) return error.InvalidPlan;
-            const defining_plan = self.ops[header][0];
+            const defining_plan = self.ops[reuse.header][0];
             if (defining_plan.token_in != resolve.token or defining_plan.base_handle != resolve.handle) return error.InvalidPlan;
             switch (defining_plan.resolve) {
-                .reuse => |id| if (id != resolve_index) return error.InvalidPlan,
+                .reuse => |id| if (id != reuse.resolve) return error.InvalidPlan,
                 else => return error.InvalidPlan,
+            }
+            if (resolve.hoisted) {
+                if (resolve.placement_block != reuse.preheader or resolve.defining_op.block != reuse.header or
+                    resolve.defining_op.index != 0) return error.InvalidPlan;
+                synthetic_referenced[reuse.resolve] = true;
             }
             for (loop.blocks) |block_id| {
                 for (self.ops[block_id]) |plan| {
                     if (plan.relocation_kill or plan.may_safepoint) return error.InvalidPlan;
                 }
             }
-            defined[resolve_index] = true;
-            inserted += 1;
             loop_hoists += 1;
-            loop_guards += 1;
+            loop_guards = std.math.add(u32, loop_guards, @intCast(reuse.latches.len)) catch return error.InvalidPlan;
+        }
+        for (self.resolves, 0..) |resolve, resolve_index| {
+            if (resolve.hoisted and !synthetic_referenced[resolve_index]) return error.InvalidPlan;
         }
 
         for (self.function.blocks, 0..) |block, block_index| {
@@ -392,7 +419,7 @@ const HoistCandidate = struct {
     defining_op: ssa.OpRef,
     placement_block: cfg.BlockId,
     loop_header: cfg.BlockId,
-    loop_latch: cfg.BlockId,
+    loop_latches: []const cfg.BlockId,
 };
 
 fn loopContainsBlock(loop: loop_phase.Loop, block: cfg.BlockId) bool {
@@ -420,7 +447,11 @@ fn appendHoistCandidate(
 ) !void {
     for (list.items) |existing| {
         if (existing.key.handle == candidate.key.handle and existing.key.token == candidate.key.token and
-            existing.placement_block == candidate.placement_block) return;
+            existing.placement_block == candidate.placement_block and existing.loop_header == candidate.loop_header)
+        {
+            if (!std.mem.eql(cfg.BlockId, existing.loop_latches, candidate.loop_latches)) return error.InvalidInput;
+            return;
+        }
     }
     try list.append(allocator, candidate);
 }
@@ -431,7 +462,9 @@ fn buildHoistCandidates(
     canonical: []const ssa.ValueId,
     plans: []const []const OpPlan,
     loops: ?*const loop_phase.Result,
+    enabled: bool,
 ) Error![]HoistCandidate {
+    if (!enabled) return allocator.alloc(HoistCandidate, 0);
     const analysis = loops orelse return allocator.alloc(HoistCandidate, 0);
     if (analysis.function != function or analysis.tree != function.tree) return error.InvalidInput;
     var candidates: std.ArrayList(HoistCandidate) = .empty;
@@ -474,7 +507,7 @@ fn buildHoistCandidates(
             .defining_op = .{ .block = loop.header, .index = 0 },
             .placement_block = preheader,
             .loop_header = loop.header,
-            .loop_latch = loop.latch,
+            .loop_latches = loop.latches,
         });
     }
     return candidates.toOwnedSlice(allocator);
@@ -699,6 +732,7 @@ fn processResolves(
     plans: [][]OpPlan,
     hoists: []const HoistCandidate,
     resolves: *std.ArrayList(Resolve),
+    loop_reuses: *std.ArrayList(LoopReuse),
     stats: *Stats,
 ) Error!void {
     var active = std.AutoHashMap(ResolveKey, ResolveId).init(allocator);
@@ -744,24 +778,34 @@ fn processResolves(
             // source operation in that block. Lowering inserts them at the
             // same semantic tail, immediately before control transfer.
             for (hoists) |candidate| {
-                if (candidate.placement_block != block_id or active.contains(candidate.key)) continue;
-                if (resolves.items.len > std.math.maxInt(ResolveId)) return error.TooManyResolves;
-                const id: ResolveId = @intCast(resolves.items.len);
-                try resolves.append(allocator, .{
-                    .handle = candidate.key.handle,
-                    .token = candidate.key.token,
-                    .defining_op = candidate.defining_op,
-                    .placement_block = candidate.placement_block,
-                    .hoisted = true,
-                    .loop_header = candidate.loop_header,
-                    .loop_latch = candidate.loop_latch,
-                    .guard_id = stats.loop_epoch_guards,
+                if (candidate.placement_block != block_id) continue;
+                const id: ResolveId = if (active.get(candidate.key)) |existing|
+                    existing
+                else create: {
+                    if (resolves.items.len > std.math.maxInt(ResolveId)) return error.TooManyResolves;
+                    const created: ResolveId = @intCast(resolves.items.len);
+                    try resolves.append(allocator, .{
+                        .handle = candidate.key.handle,
+                        .token = candidate.key.token,
+                        .defining_op = candidate.defining_op,
+                        .placement_block = candidate.placement_block,
+                        .hoisted = true,
+                    });
+                    try active.put(candidate.key, created);
+                    try undo.append(allocator, candidate.key);
+                    stats.resolves_inserted += 1;
+                    break :create created;
+                };
+                const guard_count: u32 = @intCast(candidate.loop_latches.len);
+                try loop_reuses.append(allocator, .{
+                    .resolve = id,
+                    .header = candidate.loop_header,
+                    .preheader = candidate.placement_block,
+                    .latches = candidate.loop_latches,
+                    .guard_start = stats.loop_epoch_guards,
                 });
-                try active.put(candidate.key, id);
-                try undo.append(allocator, candidate.key);
-                stats.resolves_inserted += 1;
                 stats.loop_resolves_hoisted += 1;
-                stats.loop_epoch_guards += 1;
+                stats.loop_epoch_guards = std.math.add(u32, stats.loop_epoch_guards, guard_count) catch return error.TooManyResolves;
             }
         }
 
@@ -891,14 +935,25 @@ pub fn runWithOptions(
     const token_count: u32 = @intCast(next_token);
     stats.tokens = token_count;
 
-    const hoists = try buildHoistCandidates(allocator, function, canonical, plans, options.loops);
+    const hoists = try buildHoistCandidates(
+        allocator,
+        function,
+        canonical,
+        plans,
+        options.loops,
+        options.enable_loop_resolve_hoisting,
+    );
     defer allocator.free(hoists);
 
     var resolve_list: std.ArrayList(Resolve) = .empty;
     defer resolve_list.deinit(allocator);
-    try processResolves(allocator, function, canonical, plans, hoists, &resolve_list, &stats);
+    var loop_reuse_list: std.ArrayList(LoopReuse) = .empty;
+    defer loop_reuse_list.deinit(allocator);
+    try processResolves(allocator, function, canonical, plans, hoists, &resolve_list, &loop_reuse_list, &stats);
     const resolves = try resolve_list.toOwnedSlice(allocator);
     errdefer allocator.free(resolves);
+    const loop_reuses = try loop_reuse_list.toOwnedSlice(allocator);
+    errdefer allocator.free(loop_reuses);
 
     var result = Result{
         .allocator = allocator,
@@ -907,6 +962,7 @@ pub fn runWithOptions(
         .loops = options.loops,
         .ops = plans,
         .resolves = resolves,
+        .loop_reuses = loop_reuses,
         .canonical_handles = canonical,
         .block_in = block_in,
         .block_out = block_out,

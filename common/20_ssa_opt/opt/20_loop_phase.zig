@@ -28,7 +28,10 @@ pub const Range = struct {
 
 pub const Loop = struct {
     header: cfg.BlockId,
-    latch: cfg.BlockId,
+    /// Every CFG backedge whose target is `header`. A natural loop is one
+    /// optimization unit even when several control-flow paths return to the
+    /// same header.
+    latches: []cfg.BlockId,
     blocks: []cfg.BlockId,
     preheader: ?cfg.BlockId,
     invariant_ops: []ssa.OpRef,
@@ -62,6 +65,7 @@ pub const Result = struct {
             self.allocator.free(loop.induction_values);
             self.allocator.free(loop.invariant_ops);
             self.allocator.free(loop.blocks);
+            self.allocator.free(loop.latches);
         }
         self.allocator.free(self.loops);
         self.allocator.free(self.ranges);
@@ -81,7 +85,9 @@ pub const Result = struct {
             },
         );
         for (self.loops, 0..) |loop, i| {
-            try writer.print("loop{d} header=b{d} latch=b{d} preheader=", .{ i, loop.header, loop.latch });
+            try writer.print("loop{d} header=b{d} latches:", .{ i, loop.header });
+            for (loop.latches) |latch| try writer.print(" b{d}", .{latch});
+            try writer.print(" preheader=", .{});
             if (loop.preheader) |preheader| {
                 try writer.print("b{d}", .{preheader});
             } else {
@@ -121,15 +127,17 @@ fn blockLess(_: void, a: cfg.BlockId, b: cfg.BlockId) bool {
     return a < b;
 }
 
-fn collectLoopBlocks(allocator: std.mem.Allocator, graph: *const cfg.Graph, header: cfg.BlockId, latch: cfg.BlockId) ![]cfg.BlockId {
+fn collectLoopBlocks(allocator: std.mem.Allocator, graph: *const cfg.Graph, header: cfg.BlockId, latches: []const cfg.BlockId) ![]cfg.BlockId {
     var blocks: std.ArrayList(cfg.BlockId) = .empty;
     errdefer blocks.deinit(allocator);
     var stack: std.ArrayList(cfg.BlockId) = .empty;
     defer stack.deinit(allocator);
 
     try appendUniqueBlock(&blocks, allocator, header);
-    try appendUniqueBlock(&blocks, allocator, latch);
-    try stack.append(allocator, latch);
+    for (latches) |latch| {
+        try appendUniqueBlock(&blocks, allocator, latch);
+        try stack.append(allocator, latch);
+    }
 
     while (stack.pop()) |block_id| {
         for (graph.blocks[block_id].predecessors) |pred| {
@@ -302,6 +310,7 @@ pub fn run(
             allocator.free(loop.induction_values);
             allocator.free(loop.invariant_ops);
             allocator.free(loop.blocks);
+            allocator.free(loop.latches);
         }
         loops_list.deinit(allocator);
     }
@@ -312,9 +321,25 @@ pub fn run(
     applyRanges(function, facts, ranges);
 
     var stats: Stats = .{};
+    const processed_headers = try allocator.alloc(bool, function.graph.blocks.len);
+    defer allocator.free(processed_headers);
+    @memset(processed_headers, false);
+
     for (function.graph.edges) |edge| {
         if (!tree.dominates(edge.to, edge.from)) continue;
-        const blocks = try collectLoopBlocks(allocator, function.graph, edge.to, edge.from);
+        const header = edge.to;
+        if (processed_headers[header]) continue;
+        processed_headers[header] = true;
+
+        var latch_list: std.ArrayList(cfg.BlockId) = .empty;
+        defer latch_list.deinit(allocator);
+        for (function.graph.edges) |candidate| {
+            if (candidate.to == header and tree.dominates(header, candidate.from)) {
+                try appendUniqueBlock(&latch_list, allocator, candidate.from);
+            }
+        }
+        std.mem.sort(cfg.BlockId, latch_list.items, {}, blockLess);
+        const blocks = try collectLoopBlocks(allocator, function.graph, header, latch_list.items);
         errdefer allocator.free(blocks);
 
         var invariants: std.ArrayList(ssa.OpRef) = .empty;
@@ -329,7 +354,7 @@ pub fn run(
                 if (opLoopInvariant(function, blocks, op)) try invariants.append(allocator, .{ .block = block_id, .index = @intCast(i) });
             }
         }
-        try findInductions(function, edge.to, blocks, &inductions, allocator);
+        try findInductions(function, header, blocks, &inductions, allocator);
         for (blocks) |block_id| {
             for (function.blocks[block_id].ops, 0..) |op, i| {
                 if (strengthReductionCandidate(function, inductions.items, op)) try strengths.append(allocator, .{ .block = block_id, .index = @intCast(i) });
@@ -352,11 +377,13 @@ pub fn run(
         errdefer allocator.free(induction_values);
         const strength_reduction_ops = try strengths.toOwnedSlice(allocator);
         errdefer allocator.free(strength_reduction_ops);
+        const latches = try latch_list.toOwnedSlice(allocator);
+        errdefer allocator.free(latches);
         try loops_list.append(allocator, .{
-            .header = edge.to,
-            .latch = edge.from,
+            .header = header,
+            .latches = latches,
             .blocks = blocks,
-            .preheader = findPreheader(function.graph, blocks, edge.to),
+            .preheader = findPreheader(function.graph, blocks, header),
             .invariant_ops = invariant_ops,
             .induction_values = induction_values,
             .strength_reduction_ops = strength_reduction_ops,

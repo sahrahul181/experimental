@@ -166,11 +166,21 @@ fn verifyAddressUse(
         if (resolve_id >= barriers.resolves.len or ptr.resolve != resolve_id or
             inst.reloc_token != ptr.token) return error.InvalidPlan;
         const resolve = barriers.resolves[resolve_id];
-        const guard_id = resolve.guard_id orelse return error.InvalidPlan;
-        const expected_site: u64 = @as(u64, @intCast(barriers.resolves.len)) + guard_id;
-        if (!resolve.hoisted or resolve.loop_latch != block_id or resolve.handle != ptr.handle or
-            expected_site > std.math.maxInt(u32) or @as(u64, inst.guard_site_id orelse return error.InvalidPlan) != expected_site)
-            return error.InvalidPlan;
+        if (resolve.handle != ptr.handle) return error.InvalidPlan;
+        const site_id = inst.guard_site_id orelse return error.InvalidPlan;
+        const resolve_count: u32 = @intCast(barriers.resolves.len);
+        if (site_id < resolve_count) return error.InvalidPlan;
+        const guard_id = site_id - resolve_count;
+        var matched = false;
+        for (barriers.loop_reuses) |reuse| {
+            if (reuse.resolve != resolve_id or guard_id < reuse.guard_start) continue;
+            const offset = guard_id - reuse.guard_start;
+            if (offset >= reuse.latches.len) continue;
+            if (reuse.latches[offset] != block_id) return error.InvalidPlan;
+            matched = true;
+            break;
+        }
+        if (!matched) return error.InvalidPlan;
         const state = inst.state_handle orelse return error.BadCanonicalHandle;
         if (!source.isGcRoot(state)) return error.BadCanonicalHandle;
         switch (source.runtime_values[state]) {

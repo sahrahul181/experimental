@@ -58,6 +58,10 @@ pub const Location = union(enum) {
 pub const Options = struct {
     gp_registers: []const PhysReg = &DEFAULT_GP_REGS,
     xmm_registers: []const PhysReg = &DEFAULT_XMM_REGS,
+    /// Values in this set must never share a physical register even when the
+    /// coarse linear intervals appear disjoint. Deoptimization/OSR uses this
+    /// to model simultaneous state capture at interior entry points.
+    distinct_registers: []const machine.RegId = &.{},
 };
 
 pub const Stats = struct {
@@ -199,6 +203,31 @@ pub fn allocate(allocator: std.mem.Allocator, function: *const machine.Function,
 
     const intervals = try allocator.dupe(intervals_mod.Interval, live.intervals);
     errdefer allocator.free(intervals);
+    if (options.distinct_registers.len != 0) {
+        var group_start = intervals_mod.INVALID_POS;
+        var group_end: intervals_mod.Position = 0;
+        for (options.distinct_registers, 0..) |reg, index| {
+            if (reg >= function.reg_types.len) return error.BadAllocation;
+            for (options.distinct_registers[0..index]) |previous| if (previous == reg) return error.BadAllocation;
+            var found = false;
+            for (intervals) |interval| {
+                if (interval.reg != reg) continue;
+                group_start = @min(group_start, interval.start);
+                group_end = @max(group_end, interval.end);
+                found = true;
+                break;
+            }
+            if (!found) return error.BadAllocation;
+        }
+        for (intervals) |*interval| {
+            for (options.distinct_registers) |reg| {
+                if (interval.reg != reg) continue;
+                interval.start = group_start;
+                interval.end = group_end;
+                break;
+            }
+        }
+    }
     std.mem.sort(intervals_mod.Interval, intervals, {}, lessThanStart);
 
     const locations = try allocator.alloc(Location, function.reg_types.len);

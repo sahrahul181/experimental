@@ -6,6 +6,20 @@ fn addModuleTest(b: *std.Build, test_step: *std.Build.Step, module: *std.Build.M
     test_step.dependOn(&run_tests.step);
 }
 
+fn addModuleTestSerial(
+    b: *std.Build,
+    test_step: *std.Build.Step,
+    module: *std.Build.Module,
+    filters: []const []const u8,
+    previous: ?*std.Build.Step,
+) *std.Build.Step {
+    const tests = b.addTest(.{ .root_module = module, .filters = filters });
+    if (previous) |dependency| tests.step.dependOn(dependency);
+    const run_tests = b.addRunArtifact(tests);
+    test_step.dependOn(&run_tests.step);
+    return &run_tests.step;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize_mode = b.standardOptimizeOption(.{});
@@ -181,6 +195,7 @@ pub fn build(b: *std.Build) void {
     x64_register_encoder.addImport("regalloc", regalloc);
     x64_register_encoder.addImport("runtime_stack_map", runtime_stack_map);
     x64_register_encoder.addImport("runtime_jit", runtime_jit);
+    x64_register_encoder.addImport("runtime_deopt", runtime_deopt);
     x64_register_encoder.addImport("runtime_value", runtime_value);
     x64_register_encoder.addImport("instructions", instructions);
 
@@ -374,4 +389,19 @@ pub fn build(b: *std.Build) void {
     addModuleTest(b, test_step, root_mod, test_filters);
     addModuleTest(b, test_step, exe.root_module, test_filters);
     for (public_modules) |entry| addModuleTest(b, test_step, entry.module, test_filters);
+
+    // Runtime/compiler validation intentionally excludes the unrelated legacy
+    // modules rooted under src/. Keep this boundary stable for common/ work.
+    const runtime_test_step = b.step("test-runtime", "Run common interpreter/JIT/runtime tests without src modules");
+    const src_module_count = 7;
+    var previous_runtime_test: ?*std.Build.Step = null;
+    for (public_modules[0 .. public_modules.len - src_module_count]) |entry| {
+        previous_runtime_test = addModuleTestSerial(
+            b,
+            runtime_test_step,
+            entry.module,
+            test_filters,
+            previous_runtime_test,
+        );
+    }
 }

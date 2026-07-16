@@ -109,6 +109,12 @@ pub const Capture = struct {
     stack_max_offset: i32,
 };
 
+pub const OsrImage = struct {
+    native_registers: []u64,
+    /// Requires `value_count + native_register_count` words.
+    scratch: []u64,
+};
+
 pub const ResumeFn = *const fn (*anyopaque, *Frame) usize;
 
 /// Owner-confined request installed immediately before entering a managed
@@ -130,6 +136,7 @@ pub const Request = struct {
 pub const Error = error{
     DuplicatePoint,
     DuplicateRegister,
+    AliasedOsrRegister,
     EmptyTable,
     IncompleteFrame,
     InvalidConstant,
@@ -140,9 +147,12 @@ pub const Error = error{
     InvalidStackAlignment,
     MissingPoint,
     MissingDeoptMap,
+    MissingStackMap,
     OutOfBounds,
+    OsrStateMismatch,
     TooManyValues,
     UnsortedPoints,
+    UnsupportedOsrSource,
 };
 
 pub const Table = struct {
@@ -328,6 +338,80 @@ pub const Table = struct {
             _ = self.find(record.deopt_id) catch return error.MissingDeoptMap;
         }
     }
+
+    pub fn validateAllLinked(
+        self: *const Table,
+        stack_maps: *const runtime_stack_map.Table,
+    ) Error!void {
+        for (self.records) |deopt_record| {
+            var found = false;
+            for (stack_maps.records) |stack_record| {
+                if (stack_record.deopt_id == deopt_record.id) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.MissingStackMap;
+        }
+    }
+
+    /// Transactionally exports an interpreter frame into the physical image
+    /// expected at an OSR entry. The same table drives deoptimization in the
+    /// reverse direction, preventing format drift between the two paths.
+    pub fn exportOsr(
+        self: *const Table,
+        point_id: u32,
+        frame: *const Frame,
+        image: OsrImage,
+    ) Error!void {
+        const record = try self.find(point_id);
+        const values = self.valuesFor(record);
+        const native_count: usize = self.native_register_count;
+        if (!frame.active or frame.method_id != record.method_id or frame.execution.pc != record.dex_pc or
+            frame.execution.registers.len != self.register_count or
+            frame.execution.reference_registers.len != self.register_count or
+            frame.execution.register_is_ref.len != self.register_count or
+            image.native_registers.len < native_count or
+            image.scratch.len < values.len + native_count)
+        {
+            return error.OsrStateMismatch;
+        }
+
+        const staged_values = image.scratch[0..values.len];
+        const staged_registers = image.scratch[values.len..][0..native_count];
+        @memset(staged_registers, 0);
+        var assigned: [std.math.maxInt(u8) + 1]bool = @splat(false);
+        for (values, 0..) |value, index| {
+            const bits = try readFrameValue(frame, value);
+            staged_values[index] = bits;
+            switch (value.source) {
+                .constant => |expected| if (bits != expected) return error.OsrStateMismatch,
+                .stack_slot => return error.UnsupportedOsrSource,
+                .native_register => |register| {
+                    if (register >= native_count) return error.OutOfBounds;
+                    if (assigned[register] and staged_registers[register] != bits) return error.AliasedOsrRegister;
+                    assigned[register] = true;
+                    staged_registers[register] = bits;
+                },
+            }
+        }
+        @memcpy(image.native_registers[0..native_count], staged_registers);
+    }
+
+    pub fn importOsr(
+        self: *const Table,
+        point_id: u32,
+        image: []const u64,
+        destination: Destination,
+    ) Error!*Frame {
+        var stack_anchor: u64 = 0;
+        return self.reconstruct(point_id, .{
+            .native_registers = image,
+            .stack_base = @ptrCast(&stack_anchor),
+            .stack_min_offset = 0,
+            .stack_max_offset = @sizeOf(@TypeOf(stack_anchor)),
+        }, destination, .uncommon_trap, .{});
+    }
 };
 
 fn validatePoint(spec: PointSpec, options: ValidationOptions) Error!void {
@@ -396,6 +480,27 @@ fn stackAddress(capture: Capture, offset: i32, width: u8) Error!usize {
 fn validHandleBits(bits: u64) bool {
     const handle: Handle = @bitCast(bits);
     return bits == @as(u64, @bitCast(Handle.none)) or (!handle.isNull() and handle.generation != 0);
+}
+
+fn readFrameValue(frame: *const Frame, value: ValueSpec) Error!u64 {
+    return switch (value.kind) {
+        .scalar32 => blk: {
+            if (frame.execution.register_is_ref[value.vreg]) return error.OsrStateMismatch;
+            break :blk frame.execution.registers[value.vreg];
+        },
+        .scalar64 => blk: {
+            if (frame.execution.register_is_ref[value.vreg] or frame.execution.register_is_ref[value.vreg + 1]) {
+                return error.OsrStateMismatch;
+            }
+            break :blk frame.execution.getWide(value.vreg);
+        },
+        .reference => blk: {
+            if (!frame.execution.register_is_ref[value.vreg]) return error.OsrStateMismatch;
+            const bits = frame.execution.reference_registers[value.vreg];
+            if (!validHandleBits(bits)) return error.InvalidReference;
+            break :blk bits;
+        },
+    };
 }
 
 const test_options = ValidationOptions{
@@ -568,6 +673,68 @@ test "deoptimization links stack maps and visits only canonical reference slots"
 
     linked_maps.records[0].deopt_id = 99;
     try std.testing.expectError(error.MissingDeoptMap, table.validateStackMaps(&linked_maps, true));
+}
+
+test "OSR export and import round trip through the deoptimization format" {
+    const handle = Handle{ .index = 21, .generation = 7 };
+    const values = [_]ValueSpec{
+        .{ .vreg = 0, .kind = .scalar32, .source = .{ .native_register = 1 } },
+        .{ .vreg = 1, .kind = .scalar64, .source = .{ .native_register = 2 } },
+        .{ .vreg = 3, .kind = .reference, .source = .{ .native_register = 4 } },
+    };
+    var table = try Table.init(std.testing.allocator, &.{.{
+        .id = 12,
+        .method_id = 5,
+        .dex_pc = 9,
+        .values = &values,
+    }}, .{ .register_count = 4, .native_register_count = 8, .max_dex_pc = 10 });
+    defer table.deinit();
+
+    var source_registers = [_]u32{ 0x12345678, 0x44332211, 0x88776655, @truncate(@as(u64, @bitCast(handle))) };
+    var source_references: [4]u64 = @splat(@as(u64, @bitCast(Handle.none)));
+    source_references[3] = @bitCast(handle);
+    var source_kinds = [_]bool{ false, false, false, true };
+    var source_frame = Frame{
+        .method_id = 5,
+        .execution = .{
+            .pc = 9,
+            .registers = &source_registers,
+            .instructions = &.{},
+            .register_is_ref = &source_kinds,
+            .reference_registers = &source_references,
+        },
+        .active = true,
+    };
+    var native_image: [8]u64 = @splat(0xeeeeeeeeeeeeeeee);
+    var export_scratch: [11]u64 = undefined;
+    try table.exportOsr(12, &source_frame, .{ .native_registers = &native_image, .scratch = &export_scratch });
+    try std.testing.expectEqual(@as(u64, 0x12345678), native_image[1]);
+    try std.testing.expectEqual(@as(u64, 0x8877665544332211), native_image[2]);
+    try std.testing.expectEqual(@as(u64, @bitCast(handle)), native_image[4]);
+
+    var target_registers: [4]u32 = @splat(0);
+    var target_references: [4]u64 = @splat(@as(u64, @bitCast(Handle.none)));
+    var target_kinds: [4]bool = @splat(false);
+    var target_frame = Frame{ .execution = .{
+        .pc = 0,
+        .registers = &target_registers,
+        .instructions = &.{},
+        .register_is_ref = &target_kinds,
+        .reference_registers = &target_references,
+    } };
+    var import_scratch: [3]u64 = undefined;
+    _ = try table.importOsr(12, &native_image, .{ .frame = &target_frame, .scratch = &import_scratch });
+    try std.testing.expectEqualSlices(u32, &source_registers, &target_registers);
+    try std.testing.expectEqual(@as(u64, @bitCast(handle)), target_references[3]);
+    try std.testing.expectEqual(Reason.uncommon_trap, target_frame.reason);
+
+    const before = native_image;
+    source_frame.execution.register_is_ref[3] = false;
+    try std.testing.expectError(error.OsrStateMismatch, table.exportOsr(12, &source_frame, .{
+        .native_registers = &native_image,
+        .scratch = &export_scratch,
+    }));
+    try std.testing.expectEqualSlices(u64, &before, &native_image);
 }
 
 fn allocationFailureProbe(allocator: std.mem.Allocator) !void {
