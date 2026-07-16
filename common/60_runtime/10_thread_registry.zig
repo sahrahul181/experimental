@@ -372,6 +372,13 @@ pub const Registry = struct {
         return self.request_epoch.load(.acquire);
     }
 
+    /// Stable address consumed by generated epoch guards. The registry must
+    /// outlive every registered native entry; x86-64 ordinary aligned loads
+    /// provide the acquire observation required by this publication protocol.
+    pub fn requestEpochAddress(self: *const Registry) usize {
+        return @intFromPtr(&self.request_epoch);
+    }
+
     /// Immutable registration bound used to preallocate collector handshake
     /// storage. Runtime slow paths never grow this list.
     pub fn memberCapacity(self: *const Registry) usize {
@@ -554,6 +561,23 @@ test "validated handshake rejection publishes no epoch" {
     );
     try std.testing.expectEqual(@as(u64, 0), registry.requestEpoch());
     try std.testing.expect(context.isRunning());
+}
+
+test "generated epoch guard address remains stable and observes requests" {
+    var registry = try Registry.init(std.testing.allocator, std.testing.io, 0);
+    defer registry.deinit() catch unreachable;
+
+    const address = registry.requestEpochAddress();
+    try std.testing.expect(address != 0);
+    try std.testing.expect(std.mem.isAligned(address, @alignOf(std.atomic.Value(u64))));
+    const request_epoch: *const std.atomic.Value(u64) = @ptrFromInt(address);
+    try std.testing.expectEqual(@as(u64, 0), request_epoch.load(.acquire));
+
+    var members: [0]*ThreadContext = .{};
+    var handshake = try registry.beginHandshake(&members);
+    try std.testing.expectEqual(handshake.epoch, request_epoch.load(.acquire));
+    try handshake.finish();
+    try std.testing.expectEqual(address, registry.requestEpochAddress());
 }
 
 fn allocationFailureContextInit(allocator: std.mem.Allocator) !void {

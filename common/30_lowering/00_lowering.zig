@@ -77,6 +77,7 @@ pub const Kind = enum(u8) {
     check_null,
     check_bounds,
     resolve_handle,
+    loop_epoch_guard,
     array_load,
     array_store,
     field_load,
@@ -125,6 +126,8 @@ pub const Inst = struct {
     state_handle: ?RuntimeValueId = null,
     reloc_token: ?barrier_phase.RelocTokenId = null,
     resolve_id: ?barrier_phase.ResolveId = null,
+    guard_site_id: ?u32 = null,
+    exception_site_id: ?u32 = null,
     pre_write: barrier_phase.PreWriteBarrier = .none,
     post_write: barrier_phase.PostWriteBarrier = .none,
     flags: Flags = .{},
@@ -154,6 +157,8 @@ pub const Stats = struct {
     direct_calls: u32 = 0,
     runtime_values: u32 = 0,
     handle_resolves: u32 = 0,
+    loop_epoch_guards: u32 = 0,
+    bounds_exception_sites: u32 = 0,
     pointer_accesses: u32 = 0,
     satb_barriers: u32 = 0,
     card_barriers: u32 = 0,
@@ -212,6 +217,11 @@ pub const Function = struct {
         } else if (self.resolve_values.len != 0 or self.runtime_values.len != self.source.values.len) {
             return error.InvalidInput;
         }
+        const exception_site_base: u32 = if (self.barriers) |barriers|
+            std.math.add(u32, @intCast(barriers.resolves.len), barriers.stats.loop_epoch_guards) catch return error.BadInstruction
+        else
+            0;
+        var verified_exception_sites: u32 = 0;
         for (self.blocks, 0..) |block, i| {
             if (block.id != i) return error.BadBlock;
             for (block.insts) |inst| {
@@ -230,6 +240,7 @@ pub const Function = struct {
                     .cond_branch => if (inst.target == null or inst.false_target == null or inst.uses.len == 0) return error.BadInstruction,
                     .field_load, .field_store, .static_load, .static_store, .static_satb_pre_write, .static_root_post_write => if (inst.field_idx == null) return error.BadInstruction,
                     .resolve_handle => try self.verifyResolve(inst),
+                    .loop_epoch_guard => try self.verifyLoopEpochGuard(block.id, inst),
                     .check_bounds, .field_load_ptr, .field_store_ptr, .array_load_ptr, .array_store_ptr, .satb_pre_write, .card_mark => if (inst.address != null) try self.verifyAddress(inst),
                     .call_direct, .call_static, .call_virtual, .call_quick => if (inst.address != null) try self.verifyAddress(inst),
                     else => {},
@@ -251,11 +262,20 @@ pub const Function = struct {
                     .call_static,
                     .call_virtual,
                     .call_quick,
+                    .loop_epoch_guard,
                     => true,
                     else => false,
                 };
                 if (inst.address != null and !permits_address) return error.BadInstruction;
                 if (inst.address == null and inst.kind != .resolve_handle and (inst.reloc_token != null or inst.resolve_id != null)) return error.BadInstruction;
+                if ((inst.kind == .loop_epoch_guard) != (inst.guard_site_id != null)) return error.BadInstruction;
+                const is_mapped_bounds = inst.kind == .check_bounds and inst.address != null;
+                if (is_mapped_bounds != (inst.exception_site_id != null)) return error.BadInstruction;
+                if (is_mapped_bounds) {
+                    const expected = std.math.add(u32, exception_site_base, verified_exception_sites) catch return error.BadInstruction;
+                    if (inst.exception_site_id.? != expected or inst.uses.len != 1) return error.BadInstruction;
+                    verified_exception_sites += 1;
+                }
                 const is_pre_write = inst.kind == .satb_pre_write or inst.kind == .static_satb_pre_write;
                 const is_post_write = inst.kind == .card_mark or inst.kind == .static_root_post_write;
                 if (is_pre_write != (inst.pre_write != .none)) return error.BadInstruction;
@@ -268,6 +288,7 @@ pub const Function = struct {
                 if (inst.kind == .static_root_post_write and (inst.uses.len != 1 or inst.post_write != .root_guarded)) return error.BadInstruction;
             }
         }
+        if (verified_exception_sites != self.stats.bounds_exception_sites) return error.BadInstruction;
     }
 
     fn verifyResolve(self: *const Function, inst: Inst) VerifyError!void {
@@ -308,6 +329,21 @@ pub const Function = struct {
         }
     }
 
+    fn verifyLoopEpochGuard(self: *const Function, block_id: cfg.BlockId, inst: Inst) VerifyError!void {
+        if (inst.defs.len != 0 or inst.uses.len != 0 or inst.field_idx != null or
+            inst.pre_write != .none or inst.post_write != .none) return error.BadInstruction;
+        try self.verifyAddress(inst);
+        const barriers = self.barriers orelse return error.BadInstruction;
+        const resolve_id = inst.resolve_id orelse return error.BadInstruction;
+        if (resolve_id >= barriers.resolves.len) return error.BadInstruction;
+        const resolve = barriers.resolves[resolve_id];
+        const guard_id = resolve.guard_id orelse return error.BadInstruction;
+        if (!resolve.hoisted or resolve.loop_latch != block_id or resolve.handle != inst.state_handle.? or
+            resolve.token != inst.reloc_token.?) return error.BadInstruction;
+        const expected_site: u64 = @as(u64, @intCast(barriers.resolves.len)) + guard_id;
+        if (expected_site > std.math.maxInt(u32) or inst.guard_site_id.? != expected_site) return error.BadInstruction;
+    }
+
     pub fn runtimeValue(self: *const Function, value: RuntimeValueId) ?RuntimeValueClass {
         if (value >= self.runtime_values.len) return null;
         return self.runtime_values[value];
@@ -320,7 +356,7 @@ pub const Function = struct {
 
     pub fn print(self: *const Function, writer: anytype) !void {
         try writer.print(
-            "lowering blocks={d} values={d} runtime_values={d} lowered={d} skipped_dead={d} consts={d} null_elided={d} bounds_elided={d} forwarded={d} direct_calls={d} resolves={d} ptr_accesses={d} satb={d} cards={d}\n",
+            "lowering blocks={d} values={d} runtime_values={d} lowered={d} skipped_dead={d} consts={d} null_elided={d} bounds_elided={d} forwarded={d} direct_calls={d} resolves={d} loop_guards={d} bounds_exceptions={d} ptr_accesses={d} satb={d} cards={d}\n",
             .{
                 self.blocks.len,
                 self.value_types.len,
@@ -333,6 +369,8 @@ pub const Function = struct {
                 self.stats.forwarded_loads,
                 self.stats.direct_calls,
                 self.stats.handle_resolves,
+                self.stats.loop_epoch_guards,
+                self.stats.bounds_exception_sites,
                 self.stats.pointer_accesses,
                 self.stats.satb_barriers,
                 self.stats.card_barriers,
@@ -358,6 +396,7 @@ pub const Function = struct {
                 if (inst.state_handle) |handle| try writer.print(" state=rv{d}", .{handle});
                 if (inst.reloc_token) |token| try writer.print(" token={d}", .{token});
                 if (inst.resolve_id) |resolve| try writer.print(" resolve={d}", .{resolve});
+                if (inst.exception_site_id) |site| try writer.print(" exception_site={d}", .{site});
                 if (inst.imm != 0 or inst.kind == .const_i32 or inst.kind == .const_i64) try writer.print(" imm={d}", .{inst.imm});
                 if (inst.flags.null_check_elided) try writer.print(" null_elided", .{});
                 if (inst.flags.bounds_check_elided) try writer.print(" bounds_elided", .{});
@@ -493,6 +532,36 @@ fn emitHoistedResolves(
             .resolve_id = @intCast(resolve_index),
         }, &.{@as(RuntimeValueId, @intCast(address_value))}, &.{resolve.handle}), stats);
         stats.handle_resolves += 1;
+    }
+}
+
+fn emitLoopEpochGuards(
+    allocator: std.mem.Allocator,
+    inputs: Inputs,
+    block_id: cfg.BlockId,
+    list: *std.ArrayList(Inst),
+    stats: *Stats,
+) !void {
+    const barriers = inputs.barriers orelse return;
+    for (barriers.resolves, 0..) |resolve, resolve_index| {
+        if (!resolve.hoisted or resolve.loop_latch != block_id) continue;
+        const guard_id = resolve.guard_id orelse return error.InvalidInput;
+        const site_value: u64 = @as(u64, @intCast(barriers.resolves.len)) + guard_id;
+        const address_value: u64 = inputs.function.values.len + resolve_index;
+        if (site_value > std.math.maxInt(u32) or address_value >= std.math.maxInt(RuntimeValueId)) return error.InvalidInput;
+        if (resolve.defining_op.block >= inputs.function.blocks.len or
+            resolve.defining_op.index >= inputs.function.blocks[resolve.defining_op.block].ops.len) return error.InvalidInput;
+        const pc = inputs.function.blocks[resolve.defining_op.block].ops[resolve.defining_op.index].pc;
+        try appendInst(list, allocator, try ownOperands(allocator, .{
+            .kind = .loop_epoch_guard,
+            .pc = pc,
+            .address = @intCast(address_value),
+            .state_handle = resolve.handle,
+            .reloc_token = resolve.token,
+            .resolve_id = @intCast(resolve_index),
+            .guard_site_id = @intCast(site_value),
+        }, &.{}, &.{}), stats);
+        stats.loop_epoch_guards += 1;
     }
 }
 
@@ -682,6 +751,33 @@ fn lowerArithmetic(inst: Instruction, choice: typed_ir.LoweringChoice) Kind {
     };
 }
 
+fn arithmeticImmediate(inst: Instruction) i64 {
+    return switch (inst) {
+        .add_int_lit8,
+        .rsub_int_lit8,
+        .mul_int_lit8,
+        .div_int_lit8,
+        .rem_int_lit8,
+        .and_int_lit8,
+        .or_int_lit8,
+        .xor_int_lit8,
+        .shl_int_lit8,
+        .shr_int_lit8,
+        .ushr_int_lit8,
+        => |literal| literal.lit,
+        .add_int_lit16,
+        .rsub_int_lit16,
+        .mul_int_lit16,
+        .div_int_lit16,
+        .rem_int_lit16,
+        .and_int_lit16,
+        .or_int_lit16,
+        .xor_int_lit16,
+        => |literal| literal.lit,
+        else => 0,
+    };
+}
+
 fn lowerCallKind(inst: Instruction, info: typed_ir.OpInfo) Kind {
     return switch (info.devirt) {
         .direct_exact => .call_direct,
@@ -699,6 +795,14 @@ fn lowerCallKind(inst: Instruction, info: typed_ir.OpInfo) Kind {
     };
 }
 
+fn nextBoundsExceptionSite(inputs: Inputs, cursor: *u32) !u32 {
+    const barriers = inputs.barriers orelse return error.InvalidInput;
+    const base = std.math.add(u32, @intCast(barriers.resolves.len), barriers.stats.loop_epoch_guards) catch return error.InvalidInput;
+    const site = std.math.add(u32, base, cursor.*) catch return error.InvalidInput;
+    cursor.* = std.math.add(u32, cursor.*, 1) catch return error.InvalidInput;
+    return site;
+}
+
 fn lowerOperation(
     allocator: std.mem.Allocator,
     inputs: Inputs,
@@ -707,6 +811,7 @@ fn lowerOperation(
     op: ssa.Operation,
     list: *std.ArrayList(Inst),
     stats: *Stats,
+    bounds_exception_cursor: *u32,
 ) !void {
     if (opDead(inputs, block_id, op_index)) {
         stats.skipped_dead += 1;
@@ -786,15 +891,20 @@ fn lowerOperation(
             if (!flags.null_check_elided) try appendInst(list, allocator, .{ .kind = .check_null, .pc = op.pc, .uses = try dupeValues(allocator, op.uses[0..1]) }, stats);
             if (access) |state| {
                 try emitResolve(allocator, state, op.pc, list, stats);
-                if (!flags.bounds_check_elided) try appendInst(list, allocator, .{
-                    .kind = .check_bounds,
-                    .pc = op.pc,
-                    .uses = try dupeValues(allocator, op.uses[1..2]),
-                    .address = state.address,
-                    .state_handle = state.handle,
-                    .reloc_token = state.token,
-                    .resolve_id = state.resolve,
-                }, stats);
+                if (!flags.bounds_check_elided) {
+                    const exception_site = try nextBoundsExceptionSite(inputs, bounds_exception_cursor);
+                    try appendInst(list, allocator, .{
+                        .kind = .check_bounds,
+                        .pc = op.pc,
+                        .uses = try dupeValues(allocator, op.uses[1..2]),
+                        .address = state.address,
+                        .state_handle = state.handle,
+                        .reloc_token = state.token,
+                        .resolve_id = state.resolve,
+                        .exception_site_id = exception_site,
+                    }, stats);
+                    stats.bounds_exception_sites += 1;
+                }
                 try appendInst(list, allocator, try ownOperands(allocator, .{
                     .kind = .array_load_ptr,
                     .pc = op.pc,
@@ -816,15 +926,20 @@ fn lowerOperation(
             if (!flags.null_check_elided) try appendInst(list, allocator, .{ .kind = .check_null, .pc = op.pc, .uses = try dupeValues(allocator, array_and_index[0..1]) }, stats);
             if (access) |state| {
                 try emitResolve(allocator, state, op.pc, list, stats);
-                if (!flags.bounds_check_elided) try appendInst(list, allocator, .{
-                    .kind = .check_bounds,
-                    .pc = op.pc,
-                    .uses = try dupeValues(allocator, &[_]RuntimeValueId{index}),
-                    .address = state.address,
-                    .state_handle = state.handle,
-                    .reloc_token = state.token,
-                    .resolve_id = state.resolve,
-                }, stats);
+                if (!flags.bounds_check_elided) {
+                    const exception_site = try nextBoundsExceptionSite(inputs, bounds_exception_cursor);
+                    try appendInst(list, allocator, .{
+                        .kind = .check_bounds,
+                        .pc = op.pc,
+                        .uses = try dupeValues(allocator, &[_]RuntimeValueId{index}),
+                        .address = state.address,
+                        .state_handle = state.handle,
+                        .reloc_token = state.token,
+                        .resolve_id = state.resolve,
+                        .exception_site_id = exception_site,
+                    }, stats);
+                    stats.bounds_exception_sites += 1;
+                }
                 try emitPreWrite(allocator, state, null, index, op.pc, list, stats);
                 const uses = [_]RuntimeValueId{ op.uses[0], index };
                 try appendInst(list, allocator, .{
@@ -918,7 +1033,13 @@ fn lowerOperation(
         },
         else => {
             const kind = lowerArithmetic(op.inst, tinfo.lowering);
-            try appendInst(list, allocator, try ownOperands(allocator, .{ .kind = kind, .pc = op.pc, .field_idx = fieldIndex(op.inst), .flags = flags }, op.defs, op.uses), stats);
+            try appendInst(list, allocator, try ownOperands(allocator, .{
+                .kind = kind,
+                .pc = op.pc,
+                .imm = arithmeticImmediate(op.inst),
+                .field_idx = fieldIndex(op.inst),
+                .flags = flags,
+            }, op.defs, op.uses), stats);
         },
     }
 }
@@ -1015,6 +1136,7 @@ pub fn build(allocator: std.mem.Allocator, inputs: Inputs) Error!Function {
     }
 
     var stats: Stats = .{ .runtime_values = @intCast(runtime_value_count) };
+    var bounds_exception_cursor: u32 = 0;
     for (inputs.function.blocks, 0..) |block, block_i| {
         var list: std.ArrayList(Inst) = .empty;
         errdefer {
@@ -1036,15 +1158,20 @@ pub fn build(allocator: std.mem.Allocator, inputs: Inputs) Error!Function {
         for (block.ops, 0..) |op, op_i| {
             if (!emitted_hoists and isControlTransfer(op.inst)) {
                 try emitHoistedResolves(allocator, inputs, @intCast(block_i), &list, &stats);
+                try emitLoopEpochGuards(allocator, inputs, @intCast(block_i), &list, &stats);
                 emitted_hoists = true;
             }
-            try lowerOperation(allocator, inputs, @intCast(block_i), op_i, op, &list, &stats);
+            try lowerOperation(allocator, inputs, @intCast(block_i), op_i, op, &list, &stats, &bounds_exception_cursor);
         }
-        if (!emitted_hoists) try emitHoistedResolves(allocator, inputs, @intCast(block_i), &list, &stats);
+        if (!emitted_hoists) {
+            try emitHoistedResolves(allocator, inputs, @intCast(block_i), &list, &stats);
+            try emitLoopEpochGuards(allocator, inputs, @intCast(block_i), &list, &stats);
+        }
 
         blocks[block_i] = .{ .id = @intCast(block_i), .insts = try list.toOwnedSlice(allocator) };
         built_blocks += 1;
     }
+    if (bounds_exception_cursor != stats.bounds_exception_sites) return error.InvalidInput;
 
     return .{
         .allocator = allocator,
@@ -1116,6 +1243,12 @@ test "lowering emits typed arithmetic and materialized constants" {
     defer lowered.deinit();
     try lowered.verify();
     try std.testing.expect(lowered.stats.constants_materialized >= 3);
+}
+
+test "lowering preserves signed arithmetic literal immediates" {
+    try std.testing.expectEqual(@as(i64, -1), arithmeticImmediate(.{ .add_int_lit8 = .{ .dest = 1, .src = 0, .lit = -1 } }));
+    try std.testing.expectEqual(@as(i64, -30_000), arithmeticImmediate(.{ .xor_int_lit16 = .{ .dest = 1, .src = 0, .lit = -30_000 } }));
+    try std.testing.expectEqual(@as(i64, 0), arithmeticImmediate(.{ .add_int = .{ .dest = 2, .src1 = 0, .src2 = 1 } }));
 }
 
 test "lowering skips dead pure instructions" {

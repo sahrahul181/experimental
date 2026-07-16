@@ -99,6 +99,13 @@ pub const Resolve = struct {
     placement_block: cfg.BlockId,
     hoisted: bool = false,
     loop_header: ?cfg.BlockId = null,
+    /// Backedge that must compare the thread's acknowledged relocation epoch
+    /// with the current request epoch before another iteration can reuse this
+    /// derived address.
+    loop_latch: ?cfg.BlockId = null,
+    /// Dense id among guarded loop polling sites. Runtime stack-map ids place
+    /// these after ordinary resolve ids.
+    guard_id: ?u32 = null,
 };
 
 pub const Stats = struct {
@@ -113,6 +120,7 @@ pub const Stats = struct {
     card_barriers: u32 = 0,
     card_repeat_barriers: u32 = 0,
     loop_resolves_hoisted: u32 = 0,
+    loop_epoch_guards: u32 = 0,
 };
 
 pub const Result = struct {
@@ -174,17 +182,21 @@ pub const Result = struct {
         var card_barriers: u32 = 0;
         var card_repeats: u32 = 0;
         var loop_hoists: u32 = 0;
+        var loop_guards: u32 = 0;
 
         for (self.resolves, 0..) |resolve, resolve_index| {
             if (!resolve.hoisted) {
-                if (resolve.loop_header != null) return error.InvalidPlan;
+                if (resolve.loop_header != null or resolve.loop_latch != null or resolve.guard_id != null) return error.InvalidPlan;
                 continue;
             }
             const header = resolve.loop_header orelse return error.InvalidPlan;
+            const latch = resolve.loop_latch orelse return error.InvalidPlan;
+            const guard_id = resolve.guard_id orelse return error.InvalidPlan;
+            if (guard_id != loop_guards) return error.InvalidPlan;
             const analysis = self.loops orelse return error.InvalidPlan;
             var matched_loop: ?loop_phase.Loop = null;
             for (analysis.loops) |loop| {
-                if (loop.header == header and loop.preheader == resolve.placement_block) {
+                if (loop.header == header and loop.latch == latch and loop.preheader == resolve.placement_block) {
                     matched_loop = loop;
                     break;
                 }
@@ -215,6 +227,7 @@ pub const Result = struct {
             defined[resolve_index] = true;
             inserted += 1;
             loop_hoists += 1;
+            loop_guards += 1;
         }
 
         for (self.function.blocks, 0..) |block, block_index| {
@@ -318,7 +331,7 @@ pub const Result = struct {
             alias_kills != self.stats.heap_alias_kills or satb_barriers != self.stats.satb_barriers or
             satb_repeats != self.stats.satb_repeat_barriers or card_barriers != self.stats.card_barriers or
             card_repeats != self.stats.card_repeat_barriers or
-            loop_hoists != self.stats.loop_resolves_hoisted or
+            loop_hoists != self.stats.loop_resolves_hoisted or loop_guards != self.stats.loop_epoch_guards or
             inserted != self.resolves.len or self.stats.tokens != self.token_count)
         {
             return error.InvalidPlan;
@@ -327,8 +340,8 @@ pub const Result = struct {
 
     pub fn print(self: *const Result, writer: anytype) !void {
         try writer.print(
-            "barrier_phase tokens={d} resolves={d} reused={d} loop_hoists={d} relocation_kills={d} safepoints={d} alias_kills={d} satb={d} satb_repeats={d} cards={d} card_repeats={d}\n",
-            .{ self.stats.tokens, self.stats.resolves_inserted, self.stats.resolves_reused, self.stats.loop_resolves_hoisted, self.stats.relocation_kills, self.stats.safepoints, self.stats.heap_alias_kills, self.stats.satb_barriers, self.stats.satb_repeat_barriers, self.stats.card_barriers, self.stats.card_repeat_barriers },
+            "barrier_phase tokens={d} resolves={d} reused={d} loop_hoists={d} loop_guards={d} relocation_kills={d} safepoints={d} alias_kills={d} satb={d} satb_repeats={d} cards={d} card_repeats={d}\n",
+            .{ self.stats.tokens, self.stats.resolves_inserted, self.stats.resolves_reused, self.stats.loop_resolves_hoisted, self.stats.loop_epoch_guards, self.stats.relocation_kills, self.stats.safepoints, self.stats.heap_alias_kills, self.stats.satb_barriers, self.stats.satb_repeat_barriers, self.stats.card_barriers, self.stats.card_repeat_barriers },
         );
         for (self.function.graph.rpo) |block_id| {
             try writer.print("b{d} token={d}->{d}\n", .{ block_id, self.block_in[block_id], self.block_out[block_id] });
@@ -379,6 +392,7 @@ const HoistCandidate = struct {
     defining_op: ssa.OpRef,
     placement_block: cfg.BlockId,
     loop_header: cfg.BlockId,
+    loop_latch: cfg.BlockId,
 };
 
 fn loopContainsBlock(loop: loop_phase.Loop, block: cfg.BlockId) bool {
@@ -460,6 +474,7 @@ fn buildHoistCandidates(
             .defining_op = .{ .block = loop.header, .index = 0 },
             .placement_block = preheader,
             .loop_header = loop.header,
+            .loop_latch = loop.latch,
         });
     }
     return candidates.toOwnedSlice(allocator);
@@ -739,11 +754,14 @@ fn processResolves(
                     .placement_block = candidate.placement_block,
                     .hoisted = true,
                     .loop_header = candidate.loop_header,
+                    .loop_latch = candidate.loop_latch,
+                    .guard_id = stats.loop_epoch_guards,
                 });
                 try active.put(candidate.key, id);
                 try undo.append(allocator, candidate.key);
                 stats.resolves_inserted += 1;
                 stats.loop_resolves_hoisted += 1;
+                stats.loop_epoch_guards += 1;
             }
         }
 

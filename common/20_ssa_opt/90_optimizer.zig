@@ -107,6 +107,8 @@ pub const PipelineStats = struct {
     handle_resolves: u32 = 0,
     handle_resolve_reuses: u32 = 0,
     loop_resolves_hoisted: u32 = 0,
+    loop_epoch_guards: u32 = 0,
+    bounds_exception_sites: u32 = 0,
     derived_address_uses: u32 = 0,
     machine_insts: u32 = 0,
     machine_edge_moves: u32 = 0,
@@ -151,7 +153,7 @@ pub const OptimizedFunction = struct {
 
     pub fn print(self: *const OptimizedFunction, writer: anytype) !void {
         try writer.print(
-            "optimizer_pipeline original_blocks={d} rewritten_blocks={d} lowered_insts={d} machine_insts={d} machine_edge_moves={d} cfg_removed={d} cfg_merged={d} ssa_constants={d} ssa_dead_ops={d} loops={d} memory_forwarded={d} handle_resolves={d} handle_resolve_reuses={d} loop_resolve_hoists={d} derived_address_uses={d}\n",
+            "optimizer_pipeline original_blocks={d} rewritten_blocks={d} lowered_insts={d} machine_insts={d} machine_edge_moves={d} cfg_removed={d} cfg_merged={d} ssa_constants={d} ssa_dead_ops={d} loops={d} memory_forwarded={d} handle_resolves={d} handle_resolve_reuses={d} loop_resolve_hoists={d} loop_epoch_guards={d} bounds_exceptions={d} derived_address_uses={d}\n",
             .{
                 self.stats.original_blocks,
                 self.stats.rewritten_blocks,
@@ -167,6 +169,8 @@ pub const OptimizedFunction = struct {
                 self.stats.handle_resolves,
                 self.stats.handle_resolve_reuses,
                 self.stats.loop_resolves_hoisted,
+                self.stats.loop_epoch_guards,
+                self.stats.bounds_exception_sites,
                 self.stats.derived_address_uses,
             },
         );
@@ -793,6 +797,8 @@ pub fn optimize(
         .handle_resolves = self.barriers.stats.resolves_inserted,
         .handle_resolve_reuses = self.barriers.stats.resolves_reused,
         .loop_resolves_hoisted = self.barriers.stats.loop_resolves_hoisted,
+        .loop_epoch_guards = self.barriers.stats.loop_epoch_guards,
+        .bounds_exception_sites = self.lowered.stats.bounds_exception_sites,
         .derived_address_uses = self.derived.stats.address_uses,
         .machine_insts = self.machine.stats.instructions,
         .machine_edge_moves = self.machine.stats.edge_moves,
@@ -930,6 +936,38 @@ test "optimizer orchestrates full pipeline into lowered IR" {
     try std.testing.expect(optimized.lowered.stats.bounds_checks_elided >= 1);
 }
 
+test "optimizer assigns dense mapped bounds exception sites" {
+    const insts = [_]Instruction{
+        .{ .aget = .{ .dest_or_src = 2, .array = 0, .index = 1 } },
+        .{ .aget = .{ .dest_or_src = 3, .array = 0, .index = 1 } },
+        .{ .return_ = .{ .src = 3 } },
+    };
+    var optimized = try optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+    try std.testing.expectEqual(@as(u32, 2), optimized.stats.bounds_exception_sites);
+    try std.testing.expectEqual(@as(u32, 2), optimized.lowered.stats.bounds_exception_sites);
+    try std.testing.expectEqual(@as(u32, 2), optimized.machine.stats.bounds_exception_sites);
+
+    const base = @as(u32, @intCast(optimized.barriers.resolves.len)) + optimized.barriers.stats.loop_epoch_guards;
+    var expected = base;
+    var first: ?*lowering.Inst = null;
+    for (optimized.lowered.blocks) |block| {
+        for (block.insts) |*inst| {
+            if (inst.kind != .check_bounds or inst.address == null) continue;
+            try std.testing.expectEqual(expected, inst.exception_site_id.?);
+            if (first == null) first = inst;
+            expected += 1;
+        }
+    }
+    try std.testing.expectEqual(base + 2, expected);
+    const mapped = first orelse return error.TestUnexpectedResult;
+    const saved = mapped.exception_site_id;
+    mapped.exception_site_id = std.math.maxInt(u32);
+    try std.testing.expectError(error.BadInstruction, optimized.lowered.verify());
+    mapped.exception_site_id = saved;
+    try optimized.lowered.verify();
+}
+
 test "optimizer pipeline owns and verifies relocation barrier plan" {
     const insts = [_]Instruction{
         .{ .const_string = .{ .dest = 0, .index = 1 } },
@@ -1030,12 +1068,15 @@ test "optimizer hoists invariant handle resolution out of a no-safepoint loop" {
     try std.testing.expectEqual(@as(u32, 1), optimized.loops.stats.loops);
     try std.testing.expectEqual(@as(u32, 1), optimized.stats.handle_resolves);
     try std.testing.expectEqual(@as(u32, 1), optimized.stats.loop_resolves_hoisted);
+    try std.testing.expectEqual(@as(u32, 1), optimized.stats.loop_epoch_guards);
     const loop = optimized.loops.loops[0];
     const preheader = loop.preheader orelse return error.TestUnexpectedResult;
     const resolve = optimized.barriers.resolves[0];
     try std.testing.expect(resolve.hoisted);
     try std.testing.expectEqual(preheader, resolve.placement_block);
     try std.testing.expectEqual(loop.header, resolve.loop_header.?);
+    try std.testing.expectEqual(loop.latch, resolve.loop_latch.?);
+    try std.testing.expectEqual(@as(u32, 0), resolve.guard_id.?);
     try std.testing.expectEqual(loop.header, resolve.defining_op.block);
     try std.testing.expectEqual(@as(u32, 0), resolve.defining_op.index);
     switch (optimized.barriers.ops[loop.header][0].resolve) {
@@ -1046,6 +1087,9 @@ test "optimizer hoists invariant handle resolution out of a no-safepoint loop" {
     var preheader_resolves: u32 = 0;
     var header_resolves: u32 = 0;
     var resolve_before_jump = false;
+    var latch_guards: u32 = 0;
+    var guard_before_jump = false;
+    var guard_inst_index: ?usize = null;
     for (optimized.machine.blocks[preheader].insts, 0..) |inst, index| {
         if (inst.opcode != .resolve_handle) continue;
         preheader_resolves += 1;
@@ -1056,12 +1100,30 @@ test "optimizer hoists invariant handle resolution out of a no-safepoint loop" {
     for (optimized.machine.blocks[loop.header].insts) |inst| {
         if (inst.opcode == .resolve_handle) header_resolves += 1;
     }
+    for (optimized.machine.blocks[loop.latch].insts, 0..) |inst, index| {
+        if (inst.opcode != .loop_epoch_guard) continue;
+        latch_guards += 1;
+        guard_inst_index = index;
+        try std.testing.expectEqual(@as(u32, @intCast(optimized.barriers.resolves.len)), inst.guard_site_id.?);
+        for (optimized.machine.blocks[loop.latch].insts[index + 1 ..]) |later| {
+            if (later.opcode == .jump) guard_before_jump = true;
+        }
+    }
     try std.testing.expectEqual(@as(u32, 1), preheader_resolves);
     try std.testing.expectEqual(@as(u32, 0), header_resolves);
     try std.testing.expect(resolve_before_jump);
+    try std.testing.expectEqual(@as(u32, 1), latch_guards);
+    try std.testing.expect(guard_before_jump);
+    try std.testing.expectEqual(@as(u32, 1), optimized.derived.stats.loop_epoch_guards_checked);
     try optimized.barriers.verify();
     try optimized.machine.verify();
     try optimized.derived.verify();
+
+    const machine_guard = &optimized.machine.blocks[loop.latch].insts[guard_inst_index orelse return error.TestUnexpectedResult];
+    const old_guard_site = machine_guard.guard_site_id;
+    machine_guard.guard_site_id = std.math.maxInt(u32);
+    try std.testing.expectError(error.BadInstruction, optimized.machine.verify());
+    machine_guard.guard_site_id = old_guard_site;
 
     const proof_op = &optimized.barriers.ops[loop.header][1];
     const old_kill = proof_op.relocation_kill;

@@ -57,6 +57,8 @@ pub fn build(b: *std.Build) void {
     const runtime_stack_map = b.addModule("runtime_stack_map", .{ .root_source_file = b.path("common/60_runtime/30_stack_map.zig"), .target = target, .optimize = optimize_mode });
     const runtime_jit = b.addModule("runtime_jit", .{ .root_source_file = b.path("common/60_runtime/40_jit_runtime.zig"), .target = target, .optimize = optimize_mode });
     const runtime_interpreter = b.addModule("runtime_interpreter", .{ .root_source_file = b.path("common/60_runtime/45_interpreter_runtime.zig"), .target = target, .optimize = optimize_mode });
+    const runtime_code_manager = b.addModule("runtime_code_manager", .{ .root_source_file = b.path("common/60_runtime/50_code_manager.zig"), .target = target, .optimize = optimize_mode });
+    const runtime_deopt = b.addModule("runtime_deopt", .{ .root_source_file = b.path("common/60_runtime/55_deoptimization.zig"), .target = target, .optimize = optimize_mode });
 
     const scheduler = b.addModule("scheduler", .{ .root_source_file = b.path("src/engine/scheduler.zig"), .target = target, .optimize = optimize_mode });
     const lock = b.addModule("lock", .{ .root_source_file = b.path("src/engine/lock.zig"), .target = target, .optimize = optimize_mode });
@@ -178,6 +180,7 @@ pub fn build(b: *std.Build) void {
     x64_register_encoder.addImport("optimizer", optimizer);
     x64_register_encoder.addImport("regalloc", regalloc);
     x64_register_encoder.addImport("runtime_stack_map", runtime_stack_map);
+    x64_register_encoder.addImport("runtime_jit", runtime_jit);
     x64_register_encoder.addImport("runtime_value", runtime_value);
     x64_register_encoder.addImport("instructions", instructions);
 
@@ -223,17 +226,26 @@ pub fn build(b: *std.Build) void {
     runtime_jit.addImport("runtime_gc", runtime_gc);
     runtime_jit.addImport("runtime_stack_map", runtime_stack_map);
     runtime_jit.addImport("runtime_thread_registry", runtime_thread_registry);
+    runtime_jit.addImport("runtime_code_manager", runtime_code_manager);
+    runtime_jit.addImport("runtime_deopt", runtime_deopt);
+    runtime_code_manager.addImport("jit_memory", jit_memory);
+    runtime_deopt.addImport("interpreter", interpreter);
+    runtime_deopt.addImport("runtime_value", runtime_value);
+    runtime_deopt.addImport("runtime_stack_map", runtime_stack_map);
     runtime_interpreter.addImport("interpreter", interpreter);
     runtime_interpreter.addImport("runtime_gc", runtime_gc);
     runtime_interpreter.addImport("runtime_heap", runtime_heap);
     runtime_interpreter.addImport("runtime_value", runtime_value);
 
     x64_runtime_shim.addImport("code_buffer", code_buffer);
+    x64_runtime_shim.addImport("interpreter", interpreter);
     x64_runtime_shim.addImport("jit_memory", jit_memory);
     x64_runtime_shim.addImport("optimizer", optimizer);
     x64_runtime_shim.addImport("runtime_gc", runtime_gc);
     x64_runtime_shim.addImport("runtime_heap", runtime_heap);
     x64_runtime_shim.addImport("runtime_jit", runtime_jit);
+    x64_runtime_shim.addImport("runtime_code_manager", runtime_code_manager);
+    x64_runtime_shim.addImport("runtime_deopt", runtime_deopt);
     x64_runtime_shim.addImport("runtime_stack_map", runtime_stack_map);
     x64_runtime_shim.addImport("runtime_thread_registry", runtime_thread_registry);
     x64_runtime_shim.addImport("runtime_value", runtime_value);
@@ -291,6 +303,8 @@ pub fn build(b: *std.Build) void {
         .{ .name = "runtime_stack_map", .module = runtime_stack_map },
         .{ .name = "runtime_jit", .module = runtime_jit },
         .{ .name = "runtime_interpreter", .module = runtime_interpreter },
+        .{ .name = "runtime_code_manager", .module = runtime_code_manager },
+        .{ .name = "runtime_deopt", .module = runtime_deopt },
         .{ .name = "scheduler", .module = scheduler },
         .{ .name = "lock", .module = lock },
         .{ .name = "immix", .module = immix },

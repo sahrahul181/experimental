@@ -10,18 +10,49 @@ const runtime_value = @import("runtime_value");
 const runtime_stack_map = @import("runtime_stack_map");
 const thread_registry = @import("runtime_thread_registry");
 const runtime_gc = @import("runtime_gc");
+const runtime_code_manager = @import("runtime_code_manager");
+const runtime_deopt = @import("runtime_deopt");
 
 const Handle = runtime_value.Handle;
 const HandleTable = runtime_value.HandleTable;
 const Registry = thread_registry.Registry;
 const ThreadContext = thread_registry.ThreadContext;
 
-pub const Error = runtime_value.Error || runtime_stack_map.Error || thread_registry.Error || runtime_gc.Error || std.mem.Allocator.Error || error{
+pub const Error = runtime_value.Error || runtime_stack_map.Error || thread_registry.Error || runtime_gc.Error || runtime_code_manager.Error || runtime_deopt.Error || std.mem.Allocator.Error || error{
     ActiveEntries,
+    ActiveCodeLease,
     InactiveEntry,
     InvalidTableLayout,
     MissingCollector,
+    PendingException,
     ThreadNotRunning,
+};
+
+pub const unmanaged_method_id = std.math.maxInt(u32);
+
+pub const CodeDispatchStatus = enum(u32) {
+    ok = 0,
+    fallback_no_code,
+    fallback_runtime_error,
+    inactive_entry,
+    active_lease,
+    deoptimized,
+    deopt_failed,
+};
+
+pub const ManagedExceptionKind = enum(u32) {
+    none = 0,
+    array_index_out_of_bounds = 1,
+};
+
+/// Allocation-free exception payload produced by generated code. Object
+/// materialization and handler lookup happen only after leaving the native
+/// frame, so the uncommon edge never invokes platform stack unwinding.
+pub const ManagedException = extern struct {
+    kind: ManagedExceptionKind = .none,
+    dex_pc: u32 = 0,
+    index: i32 = 0,
+    length: u32 = 0,
 };
 
 /// Values loaded into reserved registers by the architecture trampoline.
@@ -59,6 +90,7 @@ pub const NativeThreadState = extern struct {
     runtime: *Runtime,
     context: *ThreadContext,
     acknowledged_epoch: u64,
+    request_epoch_address: usize,
     last_site_key: u64 = 0,
     last_error: SlowResolveStatus = .ok,
     active: u32 = 1,
@@ -66,6 +98,12 @@ pub const NativeThreadState = extern struct {
     collector: usize = 0,
     satb_buffer: usize = 0,
     last_card_destination: u64 = 0,
+    pending_exception: ManagedException = .{},
+    code_manager: usize = 0,
+    code_reader: usize = 0,
+    code_lease_slot: usize = 0,
+    deopt_request: usize = 0,
+    last_code_dispatch: CodeDispatchStatus = .ok,
     captured_gp: [16]u64 = @splat(0),
 };
 
@@ -79,6 +117,13 @@ pub const Stats = struct {
     pre_write_barriers: u64,
     post_write_barriers: u64,
     barrier_failures: u64,
+    exception_transfers: u64,
+    exception_failures: u64,
+    code_entries: u64,
+    code_fallbacks: u64,
+    code_failures: u64,
+    deoptimizations: u64,
+    deopt_failures: u64,
 };
 
 const Counters = struct {
@@ -91,6 +136,13 @@ const Counters = struct {
     pre_write_barriers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     post_write_barriers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     barrier_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    exception_transfers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    exception_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    code_entries: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    code_fallbacks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    code_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    deoptimizations: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    deopt_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 pub const Runtime = struct {
@@ -99,6 +151,7 @@ pub const Runtime = struct {
     registry: *Registry,
     region_bases: []usize,
     collector: ?*runtime_gc.ConcurrentCollector = null,
+    code_manager: ?*runtime_code_manager.Manager = null,
     counters: Counters = .{},
 
     pub fn init(
@@ -136,6 +189,14 @@ pub const Runtime = struct {
         self.collector = collector;
     }
 
+    /// Installs the immutable-code publication domain used by architecture
+    /// entry trampolines. Each subsequently-created managed entry owns one
+    /// reader slot; no manager lock is acquired while executing compiled code.
+    pub fn installCodeManager(self: *Runtime, manager: *runtime_code_manager.Manager) Error!void {
+        if (self.counters.active_entries.load(.acquire) != 0) return error.ActiveEntries;
+        self.code_manager = manager;
+    }
+
     /// Enters managed code after acknowledging any pending root handshake.
     /// The returned epoch is installed in r12 and remains the reclamation lease
     /// for derived pointers until the next compiler safepoint/poll.
@@ -149,6 +210,9 @@ pub const Runtime = struct {
             if (collector.bufferForThread(context)) |buffer| @intFromPtr(buffer) else return error.MissingSatbBuffer
         else
             0;
+        var code_reader: ?runtime_code_manager.Reader = null;
+        if (self.code_manager) |manager| code_reader = try manager.registerReader();
+        errdefer if (code_reader) |*reader| reader.deinit();
         // Validate every dependency before publishing an active native entry;
         // failed entry attempts must not strand Runtime.deinit forever.
         _ = self.counters.managed_entries.fetchAdd(1, .monotonic);
@@ -157,10 +221,12 @@ pub const Runtime = struct {
             .runtime = self,
             .context = context,
             .acknowledged_epoch = context.observedEpoch(),
+            .code_reader = code_reader,
             .native_state = .{
                 .runtime = self,
                 .context = context,
                 .acknowledged_epoch = context.observedEpoch(),
+                .request_epoch_address = self.registry.requestEpochAddress(),
                 .collector = collector_address,
                 .satb_buffer = buffer_address,
             },
@@ -178,6 +244,13 @@ pub const Runtime = struct {
             .pre_write_barriers = self.counters.pre_write_barriers.load(.acquire),
             .post_write_barriers = self.counters.post_write_barriers.load(.acquire),
             .barrier_failures = self.counters.barrier_failures.load(.acquire),
+            .exception_transfers = self.counters.exception_transfers.load(.acquire),
+            .exception_failures = self.counters.exception_failures.load(.acquire),
+            .code_entries = self.counters.code_entries.load(.acquire),
+            .code_fallbacks = self.counters.code_fallbacks.load(.acquire),
+            .code_failures = self.counters.code_failures.load(.acquire),
+            .deoptimizations = self.counters.deoptimizations.load(.acquire),
+            .deopt_failures = self.counters.deopt_failures.load(.acquire),
         };
     }
 };
@@ -187,10 +260,16 @@ pub const ManagedEntry = struct {
     context: *ThreadContext,
     acknowledged_epoch: u64,
     native_state: NativeThreadState,
+    code_reader: ?runtime_code_manager.Reader = null,
+    code_lease: ?runtime_code_manager.Lease = null,
     active: bool = true,
 
     pub fn deinit(self: *ManagedEntry) void {
         if (!self.active) return;
+        if (self.code_lease) |*lease| lease.deinit();
+        self.code_lease = null;
+        if (self.code_reader) |*reader| reader.deinit();
+        self.code_reader = null;
         _ = self.runtime.counters.active_entries.fetchSub(1, .release);
         self.native_state.active = 0;
         self.active = false;
@@ -203,12 +282,15 @@ pub const ManagedEntry = struct {
         if (participated) _ = self.runtime.counters.handshake_polls.fetchAdd(1, .monotonic);
         self.acknowledged_epoch = self.context.observedEpoch();
         self.native_state.acknowledged_epoch = self.acknowledged_epoch;
+        self.native_state.request_epoch_address = self.runtime.registry.requestEpochAddress();
         return participated;
     }
 
     pub fn registerImage(self: *ManagedEntry) Error!RegisterImage {
         if (!self.active) return error.InactiveEntry;
         if (!self.context.isRunning()) return error.ThreadNotRunning;
+        if (self.native_state.pending_exception.kind != .none) return error.PendingException;
+        if (self.code_lease != null) return error.ActiveCodeLease;
         // A preserve-all slow helper may have acknowledged a handshake without
         // returning through `ManagedEntry.refresh`. Re-read the authoritative
         // context epoch so a subsequent native entry can never reinstall an
@@ -223,6 +305,11 @@ pub const ManagedEntry = struct {
             if (collector.bufferForThread(self.context)) |buffer| @intFromPtr(buffer) else return error.MissingSatbBuffer
         else
             0;
+        self.native_state.code_manager = if (self.runtime.code_manager) |manager| @intFromPtr(manager) else 0;
+        self.native_state.code_reader = if (self.code_reader) |*reader| @intFromPtr(reader) else 0;
+        self.native_state.code_lease_slot = @intFromPtr(&self.code_lease);
+        self.native_state.deopt_request = 0;
+        self.native_state.last_code_dispatch = .ok;
         return .{
             .r12_acknowledged_epoch = self.acknowledged_epoch,
             .r13_region_bases = @intFromPtr(self.runtime.region_bases.ptr),
@@ -232,6 +319,20 @@ pub const ManagedEntry = struct {
             .region_count = self.runtime.handles.regionCount(),
             .descriptor_stride = self.runtime.handles.descriptorStride(),
         };
+    }
+
+    pub fn pendingException(self: *const ManagedEntry) ?ManagedException {
+        if (self.native_state.pending_exception.kind == .none) return null;
+        return self.native_state.pending_exception;
+    }
+
+    /// Consume the owner-confined lazy exception record before the next native
+    /// entry. The returned payload is sufficient for handler lookup and later
+    /// managed exception-object materialization.
+    pub fn takeException(self: *ManagedEntry) ?ManagedException {
+        const exception = self.pendingException() orelse return null;
+        self.native_state.pending_exception = .{};
+        return exception;
     }
 
     pub fn installRootMaps(self: *ManagedEntry, table: *const runtime_stack_map.Table) Error!void {
@@ -271,6 +372,170 @@ pub const ManagedEntry = struct {
         return self.resolveSlow(@bitCast(handle_bits), site_key);
     }
 };
+
+/// Stable, non-reclaimable target used when dispatch has neither compiled code
+/// nor an installed interpreter/deoptimization fallback.
+pub fn unavailableCodeTarget(
+    _: usize,
+    _: usize,
+    _: usize,
+    _: usize,
+    _: usize,
+    _: usize,
+) callconv(.c) usize {
+    return 0;
+}
+
+fn codeFallback(state: *NativeThreadState, status: CodeDispatchStatus, fallback_target: usize) usize {
+    state.last_code_dispatch = status;
+    _ = state.runtime.counters.code_fallbacks.fetchAdd(1, .monotonic);
+    if (status != .fallback_no_code) _ = state.runtime.counters.code_failures.fetchAdd(1, .monotonic);
+    if (fallback_target != 0) return fallback_target;
+    if (status == .fallback_no_code and state.deopt_request != 0) return @intFromPtr(&deoptResumeBridge);
+    return @intFromPtr(&unavailableCodeTarget);
+}
+
+/// Runtime half of the architecture entry trampoline. The reader is bound to
+/// this ManagedEntry and therefore owner-confined; publication and reclamation
+/// only observe its atomic reader slot. A successful return owns exactly one
+/// lease in `code_lease_slot` until `codeLeaseExitBridge` runs.
+pub fn codeLeaseEnterBridge(
+    state: *NativeThreadState,
+    fallback_target: usize,
+    method: u32,
+    deopt_request: usize,
+) callconv(.c) usize {
+    state.deopt_request = deopt_request;
+    if (state.active == 0) return codeFallback(state, .inactive_entry, fallback_target);
+    if (state.code_manager == 0 or state.code_reader == 0 or state.code_lease_slot == 0) {
+        return codeFallback(state, .fallback_runtime_error, fallback_target);
+    }
+
+    const lease_slot: *?runtime_code_manager.Lease = @ptrFromInt(state.code_lease_slot);
+    if (lease_slot.* != null) return codeFallback(state, .active_lease, fallback_target);
+
+    var entry_roots = state.context.beginRootScope() catch {
+        return codeFallback(state, .fallback_runtime_error, fallback_target);
+    };
+    defer entry_roots.deinit();
+    if (deopt_request != 0) {
+        const request: *runtime_deopt.Request = @ptrFromInt(deopt_request);
+        const RootVisitor = struct {
+            fn add(scope: *thread_registry.RootScope, slot: *const Handle) thread_registry.Error!void {
+                try scope.add(slot);
+            }
+        };
+        request.table.visitReferenceSlots(request.point_id, .{
+            .native_registers = &state.captured_gp,
+            .stack_base = request.stack_base,
+            .stack_min_offset = request.stack_min_offset,
+            .stack_max_offset = request.stack_max_offset,
+        }, &entry_roots, RootVisitor.add) catch {
+            return codeFallback(state, .fallback_runtime_error, fallback_target);
+        };
+    }
+
+    // Entry is a safepoint. Poll before loading the code epoch so generated
+    // r12 receives the post-handshake heap epoch on return from this bridge.
+    const participated = state.runtime.registry.poll(state.context) catch {
+        return codeFallback(state, .fallback_runtime_error, fallback_target);
+    };
+    if (participated) _ = state.runtime.counters.handshake_polls.fetchAdd(1, .monotonic);
+    state.acknowledged_epoch = state.context.observedEpoch();
+    state.request_epoch_address = state.runtime.registry.requestEpochAddress();
+
+    const manager: *runtime_code_manager.Manager = @ptrFromInt(state.code_manager);
+    const reader: *runtime_code_manager.Reader = @ptrFromInt(state.code_reader);
+    lease_slot.* = manager.enter(reader, method) catch |err| switch (err) {
+        error.NoCode => return codeFallback(state, .fallback_no_code, fallback_target),
+        else => return codeFallback(state, .fallback_runtime_error, fallback_target),
+    };
+    state.deopt_request = 0;
+    state.last_code_dispatch = .ok;
+    _ = state.runtime.counters.code_entries.fetchAdd(1, .monotonic);
+    return lease_slot.*.?.entryAddress();
+}
+
+/// Stable fallback ABI selected by the entry trampoline after invalidation.
+/// The trampoline passes NativeThreadState as argument zero and has already
+/// captured the original managed GP arguments into `captured_gp`.
+pub fn deoptResumeBridge(
+    state: *NativeThreadState,
+    _: usize,
+    _: usize,
+    _: usize,
+    _: usize,
+    _: usize,
+) callconv(.c) usize {
+    if (state.active == 0 or state.deopt_request == 0) {
+        state.last_code_dispatch = .deopt_failed;
+        _ = state.runtime.counters.deopt_failures.fetchAdd(1, .monotonic);
+        _ = state.runtime.counters.code_failures.fetchAdd(1, .monotonic);
+        return 0;
+    }
+    const request: *runtime_deopt.Request = @ptrFromInt(state.deopt_request);
+    const exception = if (state.pending_exception.kind == .none)
+        request.exception
+    else
+        runtime_deopt.ExceptionState{
+            .kind = @intFromEnum(state.pending_exception.kind),
+            .dex_pc = state.pending_exception.dex_pc,
+            .payload0 = @bitCast(@as(i64, state.pending_exception.index)),
+            .payload1 = state.pending_exception.length,
+        };
+    const frame = request.table.reconstruct(
+        request.point_id,
+        .{
+            .native_registers = &state.captured_gp,
+            .stack_base = request.stack_base,
+            .stack_min_offset = request.stack_min_offset,
+            .stack_max_offset = request.stack_max_offset,
+        },
+        request.destination,
+        request.reason,
+        exception,
+    ) catch {
+        state.deopt_request = 0;
+        state.last_code_dispatch = .deopt_failed;
+        _ = state.runtime.counters.deopt_failures.fetchAdd(1, .monotonic);
+        _ = state.runtime.counters.code_failures.fetchAdd(1, .monotonic);
+        return 0;
+    };
+    state.deopt_request = 0;
+    state.pending_exception = .{};
+    var resumed_roots = state.context.beginRootScope() catch {
+        frame.active = false;
+        state.last_code_dispatch = .deopt_failed;
+        _ = state.runtime.counters.deopt_failures.fetchAdd(1, .monotonic);
+        _ = state.runtime.counters.code_failures.fetchAdd(1, .monotonic);
+        return 0;
+    };
+    defer resumed_roots.deinit();
+    for (frame.execution.register_is_ref, 0..) |is_reference, register| {
+        if (!is_reference) continue;
+        resumed_roots.add(@ptrCast(&frame.execution.reference_registers[register])) catch {
+            frame.active = false;
+            state.last_code_dispatch = .deopt_failed;
+            _ = state.runtime.counters.deopt_failures.fetchAdd(1, .monotonic);
+            _ = state.runtime.counters.code_failures.fetchAdd(1, .monotonic);
+            return 0;
+        };
+    }
+    state.last_code_dispatch = .deoptimized;
+    _ = state.runtime.counters.deoptimizations.fetchAdd(1, .monotonic);
+    return request.resume_fn(request.resume_context, frame);
+}
+
+/// Normal-return edge for both compiled and fallback targets. Returning the
+/// result unchanged lets the generated trampoline close the lease without a
+/// spill or a second result ABI.
+pub fn codeLeaseExitBridge(state: *NativeThreadState, result: usize) callconv(.c) usize {
+    if (state.code_lease_slot == 0) return result;
+    const lease_slot: *?runtime_code_manager.Lease = @ptrFromInt(state.code_lease_slot);
+    if (lease_slot.*) |*lease| lease.deinit();
+    lease_slot.* = null;
+    return result;
+}
 
 fn statusFor(err: Error) SlowResolveStatus {
     return switch (err) {
@@ -351,6 +616,48 @@ pub fn slowResolveBridge(state: *NativeThreadState, handle_bits: u64, site_key: 
         return 0;
     };
     return @intFromPtr(address);
+}
+
+fn exceptionFailure(state: *NativeThreadState, status: SlowResolveStatus) usize {
+    state.last_error = status;
+    _ = state.runtime.counters.exception_failures.fetchAdd(1, .monotonic);
+    return 0;
+}
+
+/// Platform-ABI target for the mapped array-bounds cold edge. Generated code
+/// preloads `pending_exception.index/length`, places the canonical array Handle
+/// in r10, and places `(dex_pc << 32) | exception_site_id` in r11. The
+/// preserve-all adapter captures every mapped root before this function polls.
+/// Success returns a non-zero sentinel; the generated cold edge then returns
+/// from the managed native frame with the lazy exception record installed.
+pub fn boundsExceptionBridge(state: *NativeThreadState, handle_bits: u64, site_key: u64) callconv(.c) usize {
+    state.last_site_key = site_key;
+    state.last_error = .ok;
+    if (state.active == 0) return exceptionFailure(state, .inactive_entry);
+    if (!state.context.isRunning()) return exceptionFailure(state, .thread_not_running);
+    if (state.pending_exception.kind != .none) return exceptionFailure(state, .runtime_error);
+
+    const index = state.pending_exception.index;
+    const length = state.pending_exception.length;
+    if (!(index < 0 or @as(u32, @intCast(index)) >= length)) return exceptionFailure(state, .runtime_error);
+
+    var roots = state.context.beginRootScope() catch |err| {
+        return exceptionFailure(state, statusFor(err));
+    };
+    defer roots.deinit();
+    addMappedRoots(state, handle_bits, site_key, &roots) catch |err| {
+        return exceptionFailure(state, if (err == error.InvalidLocation) .missing_canonical_root else statusFor(err));
+    };
+
+    const participated = state.runtime.registry.poll(state.context) catch |err| {
+        return exceptionFailure(state, statusFor(err));
+    };
+    if (participated) _ = state.runtime.counters.handshake_polls.fetchAdd(1, .monotonic);
+    state.acknowledged_epoch = state.context.observedEpoch();
+    state.pending_exception.dex_pc = @truncate(site_key >> 32);
+    state.pending_exception.kind = .array_index_out_of_bounds;
+    _ = state.runtime.counters.exception_transfers.fetchAdd(1, .monotonic);
+    return 1;
 }
 
 /// Explicit no-safepoint fallback. All managed registers remain saved by the

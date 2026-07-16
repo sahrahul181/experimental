@@ -35,6 +35,7 @@ pub const Stats = struct {
     canonical_state_uses: u32 = 0,
     safepoints_checked: u32 = 0,
     relocation_kills_checked: u32 = 0,
+    loop_epoch_guards_checked: u32 = 0,
 };
 
 pub const Result = struct {
@@ -64,13 +65,14 @@ pub const Result = struct {
 
     pub fn print(self: *const Result, writer: anytype) !void {
         try writer.print(
-            "derived_verify resolves={d} address_uses={d} state_uses={d} safepoints={d} relocation_kills={d}\n",
+            "derived_verify resolves={d} address_uses={d} state_uses={d} safepoints={d} relocation_kills={d} loop_guards={d}\n",
             .{
                 self.stats.resolve_definitions,
                 self.stats.address_uses,
                 self.stats.canonical_state_uses,
                 self.stats.safepoints_checked,
                 self.stats.relocation_kills_checked,
+                self.stats.loop_epoch_guards_checked,
             },
         );
     }
@@ -158,6 +160,26 @@ fn verifyAddressUse(
     if (!source.source.source.tree.dominates(definition.block, block_id)) return error.AddressDefinitionNotDominating;
     if (definition.block == block_id and definition.instruction >= instruction_index) return error.AddressDefinitionNotDominating;
 
+    if (inst.opcode == .loop_epoch_guard) {
+        const barriers = source.source.barriers orelse return error.InvalidPlan;
+        const resolve_id = inst.resolve_id orelse return error.InvalidPlan;
+        if (resolve_id >= barriers.resolves.len or ptr.resolve != resolve_id or
+            inst.reloc_token != ptr.token) return error.InvalidPlan;
+        const resolve = barriers.resolves[resolve_id];
+        const guard_id = resolve.guard_id orelse return error.InvalidPlan;
+        const expected_site: u64 = @as(u64, @intCast(barriers.resolves.len)) + guard_id;
+        if (!resolve.hoisted or resolve.loop_latch != block_id or resolve.handle != ptr.handle or
+            expected_site > std.math.maxInt(u32) or @as(u64, inst.guard_site_id orelse return error.InvalidPlan) != expected_site)
+            return error.InvalidPlan;
+        const state = inst.state_handle orelse return error.BadCanonicalHandle;
+        if (!source.isGcRoot(state)) return error.BadCanonicalHandle;
+        switch (source.runtime_values[state]) {
+            .dalvik => |value| if (value.value != ptr.handle) return error.BadCanonicalHandle,
+            .derived_ptr => return error.BadCanonicalHandle,
+        }
+        return;
+    }
+
     const plan_ref = try planFor(source, block_id, inst);
     const expected_resolve = resolveFromPlan(plan_ref.plan) orelse return error.InvalidPlan;
     if (expected_resolve != ptr.resolve or plan_ref.plan.token_in != ptr.token or plan_ref.plan.base_handle != ptr.handle) return error.InvalidPlan;
@@ -230,6 +252,7 @@ fn verifyWithDefinitions(
                 try verifyAddressUse(source, definitions, block.id, instruction_index, inst);
                 stats.address_uses += 1;
                 stats.canonical_state_uses += 1;
+                if (inst.opcode == .loop_epoch_guard) stats.loop_epoch_guards_checked += 1;
             }
         }
     }

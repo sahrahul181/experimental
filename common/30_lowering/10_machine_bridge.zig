@@ -58,6 +58,7 @@ pub const Opcode = enum(u8) {
     check_null,
     check_bounds,
     resolve_handle,
+    loop_epoch_guard,
     array_load,
     array_store,
     field_load,
@@ -115,6 +116,8 @@ pub const Inst = struct {
     state_handle: ?RegId = null,
     reloc_token: ?u32 = null,
     resolve_id: ?u32 = null,
+    guard_site_id: ?u32 = null,
+    exception_site_id: ?u32 = null,
     pre_write: barrier_phase.PreWriteBarrier = .none,
     post_write: barrier_phase.PostWriteBarrier = .none,
     flags: Flags = .{},
@@ -146,6 +149,8 @@ pub const Stats = struct {
     calls: u32 = 0,
     checks: u32 = 0,
     resolves: u32 = 0,
+    loop_epoch_guards: u32 = 0,
+    bounds_exception_sites: u32 = 0,
     pointer_accesses: u32 = 0,
     forwarded: u32 = 0,
     cse: u32 = 0,
@@ -214,6 +219,12 @@ pub const Function = struct {
             }
         }
 
+        const barriers = self.source.barriers;
+        const exception_site_base: u32 = if (barriers) |plan|
+            std.math.add(u32, @intCast(plan.resolves.len), plan.stats.loop_epoch_guards) catch return error.BadInstruction
+        else
+            0;
+        var verified_exception_sites: u32 = 0;
         for (self.blocks, 0..) |block, i| {
             if (block.id != i) return error.BadBlock;
             for (block.insts) |inst| {
@@ -239,6 +250,7 @@ pub const Function = struct {
                     .branch => if (inst.target == null or inst.false_target == null or inst.uses.len == 0 or inst.condition == null) return error.BadInstruction,
                     .field_load, .field_store, .static_load, .static_store, .static_satb_pre_write, .static_root_post_write => if (inst.field_idx == null) return error.BadInstruction,
                     .resolve_handle => try self.verifyResolve(inst),
+                    .loop_epoch_guard => try self.verifyLoopEpochGuard(block.id, inst),
                     .check_bounds, .field_load_ptr, .field_store_ptr, .array_load_ptr, .array_store_ptr, .satb_pre_write, .card_mark => if (inst.address != null) try self.verifyAddress(inst),
                     .call_direct, .call_static, .call_virtual, .call_quick => if (inst.address != null) try self.verifyAddress(inst),
                     else => {},
@@ -259,12 +271,21 @@ pub const Function = struct {
                     .call_static,
                     .call_virtual,
                     .call_quick,
+                    .loop_epoch_guard,
                     => true,
                     else => false,
                 };
                 if (inst.address != null and !permits_address) return error.BadInstruction;
                 if (inst.address == null and inst.state_handle != null and inst.opcode != .resolve_handle) return error.BadInstruction;
                 if (inst.address == null and inst.opcode != .resolve_handle and (inst.reloc_token != null or inst.resolve_id != null)) return error.BadInstruction;
+                if ((inst.opcode == .loop_epoch_guard) != (inst.guard_site_id != null)) return error.BadInstruction;
+                const is_mapped_bounds = inst.opcode == .check_bounds and inst.address != null;
+                if (is_mapped_bounds != (inst.exception_site_id != null)) return error.BadInstruction;
+                if (is_mapped_bounds) {
+                    const expected = std.math.add(u32, exception_site_base, verified_exception_sites) catch return error.BadInstruction;
+                    if (inst.exception_site_id.? != expected or inst.uses.len != 1) return error.BadInstruction;
+                    verified_exception_sites += 1;
+                }
                 const is_pre_write = inst.opcode == .satb_pre_write or inst.opcode == .static_satb_pre_write;
                 const is_post_write = inst.opcode == .card_mark or inst.opcode == .static_root_post_write;
                 if (is_pre_write != (inst.pre_write != .none)) return error.BadInstruction;
@@ -277,6 +298,8 @@ pub const Function = struct {
                 if (inst.opcode == .static_root_post_write and (inst.uses.len != 1 or inst.post_write != .root_guarded)) return error.BadInstruction;
             }
         }
+        if (verified_exception_sites != self.stats.bounds_exception_sites or
+            verified_exception_sites != self.source.stats.bounds_exception_sites) return error.BadInstruction;
     }
 
     fn verifyResolve(self: *const Function, inst: Inst) VerifyError!void {
@@ -308,6 +331,22 @@ pub const Function = struct {
         }
     }
 
+    fn verifyLoopEpochGuard(self: *const Function, block_id: cfg.BlockId, inst: Inst) VerifyError!void {
+        if (inst.defs.len != 0 or inst.uses.len != 0 or inst.field_idx != null or
+            inst.pre_write != .none or inst.post_write != .none) return error.BadInstruction;
+        try self.verifyAddress(inst);
+        const lowered = self.source;
+        const barriers = lowered.barriers orelse return error.BadInstruction;
+        const resolve_id = inst.resolve_id orelse return error.BadInstruction;
+        if (resolve_id >= barriers.resolves.len) return error.BadInstruction;
+        const resolve = barriers.resolves[resolve_id];
+        const guard_id = resolve.guard_id orelse return error.BadInstruction;
+        if (!resolve.hoisted or resolve.loop_latch != block_id or resolve.handle != inst.state_handle.? or
+            resolve.token != inst.reloc_token.?) return error.BadInstruction;
+        const expected_site: u64 = @as(u64, @intCast(barriers.resolves.len)) + guard_id;
+        if (expected_site > std.math.maxInt(u32) or @as(u64, inst.guard_site_id.?) != expected_site) return error.BadInstruction;
+    }
+
     pub fn isGcRoot(self: *const Function, reg: RegId) bool {
         if (reg >= self.runtime_values.len) return false;
         return self.runtime_values[reg].isGcRoot();
@@ -315,7 +354,7 @@ pub const Function = struct {
 
     pub fn print(self: *const Function, writer: anytype) !void {
         try writer.print(
-            "machine_bridge blocks={d} regs={d} insts={d} edge_moves={d} consts={d} branches={d} calls={d} checks={d} resolves={d} ptr_accesses={d} forwarded={d} cse={d}\n",
+            "machine_bridge blocks={d} regs={d} insts={d} edge_moves={d} consts={d} branches={d} calls={d} checks={d} resolves={d} loop_guards={d} bounds_exceptions={d} ptr_accesses={d} forwarded={d} cse={d}\n",
             .{
                 self.stats.blocks,
                 self.reg_types.len,
@@ -326,6 +365,8 @@ pub const Function = struct {
                 self.stats.calls,
                 self.stats.checks,
                 self.stats.resolves,
+                self.stats.loop_epoch_guards,
+                self.stats.bounds_exception_sites,
                 self.stats.pointer_accesses,
                 self.stats.forwarded,
                 self.stats.cse,
@@ -357,6 +398,8 @@ pub const Function = struct {
                 if (inst.state_handle) |handle| try writer.print(" state=r{d}", .{handle});
                 if (inst.reloc_token) |token| try writer.print(" token={d}", .{token});
                 if (inst.resolve_id) |resolve| try writer.print(" resolve={d}", .{resolve});
+                if (inst.guard_site_id) |site| try writer.print(" guard_site={d}", .{site});
+                if (inst.exception_site_id) |site| try writer.print(" exception_site={d}", .{site});
                 if (inst.imm != 0 or inst.opcode == .const_i32 or inst.opcode == .const_i64) try writer.print(" imm={d}", .{inst.imm});
                 if (inst.flags.null_check_elided) try writer.print(" null_elided", .{});
                 if (inst.flags.bounds_check_elided) try writer.print(" bounds_elided", .{});
@@ -404,6 +447,7 @@ fn mapOpcode(kind: lowering.Kind) ?Opcode {
         .check_null => .check_null,
         .check_bounds => .check_bounds,
         .resolve_handle => .resolve_handle,
+        .loop_epoch_guard => .loop_epoch_guard,
         .array_load => .array_load,
         .array_store => .array_store,
         .field_load => .field_load,
@@ -501,8 +545,13 @@ fn updateStats(inst: Inst, stats: *Stats) void {
         .const_i32, .const_i64 => stats.constants += 1,
         .jump, .branch, .switch_ => stats.branches += 1,
         .call_direct, .call_static, .call_virtual, .call_quick => stats.calls += 1,
-        .check_null, .check_bounds => stats.checks += 1,
+        .check_null => stats.checks += 1,
+        .check_bounds => {
+            stats.checks += 1;
+            if (inst.exception_site_id != null) stats.bounds_exception_sites += 1;
+        },
         .resolve_handle => stats.resolves += 1,
+        .loop_epoch_guard => stats.loop_epoch_guards += 1,
         .array_load_ptr, .array_store_ptr, .field_load_ptr, .field_store_ptr => stats.pointer_accesses += 1,
         else => {},
     }
@@ -626,6 +675,8 @@ pub fn build(allocator: std.mem.Allocator, source: *const lowering.Function) Err
                 .state_handle = lowered.state_handle,
                 .reloc_token = lowered.reloc_token,
                 .resolve_id = lowered.resolve_id,
+                .guard_site_id = lowered.guard_site_id,
+                .exception_site_id = lowered.exception_site_id,
                 .pre_write = lowered.pre_write,
                 .post_write = lowered.post_write,
                 .flags = flagsFrom(lowered),

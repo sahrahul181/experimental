@@ -16,6 +16,7 @@ pub const Error = error{
     InvalidAlignment,
     OutOfMemory,
     ProtectFailed,
+    UnknownAllocation,
 };
 
 pub const Permission = enum(u8) {
@@ -38,8 +39,12 @@ pub const Allocation = struct {
     permission: Permission,
 
     pub fn deinit(self: *Allocation) void {
+        self.release() catch {};
+    }
+
+    pub fn release(self: *Allocation) Error!void {
         if (self.permission == .released) return;
-        makeWritable(self.memory) catch {};
+        try makeWritable(self.memory);
         self.allocator.free(self.memory);
         self.memory = &.{};
         self.code_len = 0;
@@ -89,11 +94,19 @@ pub const Cache = struct {
 
         const reserved_len = alignToPage(code.len);
         var memory = try self.allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), reserved_len);
-        errdefer self.allocator.free(memory);
+        var executable = false;
+        errdefer {
+            var can_free = true;
+            if (executable) makeWritable(memory) catch {
+                can_free = false;
+            };
+            if (can_free) self.allocator.free(memory);
+        }
 
         @memcpy(memory[0..code.len], code);
         if (reserved_len > code.len) @memset(memory[code.len..], 0xcc);
         try makeExecutable(memory);
+        executable = true;
 
         const allocation = try self.allocator.create(Allocation);
         errdefer self.allocator.destroy(allocation);
@@ -117,6 +130,26 @@ pub const Cache = struct {
         const code = encoded.finalize() catch return error.InvalidCode;
         defer encoded.allocator.free(code);
         return try self.addBytes(code);
+    }
+
+    /// Release one allocation only after an external code-epoch manager has
+    /// proven that no native reader can still execute it. Cache ownership is
+    /// removed before page permissions are changed or memory is freed.
+    pub fn release(self: *Cache, target: *Allocation) Error!void {
+        for (self.functions.items, 0..) |allocation, index| {
+            if (allocation != target) continue;
+            const code_len = allocation.code_len;
+            const reserved_len = allocation.memory.len;
+            try allocation.release();
+            _ = self.functions.swapRemove(index);
+            self.stats.functions -= 1;
+            self.stats.code_bytes -= code_len;
+            self.stats.reserved_bytes -= @intCast(reserved_len);
+            self.stats.executable_bytes -= @intCast(reserved_len);
+            self.allocator.destroy(allocation);
+            return;
+        }
+        return error.UnknownAllocation;
     }
 
     pub fn verify(self: *const Cache) Error!void {
@@ -196,6 +229,17 @@ test "jit_memory deinit releases allocations" {
     const code = [_]u8{ 1, 2, 3, 4 };
     _ = try cache.addBytes(&code);
     cache.deinit();
+}
+
+test "jit_memory releases one epoch-safe allocation" {
+    var cache = Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const first = try cache.addBytes(&.{ 0x90, 0xc3 });
+    const second = try cache.addBytes(&.{0xc3});
+    try cache.release(first);
+    try std.testing.expectEqual(@as(u32, 1), cache.stats.functions);
+    try std.testing.expectEqual(@as(u32, 1), cache.stats.code_bytes);
+    try second.verify();
 }
 
 test "jit_memory print helper emits stable summary" {
