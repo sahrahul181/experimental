@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
     const code_buffer = b.addModule("code_buffer", .{ .root_source_file = b.path("common/40_backend/00_code_buffer.zig"), .target = target, .optimize = optimize_mode });
     const register_encoder = b.addModule("register_encoder", .{ .root_source_file = b.path("common/40_backend/10_register_encoder.zig"), .target = target, .optimize = optimize_mode });
     const jit_memory = b.addModule("jit_memory", .{ .root_source_file = b.path("common/40_backend/20_jit_memory.zig"), .target = target, .optimize = optimize_mode });
+    const jit_compiler = b.addModule("jit_compiler", .{ .root_source_file = b.path("common/40_backend/25_jit_compiler.zig"), .target = target, .optimize = optimize_mode });
     const x64_encoder = b.addModule("x64_encoder", .{ .root_source_file = b.path("common/40_backend/30_x64_encoder.zig"), .target = target, .optimize = optimize_mode });
     const x64_register_encoder = b.addModule("x64_register_encoder", .{ .root_source_file = b.path("common/40_backend/40_x64_register_encoder.zig"), .target = target, .optimize = optimize_mode });
     const x64_runtime_shim = b.addModule("x64_runtime_shim", .{ .root_source_file = b.path("common/40_backend/50_x64_runtime_shim.zig"), .target = target, .optimize = optimize_mode });
@@ -181,6 +182,12 @@ pub fn build(b: *std.Build) void {
     jit_memory.addImport("register_encoder", register_encoder);
     jit_memory.addImport("optimizer", optimizer);
     jit_memory.addImport("instructions", instructions);
+    jit_compiler.addImport("code_buffer", code_buffer);
+    jit_compiler.addImport("instructions", instructions);
+    jit_compiler.addImport("jit_memory", jit_memory);
+    jit_compiler.addImport("runtime_code_manager", runtime_code_manager);
+    jit_compiler.addImport("runtime_deopt", runtime_deopt);
+    jit_compiler.addImport("runtime_stack_map", runtime_stack_map);
     x64_encoder.addImport("cfg", cfg);
     x64_encoder.addImport("code_buffer", code_buffer);
     x64_encoder.addImport("jit_memory", jit_memory);
@@ -302,6 +309,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "code_buffer", .module = code_buffer },
         .{ .name = "register_encoder", .module = register_encoder },
         .{ .name = "jit_memory", .module = jit_memory },
+        .{ .name = "jit_compiler", .module = jit_compiler },
         .{ .name = "x64_encoder", .module = x64_encoder },
         .{ .name = "x64_register_encoder", .module = x64_register_encoder },
         .{ .name = "x64_runtime_shim", .module = x64_runtime_shim },
