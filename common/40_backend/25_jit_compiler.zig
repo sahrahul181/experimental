@@ -113,12 +113,13 @@ pub const Compiler = struct {
                 },
                 .const_wide => |op| {
                     if (op.dest > max) max = op.dest;
-                    if (op.dest < std.math.maxInt(u16)) {
-                        const next: u16 = op.dest + 1;
-                        if (next > max) max = next;
-                    }
                 },
-                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int => |op| {
+                .add_int, .sub_int, .mul_int, .div_int, .rem_int, .and_int, .or_int, .xor_int, .shl_int, .shr_int, .ushr_int, .add_float, .sub_float, .mul_float, .div_float, .rem_float => |op| {
+                    if (op.dest > max) max = op.dest;
+                    if (op.src1 > max) max = op.src1;
+                    if (op.src2 > max) max = op.src2;
+                },
+                .add_long, .sub_long, .mul_long, .div_long, .rem_long, .and_long, .or_long, .xor_long, .shl_long, .shr_long, .ushr_long, .add_double, .sub_double, .mul_double, .div_double, .rem_double => |op| {
                     if (op.dest > max) max = op.dest;
                     if (op.src1 > max) max = op.src1;
                     if (op.src2 > max) max = op.src2;
@@ -131,11 +132,35 @@ pub const Compiler = struct {
                     if (op.dest > max) max = op.dest;
                     if (op.src > max) max = op.src;
                 },
+                .neg_int, .not_int, .neg_float, .int_to_float, .float_to_int, .int_to_byte, .int_to_char, .int_to_short => |op| {
+                    if (op.dest > max) max = op.dest;
+                    if (op.src > max) max = op.src;
+                },
+                .neg_long, .not_long, .neg_double, .long_to_double, .double_to_long => |op| {
+                    if (op.dest > max) max = op.dest;
+                    if (op.src > max) max = op.src;
+                },
+                .int_to_long, .int_to_double, .float_to_long, .float_to_double => |op| {
+                    if (op.dest > max) max = op.dest;
+                    if (op.src > max) max = op.src;
+                },
+                .long_to_int, .long_to_float, .double_to_int, .double_to_float => |op| {
+                    if (op.dest > max) max = op.dest;
+                    if (op.src > max) max = op.src;
+                },
+                .cmpl_float, .cmpg_float, .cmpl_double, .cmpg_double, .cmp_long => |op| {
+                    if (op.dest > max) max = op.dest;
+                    if (op.src1 > max) max = op.src1;
+                    if (op.src2 > max) max = op.src2;
+                },
                 .if_eq, .if_ne, .if_lt, .if_ge, .if_gt, .if_le => |op| {
                     if (op.src1 > max) max = op.src1;
                     if (op.src2 > max) max = op.src2;
                 },
                 .if_eqz, .if_nez, .if_ltz, .if_gez, .if_gtz, .if_lez => |op| {
+                    if (op.src > max) max = op.src;
+                },
+                .packed_switch, .sparse_switch => |op| {
                     if (op.src > max) max = op.src;
                 },
                 else => {},
@@ -204,6 +229,38 @@ pub const Compiler = struct {
         try emitRex(buffer, true, 0, reg);
         try buffer.emitU8(0xb8 + @as(u8, reg & 7));
         try buffer.emitU64(value);
+    }
+
+    fn emitLoadXmmSlot32(buffer: *code_buffer.Buffer, xmm_reg: u4, slot_reg: u16) Error!void {
+        try buffer.emitU8(0xf3);
+        try emitRex(buffer, false, xmm_reg, 5);
+        try buffer.emitBytes(&.{ 0x0f, 0x10 });
+        try emitModRm(buffer, 2, xmm_reg, 5);
+        try emitDisp32(buffer, slotOffset(slot_reg));
+    }
+
+    fn emitStoreXmmSlot32(buffer: *code_buffer.Buffer, xmm_reg: u4, slot_reg: u16) Error!void {
+        try buffer.emitU8(0xf3);
+        try emitRex(buffer, false, xmm_reg, 5);
+        try buffer.emitBytes(&.{ 0x0f, 0x11 });
+        try emitModRm(buffer, 2, xmm_reg, 5);
+        try emitDisp32(buffer, slotOffset(slot_reg));
+    }
+
+    fn emitLoadXmmSlot64(buffer: *code_buffer.Buffer, xmm_reg: u4, slot_reg: u16) Error!void {
+        try buffer.emitU8(0xf2);
+        try emitRex(buffer, false, xmm_reg, 5);
+        try buffer.emitBytes(&.{ 0x0f, 0x10 });
+        try emitModRm(buffer, 2, xmm_reg, 5);
+        try emitDisp32(buffer, slotOffset(slot_reg));
+    }
+
+    fn emitStoreXmmSlot64(buffer: *code_buffer.Buffer, xmm_reg: u4, slot_reg: u16) Error!void {
+        try buffer.emitU8(0xf2);
+        try emitRex(buffer, false, xmm_reg, 5);
+        try buffer.emitBytes(&.{ 0x0f, 0x11 });
+        try emitModRm(buffer, 2, xmm_reg, 5);
+        try emitDisp32(buffer, slotOffset(slot_reg));
     }
 
     fn emitPrologue(buffer: *code_buffer.Buffer, stack_size: u32) Error!void {
@@ -357,6 +414,70 @@ pub const Compiler = struct {
                     try emitStoreRegSlot32(&buffer, 0, op.dest);
                     self.stats.arithmetic_emitted += 1;
                 },
+                .shl_int, .shr_int, .ushr_int => |op| {
+                    try emitLoadRegSlot32(&buffer, 1, op.src2); // ecx = src2 (shift amount)
+                    try emitLoadRegSlot32(&buffer, 0, op.src1); // eax = src1
+                    const opcode_ext: u8 = switch (inst) {
+                        .shl_int => 4,
+                        .shr_int => 7,
+                        .ushr_int => 5,
+                        else => unreachable,
+                    };
+                    try buffer.emitBytes(&.{ 0xd3, 0xe0 | (opcode_ext << 3) });
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .div_int => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src1);
+                    try emitLoadRegSlot32(&buffer, 1, op.src2);
+                    try buffer.emitBytes(&.{ 0x83, 0xf9, 0xff }); // cmp ecx, -1
+                    const label_check_min = try buffer.newLabel();
+                    const label_done = try buffer.newLabel();
+                    try buffer.emitBytes(&.{ 0x0f, 0x84 }); // je check_min
+                    _ = try buffer.reloc(label_check_min, .rel32, 0);
+
+                    const label_do_div = try buffer.newLabel();
+                    try buffer.bindLabel(label_do_div);
+                    try buffer.emitU8(0x99); // cdq
+                    try buffer.emitBytes(&.{ 0xf7, 0xf9 }); // idiv ecx
+                    try buffer.emitBytes(&.{ 0xe9 }); // jmp done
+                    _ = try buffer.reloc(label_done, .rel32, 0);
+
+                    try buffer.bindLabel(label_check_min);
+                    try buffer.emitBytes(&.{ 0x3d, 0x00, 0x00, 0x00, 0x80 }); // cmp eax, 0x80000000
+                    try buffer.emitBytes(&.{ 0x0f, 0x85 }); // jne do_div
+                    _ = try buffer.reloc(label_do_div, .rel32, 0);
+
+                    try buffer.bindLabel(label_done);
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .rem_int => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src1);
+                    try emitLoadRegSlot32(&buffer, 1, op.src2);
+                    try buffer.emitBytes(&.{ 0x83, 0xf9, 0xff }); // cmp ecx, -1
+                    const label_check_min = try buffer.newLabel();
+                    const label_done = try buffer.newLabel();
+                    try buffer.emitBytes(&.{ 0x0f, 0x84 }); // je check_min
+                    _ = try buffer.reloc(label_check_min, .rel32, 0);
+
+                    const label_do_div = try buffer.newLabel();
+                    try buffer.bindLabel(label_do_div);
+                    try buffer.emitU8(0x99); // cdq
+                    try buffer.emitBytes(&.{ 0xf7, 0xf9 }); // idiv ecx -> remainder in edx
+                    try buffer.emitBytes(&.{ 0xe9 }); // jmp done
+                    _ = try buffer.reloc(label_done, .rel32, 0);
+
+                    try buffer.bindLabel(label_check_min);
+                    try buffer.emitBytes(&.{ 0x3d, 0x00, 0x00, 0x00, 0x80 }); // cmp eax, 0x80000000
+                    try buffer.emitBytes(&.{ 0x0f, 0x85 }); // jne do_div
+                    _ = try buffer.reloc(label_do_div, .rel32, 0);
+                    try buffer.emitBytes(&.{ 0x33, 0xd2 }); // xor edx, edx
+
+                    try buffer.bindLabel(label_done);
+                    try emitStoreRegSlot32(&buffer, 2, op.dest); // store edx
+                    self.stats.arithmetic_emitted += 1;
+                },
                 .add_int_lit8 => |op| {
                     try emitLoadRegSlot32(&buffer, 0, op.src);
                     try buffer.emitBytes(&.{ 0x83, 0xc0, @bitCast(op.lit) }); // add eax, imm8
@@ -374,17 +495,583 @@ pub const Compiler = struct {
                     try emitStoreRegSlot32(&buffer, 0, op.dest);
                     self.stats.arithmetic_emitted += 1;
                 },
+                .rsub_int_lit16 => |op| {
+                    try buffer.emitU8(0xb8); // mov eax, imm32
+                    try buffer.emitU32(@bitCast(@as(i32, op.lit)));
+                    try buffer.emitBytes(&.{ 0x2b, 0x85 }); // sub eax, [rbp - disp]
+                    try emitDisp32(&buffer, slotOffset(op.src));
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .rsub_int_lit8 => |op| {
+                    try buffer.emitU8(0xb8); // mov eax, imm32
+                    try buffer.emitU32(@bitCast(@as(i32, op.lit)));
+                    try buffer.emitBytes(&.{ 0x2b, 0x85 }); // sub eax, [rbp - disp]
+                    try emitDisp32(&buffer, slotOffset(op.src));
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .mul_int_lit16 => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0x69, 0xc0 }); // imul eax, eax, imm32
+                    try buffer.emitU32(@bitCast(@as(i32, op.lit)));
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .mul_int_lit8 => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0x69, 0xc0 }); // imul eax, eax, imm32
+                    try buffer.emitU32(@bitCast(@as(i32, op.lit)));
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .and_int_lit16, .or_int_lit16, .xor_int_lit16 => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    const op_ext: u8 = switch (inst) {
+                        .and_int_lit16 => 4,
+                        .or_int_lit16 => 1,
+                        .xor_int_lit16 => 6,
+                        else => unreachable,
+                    };
+                    try buffer.emitBytes(&.{ 0x81, 0xc0 | (op_ext << 3) });
+                    try buffer.emitU32(@bitCast(@as(i32, op.lit)));
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .and_int_lit8, .or_int_lit8, .xor_int_lit8 => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    const op_ext: u8 = switch (inst) {
+                        .and_int_lit8 => 4,
+                        .or_int_lit8 => 1,
+                        .xor_int_lit8 => 6,
+                        else => unreachable,
+                    };
+                    try buffer.emitBytes(&.{ 0x81, 0xc0 | (op_ext << 3) });
+                    try buffer.emitU32(@bitCast(@as(i32, op.lit)));
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .shl_int_lit8, .shr_int_lit8, .ushr_int_lit8 => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    const opcode_ext: u8 = switch (inst) {
+                        .shl_int_lit8 => 4,
+                        .shr_int_lit8 => 7,
+                        .ushr_int_lit8 => 5,
+                        else => unreachable,
+                    };
+                    const count: u8 = @as(u8, @bitCast(op.lit)) & 31;
+                    if (count == 1) {
+                        try buffer.emitBytes(&.{ 0xd1, 0xe0 | (opcode_ext << 3) });
+                    } else {
+                        try buffer.emitBytes(&.{ 0xc1, 0xe0 | (opcode_ext << 3), count });
+                    }
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .div_int_lit16 => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    const imm: i32 = op.lit;
+                    if (imm == -1) {
+                        try buffer.emitBytes(&.{ 0x3d, 0x00, 0x00, 0x00, 0x80 });
+                        const label_skip = try buffer.newLabel();
+                        try buffer.emitBytes(&.{ 0x0f, 0x84 });
+                        _ = try buffer.reloc(label_skip, .rel32, 0);
+                        try buffer.emitU8(0x99);
+                        try buffer.emitBytes(&.{ 0xb9, 0xff, 0xff, 0xff, 0xff });
+                        try buffer.emitBytes(&.{ 0xf7, 0xf9 });
+                        try buffer.bindLabel(label_skip);
+                    } else {
+                        try buffer.emitU8(0x99);
+                        try buffer.emitU8(0xb9);
+                        try buffer.emitU32(@bitCast(imm));
+                        try buffer.emitBytes(&.{ 0xf7, 0xf9 });
+                    }
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .div_int_lit8 => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    const imm: i32 = op.lit;
+                    if (imm == -1) {
+                        try buffer.emitBytes(&.{ 0x3d, 0x00, 0x00, 0x00, 0x80 });
+                        const label_skip = try buffer.newLabel();
+                        try buffer.emitBytes(&.{ 0x0f, 0x84 });
+                        _ = try buffer.reloc(label_skip, .rel32, 0);
+                        try buffer.emitU8(0x99);
+                        try buffer.emitBytes(&.{ 0xb9, 0xff, 0xff, 0xff, 0xff });
+                        try buffer.emitBytes(&.{ 0xf7, 0xf9 });
+                        try buffer.bindLabel(label_skip);
+                    } else {
+                        try buffer.emitU8(0x99);
+                        try buffer.emitU8(0xb9);
+                        try buffer.emitU32(@bitCast(imm));
+                        try buffer.emitBytes(&.{ 0xf7, 0xf9 });
+                    }
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .rem_int_lit16 => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    const imm: i32 = op.lit;
+                    if (imm == -1) {
+                        try buffer.emitBytes(&.{ 0x3d, 0x00, 0x00, 0x00, 0x80 });
+                        const label_skip = try buffer.newLabel();
+                        const label_done = try buffer.newLabel();
+                        try buffer.emitBytes(&.{ 0x0f, 0x84 });
+                        _ = try buffer.reloc(label_skip, .rel32, 0);
+                        try buffer.emitU8(0x99);
+                        try buffer.emitBytes(&.{ 0xb9, 0xff, 0xff, 0xff, 0xff });
+                        try buffer.emitBytes(&.{ 0xf7, 0xf9 });
+                        try buffer.emitBytes(&.{ 0xe9 });
+                        _ = try buffer.reloc(label_done, .rel32, 0);
+                        try buffer.bindLabel(label_skip);
+                        try buffer.emitBytes(&.{ 0x33, 0xd2 });
+                        try buffer.bindLabel(label_done);
+                    } else {
+                        try buffer.emitU8(0x99);
+                        try buffer.emitU8(0xb9);
+                        try buffer.emitU32(@bitCast(imm));
+                        try buffer.emitBytes(&.{ 0xf7, 0xf9 });
+                    }
+                    try emitStoreRegSlot32(&buffer, 2, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .rem_int_lit8 => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    const imm: i32 = op.lit;
+                    if (imm == -1) {
+                        try buffer.emitBytes(&.{ 0x3d, 0x00, 0x00, 0x00, 0x80 });
+                        const label_skip = try buffer.newLabel();
+                        const label_done = try buffer.newLabel();
+                        try buffer.emitBytes(&.{ 0x0f, 0x84 });
+                        _ = try buffer.reloc(label_skip, .rel32, 0);
+                        try buffer.emitU8(0x99);
+                        try buffer.emitBytes(&.{ 0xb9, 0xff, 0xff, 0xff, 0xff });
+                        try buffer.emitBytes(&.{ 0xf7, 0xf9 });
+                        try buffer.emitBytes(&.{ 0xe9 });
+                        _ = try buffer.reloc(label_done, .rel32, 0);
+                        try buffer.bindLabel(label_skip);
+                        try buffer.emitBytes(&.{ 0x33, 0xd2 });
+                        try buffer.bindLabel(label_done);
+                    } else {
+                        try buffer.emitU8(0x99);
+                        try buffer.emitU8(0xb9);
+                        try buffer.emitU32(@bitCast(imm));
+                        try buffer.emitBytes(&.{ 0xf7, 0xf9 });
+                    }
+                    try emitStoreRegSlot32(&buffer, 2, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .neg_int, .not_int => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    if (inst == .neg_int) {
+                        try buffer.emitBytes(&.{ 0xf7, 0xd8 });
+                    } else {
+                        try buffer.emitBytes(&.{ 0xf7, 0xd0 });
+                    }
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .int_to_byte, .int_to_char, .int_to_short => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    switch (inst) {
+                        .int_to_byte => try buffer.emitBytes(&.{ 0x0f, 0xbe, 0xc0 }),
+                        .int_to_char => try buffer.emitBytes(&.{ 0x0f, 0xb7, 0xc0 }),
+                        .int_to_short => try buffer.emitBytes(&.{ 0x0f, 0xbf, 0xc0 }),
+                        else => unreachable,
+                    }
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .int_to_long => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0x48, 0x98 }); // cdqe
+                    try emitStoreRegSlot64(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .long_to_int => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .int_to_float => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0xf3, 0x0f, 0x2a, 0xc0 }); // cvtsi2ss xmm0, eax
+                    try emitStoreXmmSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .int_to_double => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0xf2, 0x0f, 0x2a, 0xc0 }); // cvtsi2sd xmm0, eax
+                    try emitStoreXmmSlot64(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .long_to_float => |op| {
+                    try emitLoadRegSlot64(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0xf3, 0x48, 0x0f, 0x2a, 0xc0 }); // cvtsi2ss xmm0, rax
+                    try emitStoreXmmSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .long_to_double => |op| {
+                    try emitLoadRegSlot64(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0xf2, 0x48, 0x0f, 0x2a, 0xc0 }); // cvtsi2sd xmm0, rax
+                    try emitStoreXmmSlot64(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .float_to_int => |op| {
+                    try emitLoadXmmSlot32(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0xf3, 0x0f, 0x2c, 0xc0 }); // cvttss2si eax, xmm0
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .double_to_int => |op| {
+                    try emitLoadXmmSlot64(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0xf2, 0x0f, 0x2c, 0xc0 }); // cvttsd2si eax, xmm0
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .float_to_long => |op| {
+                    try emitLoadXmmSlot32(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0xf3, 0x48, 0x0f, 0x2c, 0xc0 }); // cvttss2si rax, xmm0
+                    try emitStoreRegSlot64(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .double_to_long => |op| {
+                    try emitLoadXmmSlot64(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0xf2, 0x48, 0x0f, 0x2c, 0xc0 }); // cvttsd2si rax, xmm0
+                    try emitStoreRegSlot64(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .float_to_double => |op| {
+                    try emitLoadXmmSlot32(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0xf3, 0x0f, 0x5a, 0xc0 }); // cvtss2sd xmm0, xmm0
+                    try emitStoreXmmSlot64(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .double_to_float => |op| {
+                    try emitLoadXmmSlot64(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0xf2, 0x0f, 0x5a, 0xc0 }); // cvtsd2ss xmm0, xmm0
+                    try emitStoreXmmSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .neg_long, .not_long => |op| {
+                    try emitLoadRegSlot64(&buffer, 0, op.src);
+                    if (inst == .neg_long) {
+                        try buffer.emitBytes(&.{ 0x48, 0xf7, 0xd8 });
+                    } else {
+                        try buffer.emitBytes(&.{ 0x48, 0xf7, 0xd0 });
+                    }
+                    try emitStoreRegSlot64(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .add_long, .sub_long, .and_long, .or_long, .xor_long => |op| {
+                    try emitLoadRegSlot64(&buffer, 0, op.src1);
+                    const opcode: u8 = switch (inst) {
+                        .add_long => 0x03,
+                        .sub_long => 0x2b,
+                        .and_long => 0x23,
+                        .or_long => 0x0b,
+                        .xor_long => 0x33,
+                        else => unreachable,
+                    };
+                    try emitRex(&buffer, true, 0, 5);
+                    try buffer.emitU8(opcode);
+                    try emitModRm(&buffer, 2, 0, 5);
+                    try emitDisp32(&buffer, slotOffset(op.src2));
+                    try emitStoreRegSlot64(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .mul_long => |op| {
+                    try emitLoadRegSlot64(&buffer, 0, op.src1);
+                    try emitRex(&buffer, true, 0, 5);
+                    try buffer.emitBytes(&.{ 0x0f, 0xaf });
+                    try emitModRm(&buffer, 2, 0, 5);
+                    try emitDisp32(&buffer, slotOffset(op.src2));
+                    try emitStoreRegSlot64(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .div_long => |op| {
+                    try emitLoadRegSlot64(&buffer, 0, op.src1);
+                    try emitLoadRegSlot64(&buffer, 1, op.src2);
+                    try buffer.emitBytes(&.{ 0x48, 0x83, 0xf9, 0xff }); // cmp rcx, -1
+                    const label_check_min = try buffer.newLabel();
+                    const label_done = try buffer.newLabel();
+                    try buffer.emitBytes(&.{ 0x0f, 0x84 }); // je check_min
+                    _ = try buffer.reloc(label_check_min, .rel32, 0);
+
+                    const label_do_div = try buffer.newLabel();
+                    try buffer.bindLabel(label_do_div);
+                    try buffer.emitBytes(&.{ 0x48, 0x99 }); // cqo
+                    try buffer.emitBytes(&.{ 0x48, 0xf7, 0xf9 }); // idiv rcx
+                    try buffer.emitBytes(&.{ 0xe9 }); // jmp done
+                    _ = try buffer.reloc(label_done, .rel32, 0);
+
+                    try buffer.bindLabel(label_check_min);
+                    try buffer.emitBytes(&.{ 0x48, 0xba, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80 }); // mov rdx, 0x8000000000000000
+                    try buffer.emitBytes(&.{ 0x48, 0x3b, 0xc2 }); // cmp rax, rdx
+                    try buffer.emitBytes(&.{ 0x0f, 0x85 }); // jne do_div
+                    _ = try buffer.reloc(label_do_div, .rel32, 0);
+
+                    try buffer.bindLabel(label_done);
+                    try emitStoreRegSlot64(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .rem_long => |op| {
+                    try emitLoadRegSlot64(&buffer, 0, op.src1);
+                    try emitLoadRegSlot64(&buffer, 1, op.src2);
+                    try buffer.emitBytes(&.{ 0x48, 0x83, 0xf9, 0xff }); // cmp rcx, -1
+                    const label_check_min = try buffer.newLabel();
+                    const label_done = try buffer.newLabel();
+                    try buffer.emitBytes(&.{ 0x0f, 0x84 }); // je check_min
+                    _ = try buffer.reloc(label_check_min, .rel32, 0);
+
+                    const label_do_div = try buffer.newLabel();
+                    try buffer.bindLabel(label_do_div);
+                    try buffer.emitBytes(&.{ 0x48, 0x99 }); // cqo
+                    try buffer.emitBytes(&.{ 0x48, 0xf7, 0xf9 }); // idiv rcx -> remainder in RDX
+                    try buffer.emitBytes(&.{ 0xe9 }); // jmp done
+                    _ = try buffer.reloc(label_done, .rel32, 0);
+
+                    try buffer.bindLabel(label_check_min);
+                    try buffer.emitBytes(&.{ 0x48, 0xba, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80 }); // mov rdx, 0x8000000000000000
+                    try buffer.emitBytes(&.{ 0x48, 0x3b, 0xc2 }); // cmp rax, rdx
+                    try buffer.emitBytes(&.{ 0x0f, 0x85 }); // jne do_div
+                    _ = try buffer.reloc(label_do_div, .rel32, 0);
+                    try buffer.emitBytes(&.{ 0x33, 0xd2 }); // xor edx, edx
+
+                    try buffer.bindLabel(label_done);
+                    try emitStoreRegSlot64(&buffer, 2, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .shl_long, .shr_long, .ushr_long => |op| {
+                    try emitLoadRegSlot32(&buffer, 1, op.src2); // shift amount in cl
+                    try emitLoadRegSlot64(&buffer, 0, op.src1); // value in rax
+                    const opcode_ext: u8 = switch (inst) {
+                        .shl_long => 4,
+                        .shr_long => 7,
+                        .ushr_long => 5,
+                        else => unreachable,
+                    };
+                    try buffer.emitBytes(&.{ 0x48, 0xd3, 0xe0 | (opcode_ext << 3) });
+                    try emitStoreRegSlot64(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .cmp_long => |op| {
+                    try emitLoadRegSlot64(&buffer, 0, op.src1);
+                    try emitRex(&buffer, true, 0, 5);
+                    try buffer.emitU8(0x3b); // cmp rax, [rbp - disp]
+                    try emitModRm(&buffer, 2, 0, 5);
+                    try emitDisp32(&buffer, slotOffset(op.src2));
+                    const label_gt = try buffer.newLabel();
+                    const label_lt = try buffer.newLabel();
+                    const label_done = try buffer.newLabel();
+
+                    try buffer.emitBytes(&.{ 0x0f, 0x8f }); // jg target
+                    _ = try buffer.reloc(label_gt, .rel32, 0);
+                    try buffer.emitBytes(&.{ 0x0f, 0x8c }); // jl target
+                    _ = try buffer.reloc(label_lt, .rel32, 0);
+
+                    try buffer.emitBytes(&.{ 0x33, 0xc0 }); // xor eax, eax
+                    try buffer.emitBytes(&.{ 0xe9 }); // jmp done
+                    _ = try buffer.reloc(label_done, .rel32, 0);
+
+                    try buffer.bindLabel(label_gt);
+                    try buffer.emitBytes(&.{ 0xb8, 0x01, 0x00, 0x00, 0x00 });
+                    try buffer.emitBytes(&.{ 0xe9 });
+                    _ = try buffer.reloc(label_done, .rel32, 0);
+
+                    try buffer.bindLabel(label_lt);
+                    try buffer.emitBytes(&.{ 0xb8, 0xff, 0xff, 0xff, 0xff });
+
+                    try buffer.bindLabel(label_done);
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .add_float, .sub_float, .mul_float, .div_float => |op| {
+                    try emitLoadXmmSlot32(&buffer, 0, op.src1);
+                    try buffer.emitU8(0xf3);
+                    try emitRex(&buffer, false, 0, 5);
+                    const opcode_byte: u8 = switch (inst) {
+                        .add_float => 0x58,
+                        .sub_float => 0x5c,
+                        .mul_float => 0x59,
+                        .div_float => 0x5e,
+                        else => unreachable,
+                    };
+                    try buffer.emitBytes(&.{ 0x0f, opcode_byte });
+                    try emitModRm(&buffer, 2, 0, 5);
+                    try emitDisp32(&buffer, slotOffset(op.src2));
+                    try emitStoreXmmSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .add_double, .sub_double, .mul_double, .div_double => |op| {
+                    try emitLoadXmmSlot64(&buffer, 0, op.src1);
+                    try buffer.emitU8(0xf2);
+                    try emitRex(&buffer, false, 0, 5);
+                    const opcode_byte: u8 = switch (inst) {
+                        .add_double => 0x58,
+                        .sub_double => 0x5c,
+                        .mul_double => 0x59,
+                        .div_double => 0x5e,
+                        else => unreachable,
+                    };
+                    try buffer.emitBytes(&.{ 0x0f, opcode_byte });
+                    try emitModRm(&buffer, 2, 0, 5);
+                    try emitDisp32(&buffer, slotOffset(op.src2));
+                    try emitStoreXmmSlot64(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .neg_float => |op| {
+                    try emitLoadRegSlot32(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0x35, 0x00, 0x00, 0x00, 0x80 }); // xor eax, 0x80000000
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .neg_double => |op| {
+                    try emitLoadRegSlot64(&buffer, 0, op.src);
+                    try buffer.emitBytes(&.{ 0x48, 0xba, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80 }); // mov rdx, 0x8000000000000000
+                    try buffer.emitBytes(&.{ 0x48, 0x33, 0xc2 }); // xor rax, rdx
+                    try emitStoreRegSlot64(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .rem_float => |op| {
+                    try buffer.emitBytes(&.{ 0xd9 }); // fld dword ptr [rbp - disp2]
+                    try emitModRm(&buffer, 2, 0, 5);
+                    try emitDisp32(&buffer, slotOffset(op.src2));
+                    try buffer.emitBytes(&.{ 0xd9 }); // fld dword ptr [rbp - disp1]
+                    try emitModRm(&buffer, 2, 0, 5);
+                    try emitDisp32(&buffer, slotOffset(op.src1));
+                    const loop_label = try buffer.newLabel();
+                    try buffer.bindLabel(loop_label);
+                    try buffer.emitBytes(&.{ 0xd9, 0xf8 }); // fprem
+                    try buffer.emitBytes(&.{ 0xdf, 0xe0 }); // fstsw ax
+                    try buffer.emitBytes(&.{ 0xf6, 0xc4, 0x04 }); // test ah, 0x04
+                    try buffer.emitBytes(&.{ 0x75, 0xf7 }); // jnz loop_label (-9 bytes)
+                    try buffer.emitBytes(&.{ 0xd9 }); // fstp dword ptr [rbp - disp_dest]
+                    try emitModRm(&buffer, 2, 3, 5);
+                    try emitDisp32(&buffer, slotOffset(op.dest));
+                    try buffer.emitBytes(&.{ 0xdd, 0xd8 }); // fstp st(0)
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .rem_double => |op| {
+                    try buffer.emitBytes(&.{ 0xdd }); // fld qword ptr [rbp - disp2]
+                    try emitModRm(&buffer, 2, 0, 5);
+                    try emitDisp32(&buffer, slotOffset(op.src2));
+                    try buffer.emitBytes(&.{ 0xdd }); // fld qword ptr [rbp - disp1]
+                    try emitModRm(&buffer, 2, 0, 5);
+                    try emitDisp32(&buffer, slotOffset(op.src1));
+                    const loop_label = try buffer.newLabel();
+                    try buffer.bindLabel(loop_label);
+                    try buffer.emitBytes(&.{ 0xd9, 0xf8 }); // fprem
+                    try buffer.emitBytes(&.{ 0xdf, 0xe0 }); // fstsw ax
+                    try buffer.emitBytes(&.{ 0xf6, 0xc4, 0x04 }); // test ah, 0x04
+                    try buffer.emitBytes(&.{ 0x75, 0xf7 }); // jnz loop_label (-9 bytes)
+                    try buffer.emitBytes(&.{ 0xdd }); // fstp qword ptr [rbp - disp_dest]
+                    try emitModRm(&buffer, 2, 3, 5);
+                    try emitDisp32(&buffer, slotOffset(op.dest));
+                    try buffer.emitBytes(&.{ 0xdd, 0xd8 }); // fstp st(0)
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .cmpl_float, .cmpg_float => |op| {
+                    try emitLoadXmmSlot32(&buffer, 0, op.src1);
+                    try buffer.emitBytes(&.{ 0x0f, 0x2e }); // ucomiss xmm0, [rbp - disp]
+                    try emitModRm(&buffer, 2, 0, 5);
+                    try emitDisp32(&buffer, slotOffset(op.src2));
+
+                    const label_nan = try buffer.newLabel();
+                    const label_lt = try buffer.newLabel();
+                    const label_eq = try buffer.newLabel();
+                    const label_done = try buffer.newLabel();
+
+                    try buffer.emitBytes(&.{ 0x0f, 0x8a }); // jp nan (PF=1 on NaN)
+                    _ = try buffer.reloc(label_nan, .rel32, 0);
+                    try buffer.emitBytes(&.{ 0x0f, 0x82 }); // jb lt (CF=1 if <)
+                    _ = try buffer.reloc(label_lt, .rel32, 0);
+                    try buffer.emitBytes(&.{ 0x0f, 0x84 }); // je eq (ZF=1 if ==)
+                    _ = try buffer.reloc(label_eq, .rel32, 0);
+
+                    // Greater than
+                    try buffer.emitBytes(&.{ 0xb8, 0x01, 0x00, 0x00, 0x00 }); // mov eax, 1
+                    try buffer.emitBytes(&.{ 0xe9 }); // jmp done
+                    _ = try buffer.reloc(label_done, .rel32, 0);
+
+                    try buffer.bindLabel(label_nan);
+                    if (inst == .cmpg_float) {
+                        try buffer.emitBytes(&.{ 0xb8, 0x01, 0x00, 0x00, 0x00 });
+                    } else {
+                        try buffer.emitBytes(&.{ 0xb8, 0xff, 0xff, 0xff, 0xff });
+                    }
+                    try buffer.emitBytes(&.{ 0xe9 });
+                    _ = try buffer.reloc(label_done, .rel32, 0);
+
+                    try buffer.bindLabel(label_lt);
+                    try buffer.emitBytes(&.{ 0xb8, 0xff, 0xff, 0xff, 0xff });
+                    try buffer.emitBytes(&.{ 0xe9 });
+                    _ = try buffer.reloc(label_done, .rel32, 0);
+
+                    try buffer.bindLabel(label_eq);
+                    try buffer.emitBytes(&.{ 0x33, 0xc0 }); // xor eax, eax
+
+                    try buffer.bindLabel(label_done);
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
+                .cmpl_double, .cmpg_double => |op| {
+                    try emitLoadXmmSlot64(&buffer, 0, op.src1);
+                    try buffer.emitBytes(&.{ 0x66, 0x0f, 0x2e }); // ucomisd xmm0, [rbp - disp]
+                    try emitModRm(&buffer, 2, 0, 5);
+                    try emitDisp32(&buffer, slotOffset(op.src2));
+
+                    const label_nan = try buffer.newLabel();
+                    const label_lt = try buffer.newLabel();
+                    const label_eq = try buffer.newLabel();
+                    const label_done = try buffer.newLabel();
+
+                    try buffer.emitBytes(&.{ 0x0f, 0x8a }); // jp nan
+                    _ = try buffer.reloc(label_nan, .rel32, 0);
+                    try buffer.emitBytes(&.{ 0x0f, 0x82 }); // jb lt
+                    _ = try buffer.reloc(label_lt, .rel32, 0);
+                    try buffer.emitBytes(&.{ 0x0f, 0x84 }); // je eq
+                    _ = try buffer.reloc(label_eq, .rel32, 0);
+
+                    try buffer.emitBytes(&.{ 0xb8, 0x01, 0x00, 0x00, 0x00 });
+                    try buffer.emitBytes(&.{ 0xe9 });
+                    _ = try buffer.reloc(label_done, .rel32, 0);
+
+                    try buffer.bindLabel(label_nan);
+                    if (inst == .cmpg_double) {
+                        try buffer.emitBytes(&.{ 0xb8, 0x01, 0x00, 0x00, 0x00 });
+                    } else {
+                        try buffer.emitBytes(&.{ 0xb8, 0xff, 0xff, 0xff, 0xff });
+                    }
+                    try buffer.emitBytes(&.{ 0xe9 });
+                    _ = try buffer.reloc(label_done, .rel32, 0);
+
+                    try buffer.bindLabel(label_lt);
+                    try buffer.emitBytes(&.{ 0xb8, 0xff, 0xff, 0xff, 0xff });
+                    try buffer.emitBytes(&.{ 0xe9 });
+                    _ = try buffer.reloc(label_done, .rel32, 0);
+
+                    try buffer.bindLabel(label_eq);
+                    try buffer.emitBytes(&.{ 0x33, 0xc0 });
+
+                    try buffer.bindLabel(label_done);
+                    try emitStoreRegSlot32(&buffer, 0, op.dest);
+                    self.stats.arithmetic_emitted += 1;
+                },
                 .return_void => {
                     try emitEpilogue(&buffer);
                     self.stats.returns_emitted += 1;
                 },
                 .return_, .return_object => |op| {
                     try emitLoadRegSlot32(&buffer, 0, op.src);
+                    try emitLoadXmmSlot32(&buffer, 0, op.src);
                     try emitEpilogue(&buffer);
                     self.stats.returns_emitted += 1;
                 },
                 .return_wide => |op| {
                     try emitLoadRegSlot64(&buffer, 0, op.src);
+                    try emitLoadXmmSlot64(&buffer, 0, op.src);
                     try emitEpilogue(&buffer);
                     self.stats.returns_emitted += 1;
                 },
@@ -431,6 +1118,22 @@ pub const Compiler = struct {
                     try buffer.emitBytes(&.{ 0x0f, cond }); // jcc rel32
                     _ = try buffer.reloc(labels[@intCast(target_idx)], .rel32, 0);
                     self.stats.branches_emitted += 1;
+                },
+                .packed_switch, .sparse_switch => |op| {
+                    if (op.payload) |payload| {
+                        if (payload.keys.len > 0) {
+                            try emitLoadRegSlot32(&buffer, 0, op.src);
+                            for (payload.keys, payload.targets) |key, target_offset| {
+                                const target_idx: i64 = @as(i64, @intCast(i)) + target_offset;
+                                if (target_idx < 0 or target_idx >= insts.len) return error.InvalidInstructionTarget;
+                                try buffer.emitU8(0x3d); // cmp eax, imm32
+                                try buffer.emitU32(@bitCast(key));
+                                try buffer.emitBytes(&.{ 0x0f, 0x84 }); // je target
+                                _ = try buffer.reloc(labels[@intCast(target_idx)], .rel32, 0);
+                                self.stats.branches_emitted += 1;
+                            }
+                        }
+                    }
                 },
                 else => return error.UnsupportedInstruction,
             }
@@ -589,4 +1292,171 @@ test "direct JIT compiler executes with parameters and conditional branching" {
 
     try std.testing.expectEqual(@as(i32, 77), exec(0, 77));
     try std.testing.expectEqual(@as(i32, 42), exec(23, 19));
+}
+
+test "direct JIT compiler executes shift instructions" {
+    // v0 = v0 << v1
+    // v0 = v0 >> 1
+    // return v0
+    const insts = [_]Instruction{
+        .{ .shl_int = .{ .dest = 0, .src1 = 0, .src2 = 1 } },
+        .{ .shr_int_lit8 = .{ .dest = 0, .src = 0, .lit = 1 } },
+        .{ .return_ = .{ .src = 0 } },
+    };
+
+    var manager = try runtime_code_manager.Manager.init(std.testing.allocator, 4, 4, 4);
+    defer manager.deinit() catch {};
+
+    var compiler = Compiler.init();
+    _ = try compiler.compileAndPublish(std.testing.allocator, &manager, 1, &insts, .{
+        .register_count = 2,
+        .parameter_count = 2,
+    });
+
+    var reader = try manager.registerReader();
+    defer reader.deinit();
+    var lease = try manager.enter(&reader, 1);
+    defer lease.deinit();
+
+    const Fn = fn (i64, i64) callconv(.c) i32;
+    const exec = lease.typedEntry(Fn);
+
+    try std.testing.expectEqual(@as(i32, 10), exec(5, 2)); // (5 << 2) >> 1 = 20 >> 1 = 10
+}
+
+test "direct JIT compiler executes integer division and remainder with minInt overflow protection" {
+    // Parameters in v2 and v3 (param_base = 4 - 2 = 2)
+    // v0 = v2 / v3
+    // v1 = v2 % v3
+    // v0 = v0 + v1
+    // return v0
+    const insts = [_]Instruction{
+        .{ .div_int = .{ .dest = 0, .src1 = 2, .src2 = 3 } },
+        .{ .rem_int = .{ .dest = 1, .src1 = 2, .src2 = 3 } },
+        .{ .add_int = .{ .dest = 0, .src1 = 0, .src2 = 1 } },
+        .{ .return_ = .{ .src = 0 } },
+    };
+
+    var manager = try runtime_code_manager.Manager.init(std.testing.allocator, 4, 4, 4);
+    defer manager.deinit() catch {};
+
+    var compiler = Compiler.init();
+    _ = try compiler.compileAndPublish(std.testing.allocator, &manager, 1, &insts, .{
+        .register_count = 4,
+        .parameter_count = 2,
+    });
+
+    var reader = try manager.registerReader();
+    defer reader.deinit();
+    var lease = try manager.enter(&reader, 1);
+    defer lease.deinit();
+
+    const Fn = fn (i64, i64) callconv(.c) i32;
+    const exec = lease.typedEntry(Fn);
+
+    // Normal div and rem: 17 / 5 = 3, 17 % 5 = 2 -> sum = 5
+    try std.testing.expectEqual(@as(i32, 5), exec(17, 5));
+
+    // minInt / -1 protection: (-2147483648) / (-1) = -2147483648, rem = 0 -> sum = -2147483648
+    try std.testing.expectEqual(@as(i32, std.math.minInt(i32)), exec(std.math.minInt(i32), -1));
+}
+
+test "direct JIT compiler executes long arithmetic and comparison" {
+    // Parameters in v4 and v5 (param_base = 6 - 2 = 4)
+    // v0 = v4 + v5
+    // return_wide v0
+    const insts = [_]Instruction{
+        .{ .add_long = .{ .dest = 0, .src1 = 4, .src2 = 5 } },
+        .{ .return_wide = .{ .src = 0 } },
+    };
+
+    var manager = try runtime_code_manager.Manager.init(std.testing.allocator, 4, 4, 4);
+    defer manager.deinit() catch {};
+
+    var compiler = Compiler.init();
+    _ = try compiler.compileAndPublish(std.testing.allocator, &manager, 1, &insts, .{
+        .register_count = 6,
+        .parameter_count = 2,
+    });
+
+    var reader = try manager.registerReader();
+    defer reader.deinit();
+    var lease = try manager.enter(&reader, 1);
+    defer lease.deinit();
+
+    const Fn = fn (i64, i64) callconv(.c) i64;
+    const exec = lease.typedEntry(Fn);
+
+    try std.testing.expectEqual(@as(i64, 1234567890123 + 9876543210987), exec(1234567890123, 9876543210987));
+}
+
+test "direct JIT compiler executes float arithmetic" {
+    // Parameters in v1 and v2 (param_base = 3 - 2 = 1)
+    // v0 = v1 * v2
+    // v0 = v0 + v1
+    // return v0
+    const insts = [_]Instruction{
+        .{ .mul_float = .{ .dest = 0, .src1 = 1, .src2 = 2 } },
+        .{ .add_float = .{ .dest = 0, .src1 = 0, .src2 = 1 } },
+        .{ .return_ = .{ .src = 0 } },
+    };
+
+    var manager = try runtime_code_manager.Manager.init(std.testing.allocator, 4, 4, 4);
+    defer manager.deinit() catch {};
+
+    var compiler = Compiler.init();
+    _ = try compiler.compileAndPublish(std.testing.allocator, &manager, 1, &insts, .{
+        .register_count = 3,
+        .parameter_count = 2,
+    });
+
+    var reader = try manager.registerReader();
+    defer reader.deinit();
+    var lease = try manager.enter(&reader, 1);
+    defer lease.deinit();
+
+    const Fn = fn (i64, i64) callconv(.c) f32;
+    const exec = lease.typedEntry(Fn);
+
+    const f1: f32 = 3.5;
+    const f2: f32 = 4.0;
+    const arg1: i64 = @as(i64, @intCast(@as(u32, @bitCast(f1))));
+    const arg2: i64 = @as(i64, @intCast(@as(u32, @bitCast(f2))));
+
+    const expected: f32 = (3.5 * 4.0) + 3.5;
+    try std.testing.expectEqual(expected, exec(arg1, arg2));
+}
+
+test "direct JIT compiler executes double arithmetic" {
+    // Parameters in v4 and v5 (param_base = 6 - 2 = 4)
+    // v0 = v4 / v5
+    // return_wide v0
+    const insts = [_]Instruction{
+        .{ .div_double = .{ .dest = 0, .src1 = 4, .src2 = 5 } },
+        .{ .return_wide = .{ .src = 0 } },
+    };
+
+    var manager = try runtime_code_manager.Manager.init(std.testing.allocator, 4, 4, 4);
+    defer manager.deinit() catch {};
+
+    var compiler = Compiler.init();
+    _ = try compiler.compileAndPublish(std.testing.allocator, &manager, 1, &insts, .{
+        .register_count = 6,
+        .parameter_count = 2,
+    });
+
+    var reader = try manager.registerReader();
+    defer reader.deinit();
+    var lease = try manager.enter(&reader, 1);
+    defer lease.deinit();
+
+    const Fn = fn (i64, i64) callconv(.c) f64;
+    const exec = lease.typedEntry(Fn);
+
+    const d1: f64 = 84.0;
+    const d2: f64 = 2.5;
+    const arg1: i64 = @bitCast(d1);
+    const arg2: i64 = @bitCast(d2);
+
+    try std.testing.expectEqual(@as(f64, 33.6), exec(arg1, arg2));
 }

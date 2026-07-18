@@ -393,6 +393,23 @@ pub fn build(b: *std.Build) void {
     const run_runner_step = b.step("run-runner", "Run the DEX runner CLI (usage: zig build run-runner -- <user_dex> <class_name> <method_name> [args...])");
     run_runner_step.dependOn(&run_runner_cli.step);
 
+    const jit_runner_mod = b.createModule(.{
+        .root_source_file = b.path("dex_jit_runner.zig"),
+        .target = target,
+        .optimize = optimize_mode,
+    });
+    jit_runner_mod.addImport("parser", parser);
+    jit_runner_mod.addImport("jit_compiler", jit_compiler);
+    jit_runner_mod.addImport("runtime_code_manager", runtime_code_manager);
+    const jit_runner_cli = b.addExecutable(.{ .name = "dex_jit_runner", .root_module = jit_runner_mod });
+    b.installArtifact(jit_runner_cli);
+
+    const run_jit_runner_cli = b.addRunArtifact(jit_runner_cli);
+    run_jit_runner_cli.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_jit_runner_cli.addArgs(args);
+    const run_jit_runner_step = b.step("run-jit-runner", "Run the DEX JIT runner CLI (usage: zig build run-jit-runner -- <user_dex> <class_name> <method_name> [args...])");
+    run_jit_runner_step.dependOn(&run_jit_runner_cli.step);
+
     const test_step = b.step("test", "Run tests");
     addModuleTest(b, test_step, root_mod, test_filters);
     addModuleTest(b, test_step, exe.root_module, test_filters);
