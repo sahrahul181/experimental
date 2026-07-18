@@ -62,6 +62,9 @@ pub const Options = struct {
     /// coarse linear intervals appear disjoint. Deoptimization/OSR uses this
     /// to model simultaneous state capture at interior entry points.
     distinct_registers: []const machine.RegId = &.{},
+    /// Values consumed by instruction encodings with a private fixed-scratch
+    /// ABI may not spill. Ordinary live values remain eligible victims.
+    must_registers: []const machine.RegId = &.{},
 };
 
 pub const Stats = struct {
@@ -173,10 +176,15 @@ fn firstFree(active: []const Active, regs: []const PhysReg) ?PhysReg {
     return null;
 }
 
-fn farthestActive(active: []const Active, class: RegClass) ?usize {
+fn containsRegister(registers: []const machine.RegId, reg: machine.RegId) bool {
+    for (registers) |candidate| if (candidate == reg) return true;
+    return false;
+}
+
+fn farthestSpillable(active: []const Active, class: RegClass, must_registers: []const machine.RegId) ?usize {
     var best: ?usize = null;
     for (active, 0..) |item, i| {
-        if (item.phys.class() != class) continue;
+        if (item.phys.class() != class or containsRegister(must_registers, item.reg)) continue;
         if (best == null or item.end > active[best.?].end) best = i;
     }
     return best;
@@ -203,6 +211,10 @@ pub fn allocate(allocator: std.mem.Allocator, function: *const machine.Function,
 
     const intervals = try allocator.dupe(intervals_mod.Interval, live.intervals);
     errdefer allocator.free(intervals);
+    for (options.must_registers, 0..) |reg, index| {
+        if (reg >= function.reg_types.len) return error.BadAllocation;
+        for (options.must_registers[0..index]) |previous| if (previous == reg) return error.BadAllocation;
+    }
     if (options.distinct_registers.len != 0) {
         var group_start = intervals_mod.INVALID_POS;
         var group_end: intervals_mod.Position = 0;
@@ -243,6 +255,7 @@ pub fn allocate(allocator: std.mem.Allocator, function: *const machine.Function,
         const class = classForType(interval.ty);
         const regs = registersForClass(options, class);
         if (regs.len == 0) {
+            if (containsRegister(options.must_registers, interval.reg)) return error.BadAllocation;
             locations[interval.reg] = .{ .spill = nextSpillSlot(&stats) };
             continue;
         }
@@ -251,8 +264,8 @@ pub fn allocate(allocator: std.mem.Allocator, function: *const machine.Function,
             locations[interval.reg] = .{ .phys = phys };
             try active.append(allocator, .{ .reg = interval.reg, .end = interval.end, .phys = phys });
             stats.assigned_phys += 1;
-        } else if (farthestActive(active.items, class)) |spill_i| {
-            if (active.items[spill_i].end > interval.end) {
+        } else if (farthestSpillable(active.items, class, options.must_registers)) |spill_i| {
+            if (containsRegister(options.must_registers, interval.reg) or active.items[spill_i].end > interval.end) {
                 const victim = active.items[spill_i];
                 locations[victim.reg] = .{ .spill = nextSpillSlot(&stats) };
                 locations[interval.reg] = .{ .phys = victim.phys };
@@ -262,6 +275,7 @@ pub fn allocate(allocator: std.mem.Allocator, function: *const machine.Function,
                 locations[interval.reg] = .{ .spill = nextSpillSlot(&stats) };
             }
         } else {
+            if (containsRegister(options.must_registers, interval.reg)) return error.BadAllocation;
             locations[interval.reg] = .{ .spill = nextSpillSlot(&stats) };
         }
         stats.max_active = @max(stats.max_active, @as(u32, @intCast(active.items.len)));
@@ -317,6 +331,34 @@ test "linear_scan spills under constrained register pressure" {
     defer allocation.deinit();
     try allocation.verify();
     try std.testing.expect(allocation.stats.spills > 0);
+}
+
+test "linear_scan preserves must-register values by spilling eligible victims" {
+    const optimizer = @import("optimizer");
+    const Instruction = @import("instructions").Instruction;
+    const insts = [_]Instruction{
+        .{ .add_int = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
+        .{ .add_int = .{ .dest = 3, .src1 = 2, .src2 = 0 } },
+        .{ .return_ = .{ .src = 3 } },
+    };
+    var optimized = try optimizer.optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+
+    const one_gp = [_]PhysReg{.r10};
+    const required = [_]machine.RegId{0};
+    var allocation = try allocate(std.testing.allocator, &optimized.machine, .{
+        .gp_registers = &one_gp,
+        .must_registers = &required,
+    });
+    defer allocation.deinit();
+    try std.testing.expectEqual(Location{ .phys = .r10 }, allocation.locationOf(0).?);
+    try std.testing.expect(allocation.stats.spills > 0);
+
+    const impossible = [_]machine.RegId{ 0, 1 };
+    try std.testing.expectError(error.BadAllocation, allocate(std.testing.allocator, &optimized.machine, .{
+        .gp_registers = &one_gp,
+        .must_registers = &impossible,
+    }));
 }
 
 test "linear_scan print helper emits stable summary" {

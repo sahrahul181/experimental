@@ -18,6 +18,8 @@ pub const SpillSlot = struct {
     slot: u32,
     ty: typedir.Type,
     size: u8,
+    /// Byte offset from the managed frame's captured rsp.
+    byte_offset: u32,
 };
 
 pub const Stats = struct {
@@ -46,12 +48,23 @@ pub const Plan = struct {
         var seen = try self.allocator.alloc(bool, self.location_count);
         defer self.allocator.free(seen);
         @memset(seen, false);
+        const seen_slots = try self.allocator.alloc(bool, self.slots.len);
+        defer self.allocator.free(seen_slots);
+        @memset(seen_slots, false);
 
-        for (self.slots) |slot| {
+        var cursor: u32 = 0;
+        for (self.slots, 0..) |slot, index| {
             if (slot.reg >= self.location_count) return error.BadSpillPlan;
             if (seen[slot.reg]) return error.BadSpillPlan;
             seen[slot.reg] = true;
+            if (slot.slot >= seen_slots.len or seen_slots[slot.slot] or slot.slot != index) return error.BadSpillPlan;
+            seen_slots[slot.slot] = true;
+            if (slot.size != 4 and slot.size != 8) return error.BadSpillPlan;
+            cursor = alignForward(cursor, slot.size);
+            if (slot.byte_offset != cursor) return error.BadSpillPlan;
+            cursor = std.math.add(u32, cursor, slot.size) catch return error.BadSpillPlan;
         }
+        if (self.stats.stack_bytes != alignForward(cursor, 16)) return error.BadSpillPlan;
     }
 
     pub fn print(self: *const Plan, writer: anytype) !void {
@@ -67,14 +80,16 @@ pub const Plan = struct {
             },
         );
         for (self.slots) |slot| {
-            try writer.print("  spill[{d}] r{d}:{s} size={d}\n", .{ slot.slot, slot.reg, @tagName(slot.ty), slot.size });
+            try writer.print("  spill[{d}] r{d}:{s} size={d} offset={d}\n", .{ slot.slot, slot.reg, @tagName(slot.ty), slot.size, slot.byte_offset });
         }
     }
 };
 
-fn typeSize(ty: typedir.Type) u8 {
+fn typeSize(ty: typedir.Type, gc_root: bool) u8 {
+    // Canonical Handles are the runtime's 64-bit GC identity.
+    if (gc_root) return @sizeOf(u64);
     return switch (ty) {
-        .long, .double => 8,
+        .long, .double, .object => 8,
         else => 4,
     };
 }
@@ -87,10 +102,13 @@ fn isSpilled(allocation: *const linear_scan.Allocation, reg: machine.RegId) bool
     };
 }
 
-fn stackBytes(slots: []const SpillSlot) u32 {
-    var bytes: u32 = 0;
-    for (slots) |slot| bytes += slot.size;
-    return (bytes + 15) & ~@as(u32, 15);
+fn alignForward(value: u32, alignment: u8) u32 {
+    const mask = @as(u32, alignment) - 1;
+    return (value + mask) & ~mask;
+}
+
+fn slotLess(_: void, a: SpillSlot, b: SpillSlot) bool {
+    return a.slot < b.slot;
 }
 
 pub fn build(allocator: std.mem.Allocator, allocation: *const linear_scan.Allocation) Error!Plan {
@@ -104,7 +122,8 @@ pub fn build(allocator: std.mem.Allocator, allocation: *const linear_scan.Alloca
                 .reg = interval.reg,
                 .slot = slot,
                 .ty = interval.ty,
-                .size = typeSize(interval.ty),
+                .size = typeSize(interval.ty, allocation.source.isGcRoot(interval.reg)),
+                .byte_offset = 0,
             }),
             else => {},
         }
@@ -134,9 +153,16 @@ pub fn build(allocator: std.mem.Allocator, allocation: *const linear_scan.Alloca
         }
     }
 
+    std.mem.sort(SpillSlot, slots_list.items, {}, slotLess);
+    var stack_cursor: u32 = 0;
+    for (slots_list.items) |*slot| {
+        stack_cursor = alignForward(stack_cursor, slot.size);
+        slot.byte_offset = stack_cursor;
+        stack_cursor = std.math.add(u32, stack_cursor, slot.size) catch return error.BadSpillPlan;
+    }
     const slots = try slots_list.toOwnedSlice(allocator);
     stats.slots = @intCast(slots.len);
-    stats.stack_bytes = stackBytes(slots);
+    stats.stack_bytes = alignForward(stack_cursor, 16);
 
     var plan = Plan{
         .allocator = allocator,
@@ -145,6 +171,7 @@ pub fn build(allocator: std.mem.Allocator, allocation: *const linear_scan.Alloca
         .slots = slots,
         .stats = stats,
     };
+    errdefer plan.deinit();
     try plan.verify();
     return plan;
 }
@@ -167,6 +194,11 @@ test "spill_rewrite builds empty plan for register-only allocation" {
     try std.testing.expectEqual(@as(u32, 0), plan.stats.slots);
 }
 
+fn allocationFailureProbe(allocator: std.mem.Allocator, allocation: *const linear_scan.Allocation) !void {
+    var plan = try build(allocator, allocation);
+    defer plan.deinit();
+}
+
 test "spill_rewrite counts reloads and stores for constrained allocation" {
     const optimizer = @import("optimizer");
     const Instruction = @import("instructions").Instruction;
@@ -186,4 +218,13 @@ test "spill_rewrite counts reloads and stores for constrained allocation" {
     defer plan.deinit();
     try std.testing.expect(plan.stats.slots > 0);
     try std.testing.expect(plan.stats.reloads + plan.stats.stores > 0);
+    try std.testing.expect(std.mem.isAligned(plan.stats.stack_bytes, 16));
+    var previous_end: u32 = 0;
+    for (plan.slots, 0..) |slot, index| {
+        try std.testing.expectEqual(@as(u32, @intCast(index)), slot.slot);
+        try std.testing.expect(std.mem.isAligned(slot.byte_offset, slot.size));
+        try std.testing.expect(slot.byte_offset >= previous_end);
+        previous_end = slot.byte_offset + slot.size;
+    }
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationFailureProbe, .{&allocation});
 }

@@ -35,6 +35,7 @@ pub const VerifyError = error{
 
 pub const RegId = u32;
 pub const INVALID_REG: RegId = std.math.maxInt(RegId);
+pub const FloatOperation = lowering.FloatOperation;
 
 pub const Opcode = enum(u8) {
     mov,
@@ -111,6 +112,7 @@ pub const Inst = struct {
     false_target: ?cfg.BlockId = null,
     condition: ?Condition = null,
     imm: i64 = 0,
+    float_op: ?FloatOperation = null,
     field_idx: ?u32 = null,
     address: ?RegId = null,
     state_handle: ?RegId = null,
@@ -263,6 +265,7 @@ pub const Function = struct {
                     .call_direct, .call_static, .call_virtual, .call_quick => if (inst.address != null) try self.verifyAddress(inst),
                     else => {},
                 }
+                if ((inst.opcode == .f32_op or inst.opcode == .f64_op) != (inst.float_op != null)) return error.BadInstruction;
                 for (inst.uses) |use| switch (self.runtime_values[use]) {
                     .dalvik => {},
                     .derived_ptr => return error.BadInstruction,
@@ -579,6 +582,41 @@ fn updateStats(inst: Inst, stats: *Stats) void {
     if (inst.flags.cse) stats.cse += 1;
 }
 
+fn setScalarXmmType(reg_types: []typedir.Type, reg: RegId, ty: typedir.Type) Error!void {
+    if (reg >= reg_types.len) return error.InvalidLowering;
+    const current = reg_types[reg];
+    if (current == ty) return;
+    if (current == .unknown or
+        (current == .int and ty == .float) or
+        (current == .long and ty == .double))
+    {
+        reg_types[reg] = ty;
+        return;
+    }
+    return error.InvalidLowering;
+}
+
+/// Dalvik constants and incoming parameters are physically untyped bit
+/// patterns. Once scalar arithmetic consumes them, specialize their machine
+/// register class before interval construction so GP and XMM values can never
+/// share an incorrectly classified allocation.
+fn refineScalarXmmTypes(reg_types: []typedir.Type, source: *const lowering.Function) Error!void {
+    for (source.blocks) |block| for (block.insts) |inst| {
+        const operation = inst.float_op orelse continue;
+        switch (operation) {
+            .add, .sub, .mul, .div, .rem, .neg => {},
+            else => continue,
+        }
+        const ty: typedir.Type = switch (inst.kind) {
+            .f32_op => .float,
+            .f64_op => .double,
+            else => return error.InvalidLowering,
+        };
+        for (inst.defs) |reg| try setScalarXmmType(reg_types, reg, ty);
+        for (inst.uses) |reg| try setScalarXmmType(reg_types, reg, ty);
+    };
+}
+
 pub fn build(allocator: std.mem.Allocator, source: *const lowering.Function) Error!Function {
     source.verify() catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -587,6 +625,7 @@ pub fn build(allocator: std.mem.Allocator, source: *const lowering.Function) Err
 
     const reg_types = try allocator.dupe(typedir.Type, source.value_types);
     errdefer allocator.free(reg_types);
+    try refineScalarXmmTypes(reg_types, source);
     const runtime_values = try allocator.dupe(lowering.RuntimeValueClass, source.runtime_values);
     errdefer allocator.free(runtime_values);
 
@@ -690,6 +729,7 @@ pub fn build(allocator: std.mem.Allocator, source: *const lowering.Function) Err
                 .false_target = lowered.false_target,
                 .condition = if (opcode == .branch) conditionForLowered(source, lowered) else null,
                 .imm = lowered.imm,
+                .float_op = lowered.float_op,
                 .field_idx = lowered.field_idx,
                 .address = lowered.address,
                 .state_handle = lowered.state_handle,

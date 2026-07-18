@@ -111,6 +111,10 @@ pub const NativeThreadState = extern struct {
     deopt_request: usize = 0,
     last_code_dispatch: CodeDispatchStatus = .ok,
     captured_gp: [16]u64 = @splat(0),
+    captured_xmm: [8][16]u8 = @splat(@splat(0)),
+    /// Managed rsp before the private helper call. Spill offsets are relative
+    /// to this base and are bounded by immutable deoptimization metadata.
+    captured_stack_base: usize = 0,
 };
 
 pub const Stats = struct {
@@ -433,6 +437,7 @@ pub fn codeLeaseEnterBridge(
         };
         request.table.visitReferenceSlots(request.point_id, .{
             .native_registers = &state.captured_gp,
+            .xmm_registers = request.xmm_registers,
             .stack_base = request.stack_base,
             .stack_min_offset = request.stack_min_offset,
             .stack_max_offset = request.stack_max_offset,
@@ -515,7 +520,13 @@ pub fn deoptResumeBridge(
         return deoptFailure(state, null);
     }
     const request: *runtime_deopt.Request = @ptrFromInt(state.deopt_request);
-    const result = resumeDeoptPoint(state, request, request.table, request.point_id);
+    const result = resumeDeoptPoint(state, request, request.table, request.point_id, .{
+        .native_registers = &state.captured_gp,
+        .xmm_registers = request.xmm_registers,
+        .stack_base = request.stack_base,
+        .stack_min_offset = request.stack_min_offset,
+        .stack_max_offset = request.stack_max_offset,
+    });
     state.deopt_request = 0;
     return result;
 }
@@ -528,11 +539,18 @@ fn deoptFailure(state: *NativeThreadState, frame: ?*runtime_deopt.Frame) usize {
     return 0;
 }
 
+fn deoptFailureDestination(state: *NativeThreadState, destination: runtime_deopt.Destination) usize {
+    destination.frame.active = false;
+    for (destination.inline_frames) |*frame| frame.active = false;
+    return deoptFailure(state, null);
+}
+
 fn resumeDeoptPoint(
     state: *NativeThreadState,
     request: *runtime_deopt.Request,
     table: *const runtime_deopt.Table,
     point_id: u32,
+    capture: runtime_deopt.Capture,
 ) usize {
     const exception = if (state.pending_exception.kind == .none)
         request.exception
@@ -545,23 +563,22 @@ fn resumeDeoptPoint(
         };
     const frame = table.reconstruct(
         point_id,
-        .{
-            .native_registers = &state.captured_gp,
-            .stack_base = request.stack_base,
-            .stack_min_offset = request.stack_min_offset,
-            .stack_max_offset = request.stack_max_offset,
-        },
+        capture,
         request.destination,
         request.reason,
         exception,
     ) catch return deoptFailure(state, null);
     state.pending_exception = .{};
-    var resumed_roots = state.context.beginRootScope() catch return deoptFailure(state, frame);
+    var resumed_roots = state.context.beginRootScope() catch return deoptFailureDestination(state, request.destination);
     defer resumed_roots.deinit();
-    for (frame.execution.register_is_ref, 0..) |is_reference, register| {
-        if (!is_reference) continue;
-        resumed_roots.add(@ptrCast(&frame.execution.reference_registers[register])) catch return deoptFailure(state, frame);
-    }
+    const RootVisitor = struct {
+        fn add(scope: *thread_registry.RootScope, slot: *const Handle) thread_registry.Error!void {
+            try scope.add(slot);
+        }
+    };
+    table.visitFrameReferenceSlots(point_id, frame, &resumed_roots, RootVisitor.add) catch {
+        return deoptFailureDestination(state, request.destination);
+    };
     state.last_code_dispatch = .deoptimized;
     _ = state.runtime.counters.deoptimizations.fetchAdd(1, .monotonic);
     return request.resume_fn(request.resume_context, frame);
@@ -584,7 +601,15 @@ pub fn midFunctionDeoptBridge(state: *NativeThreadState, site_id: u32) callconv(
     if (stack_record.deopt_id == runtime_stack_map.no_deopt) return deoptFailure(state, null);
     const request: *runtime_deopt.Request = @ptrFromInt(state.deopt_request);
     if (request.table != deopt_table) return deoptFailure(state, null);
-    return resumeDeoptPoint(state, request, deopt_table, stack_record.deopt_id);
+    if (state.captured_stack_base == 0) return deoptFailure(state, null);
+    const stack_bounds = deopt_table.stackBounds(stack_record.deopt_id) catch return deoptFailure(state, null);
+    return resumeDeoptPoint(state, request, deopt_table, stack_record.deopt_id, .{
+        .native_registers = &state.captured_gp,
+        .xmm_registers = &state.captured_xmm,
+        .stack_base = @ptrFromInt(state.captured_stack_base),
+        .stack_min_offset = stack_bounds.min_offset,
+        .stack_max_offset = stack_bounds.max_offset,
+    });
 }
 
 /// Normal-return edge for both compiled and fallback targets. Returning the
@@ -690,8 +715,28 @@ fn addMappedRoots(
     const record = try table.find(resolve_id);
     var found_canonical = false;
     for (table.rootsFor(record)) |location| {
-        if (location.kind != .native_register or location.payload >= state.captured_gp.len) return error.InvalidLocation;
-        const slot = &state.captured_gp[location.payload];
+        const slot: *const u64 = switch (location.kind) {
+            .native_register => blk: {
+                if (location.payload >= state.captured_gp.len) return error.InvalidLocation;
+                break :blk &state.captured_gp[location.payload];
+            },
+            .stack_slot => blk: {
+                if (state.captured_stack_base == 0) return error.InvalidLocation;
+                const offset = location.stackOffset();
+                const address = if (offset >= 0) add: {
+                    const magnitude: usize = @intCast(offset);
+                    if (magnitude > std.math.maxInt(usize) - state.captured_stack_base) return error.InvalidLocation;
+                    break :add state.captured_stack_base + magnitude;
+                } else sub: {
+                    const magnitude: usize = @intCast(-@as(i64, offset));
+                    if (magnitude > state.captured_stack_base) return error.InvalidLocation;
+                    break :sub state.captured_stack_base - magnitude;
+                };
+                if (!std.mem.isAligned(address, @alignOf(Handle))) return error.InvalidLocation;
+                break :blk @ptrFromInt(address);
+            },
+            else => return error.InvalidLocation,
+        };
         try roots.add(@ptrCast(slot));
         if (slot.* == handle_bits) found_canonical = true;
     }
@@ -1024,11 +1069,28 @@ test "polling bridge fails closed until its precise root map matches the receive
     try std.testing.expectEqual(@intFromPtr(object), slowResolveBridge(&entry.native_state, handle_bits, 0x55_0000_0007));
     try std.testing.expectEqual(SlowResolveStatus.ok, entry.native_state.last_error);
     try std.testing.expectEqual(@as(usize, 0), context.rootCount());
-    try std.testing.expectEqual(@as(u64, 1), runtime.stats().slow_resolves);
+
+    var spilled_handle = handle;
+    const stack_locations = [_]runtime_stack_map.RootLocation{runtime_stack_map.RootLocation.stackSlot(0)};
+    const stack_specs = [_]runtime_stack_map.MapSpec{.{ .pc_offset = 8, .roots = &stack_locations }};
+    var stack_maps = try runtime_stack_map.Table.init(std.testing.allocator, &stack_specs, .{
+        .native_register_count = 16,
+        .interpreter_register_count = 0,
+        .max_frame_depth = 0,
+        .max_shadow_roots = 0,
+    });
+    defer stack_maps.deinit();
+    try entry.installRootMaps(&stack_maps);
+    entry.native_state.captured_stack_base = @intFromPtr(&spilled_handle);
+    try std.testing.expectEqual(@intFromPtr(object), slowResolveBridge(&entry.native_state, handle_bits, 0x55_0000_0008));
+    try std.testing.expectEqual(SlowResolveStatus.ok, entry.native_state.last_error);
+    try std.testing.expectEqual(@as(usize, 0), context.rootCount());
+
+    try std.testing.expectEqual(@as(u64, 2), runtime.stats().slow_resolves);
     try std.testing.expectEqual(@as(u64, 2), runtime.stats().resolve_failures);
 }
 
-test "slow resolver publishes temporary root during concurrent handshake" {
+test "slow resolver publishes a spilled root during concurrent handshake" {
     var storage: [128]u8 align(runtime_value.object_alignment) = undefined;
     const regions = [_]runtime_value.Region{try runtime_value.Region.fromSlice(&storage)};
     var handles = try HandleTable.init(std.testing.allocator, 2, &regions);
@@ -1045,19 +1107,35 @@ test "slow resolver publishes temporary root during concurrent handshake" {
     var runtime = try Runtime.init(std.testing.allocator, &handles, &registry);
     defer runtime.deinit() catch unreachable;
 
+    const locations = [_]runtime_stack_map.RootLocation{runtime_stack_map.RootLocation.stackSlot(0)};
+    var maps = try runtime_stack_map.Table.init(std.testing.allocator, &.{.{
+        .pc_offset = 1,
+        .roots = &locations,
+    }}, .{
+        .native_register_count = 16,
+        .interpreter_register_count = 0,
+        .max_frame_depth = 0,
+        .max_shadow_roots = 0,
+    });
+    defer maps.deinit();
+
     const Worker = struct {
         runtime: *Runtime,
         context: *ThreadContext,
         handle: Handle,
+        maps: *const runtime_stack_map.Table,
         entered: *std.atomic.Value(bool),
         completed: *std.atomic.Value(bool),
 
         fn run(self: *@This()) void {
             var entry = self.runtime.enter(self.context) catch return;
             defer entry.deinit();
+            entry.installRootMaps(self.maps) catch return;
+            var spilled_handle = self.handle;
+            entry.native_state.captured_stack_base = @intFromPtr(&spilled_handle);
             self.entered.store(true, .release);
             while (self.runtime.registry.requestEpoch() == entry.acknowledged_epoch) std.atomic.spinLoopHint();
-            _ = entry.resolveSlow(self.handle, 0x20_0000_0001) catch return;
+            if (slowResolveBridge(&entry.native_state, @bitCast(self.handle), 0x20_0000_0001) == 0) return;
             self.completed.store(true, .release);
         }
     };
@@ -1068,6 +1146,7 @@ test "slow resolver publishes temporary root during concurrent handshake" {
         .runtime = &runtime,
         .context = &context,
         .handle = handle,
+        .maps = &maps,
         .entered = &entered,
         .completed = &completed,
     };

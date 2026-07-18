@@ -105,6 +105,30 @@ pub const Kind = enum(u8) {
     unsupported,
 };
 
+/// Preserves the bytecode operation after type-directed lowering selects the
+/// scalar SSE lane width. Unsupported operations remain explicit so a backend
+/// can fail closed instead of silently choosing the wrong floating semantics.
+pub const FloatOperation = enum(u8) {
+    add,
+    sub,
+    mul,
+    div,
+    rem,
+    neg,
+    compare_l,
+    compare_g,
+    int_to_float,
+    int_to_double,
+    long_to_float,
+    long_to_double,
+    float_to_int,
+    float_to_long,
+    float_to_double,
+    double_to_int,
+    double_to_long,
+    double_to_float,
+};
+
 pub const Flags = packed struct {
     dead: bool = false,
     null_check_elided: bool = false,
@@ -121,6 +145,7 @@ pub const Inst = struct {
     target: ?cfg.BlockId = null,
     false_target: ?cfg.BlockId = null,
     imm: i64 = 0,
+    float_op: ?FloatOperation = null,
     field_idx: ?u32 = null,
     address: ?RuntimeValueId = null,
     state_handle: ?RuntimeValueId = null,
@@ -253,6 +278,7 @@ pub const Function = struct {
                     .call_direct, .call_static, .call_virtual, .call_quick => if (inst.address != null) try self.verifyAddress(inst),
                     else => {},
                 }
+                if ((inst.kind == .f32_op or inst.kind == .f64_op) != (inst.float_op != null)) return error.BadInstruction;
                 for (inst.uses) |use| switch (self.runtime_values[use]) {
                     .dalvik => {},
                     .derived_ptr => return error.BadInstruction,
@@ -779,6 +805,30 @@ fn lowerArithmetic(inst: Instruction, choice: typed_ir.LoweringChoice) Kind {
     };
 }
 
+fn floatOperation(inst: Instruction) ?FloatOperation {
+    return switch (inst) {
+        .add_float, .add_double => .add,
+        .sub_float, .sub_double => .sub,
+        .mul_float, .mul_double => .mul,
+        .div_float, .div_double => .div,
+        .rem_float, .rem_double => .rem,
+        .neg_float, .neg_double => .neg,
+        .cmpl_float, .cmpl_double => .compare_l,
+        .cmpg_float, .cmpg_double => .compare_g,
+        .int_to_float => .int_to_float,
+        .int_to_double => .int_to_double,
+        .long_to_float => .long_to_float,
+        .long_to_double => .long_to_double,
+        .float_to_int => .float_to_int,
+        .float_to_long => .float_to_long,
+        .float_to_double => .float_to_double,
+        .double_to_int => .double_to_int,
+        .double_to_long => .double_to_long,
+        .double_to_float => .double_to_float,
+        else => null,
+    };
+}
+
 fn arithmeticImmediate(inst: Instruction) i64 {
     return switch (inst) {
         .add_int_lit8,
@@ -1065,6 +1115,7 @@ fn lowerOperation(
                 .kind = kind,
                 .pc = op.pc,
                 .imm = arithmeticImmediate(op.inst),
+                .float_op = if (kind == .f32_op or kind == .f64_op) floatOperation(op.inst) else null,
                 .field_idx = fieldIndex(op.inst),
                 .flags = flags,
             }, op.defs, op.uses), stats);

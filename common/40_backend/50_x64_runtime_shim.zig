@@ -170,6 +170,27 @@ fn emitCapturedGpRegisters(buffer: *code_buffer.Buffer) Error!void {
     }
 }
 
+fn emitCapturedXmmRegisters(buffer: *code_buffer.Buffer) Error!void {
+    const base: u32 = @offsetOf(runtime_jit.NativeThreadState, "captured_xmm");
+    for (0..8) |index| {
+        const xmm: u4 = @intCast(index);
+        // movdqu [r15 + disp32], xmmN. Keep the legacy prefix before REX.
+        try buffer.emitU8(0xf3);
+        try emitRex(buffer, false, xmm, r15);
+        try buffer.emitBytes(&.{ 0x0f, 0x7f });
+        try emitModRm(buffer, 2, xmm, r15);
+        try buffer.emitU32(base + @as(u32, @intCast(index)) * 16);
+    }
+}
+
+fn emitCapturedStackBase(buffer: *code_buffer.Buffer, frame_bytes: u32) Error!void {
+    // Seven GP pushes and the helper CALL separate the adjusted helper rsp
+    // from the managed frame's rsp by 64 bytes.
+    try buffer.emitBytes(&.{ 0x48, 0x8d, 0x84, 0x24 }); // lea rax, [rsp + disp32]
+    try buffer.emitU32(frame_bytes + 64);
+    try emitMovMemReg(buffer, r15, @offsetOf(runtime_jit.NativeThreadState, "captured_stack_base"), rax);
+}
+
 const xmm_save_bytes: u32 = 8 * 16;
 
 fn emitXmmStack(buffer: *code_buffer.Buffer, xmm: u3, displacement: u32, store: bool) Error!void {
@@ -198,6 +219,7 @@ fn emitSlowHelper(buffer: *code_buffer.Buffer, bridge_address: usize) Error!void
     const frame_bytes = home_bytes + xmm_save_bytes + alignment_bytes;
     try emitAdjustStack(buffer, true, frame_bytes);
     try emitSavedXmmRegisters(buffer, home_bytes);
+    try emitCapturedStackBase(buffer, frame_bytes);
 
     if (builtin.os.tag == .windows) {
         try emitMovRegReg(buffer, rcx, r15);
@@ -227,12 +249,14 @@ fn emitSlowHelper(buffer: *code_buffer.Buffer, bridge_address: usize) Error!void
 
 fn emitDeoptHelper(buffer: *code_buffer.Buffer, bridge_address: usize) Error!void {
     try emitCapturedGpRegisters(buffer);
+    try emitCapturedXmmRegisters(buffer);
     try emitSavedManagedRegisters(buffer);
     const home_bytes: u32 = if (builtin.os.tag == .windows) 32 else 0;
     const alignment_bytes: u32 = 8;
     const frame_bytes = home_bytes + xmm_save_bytes + alignment_bytes;
     try emitAdjustStack(buffer, true, frame_bytes);
     try emitSavedXmmRegisters(buffer, home_bytes);
+    try emitCapturedStackBase(buffer, frame_bytes);
 
     if (builtin.os.tag == .windows) {
         try emitMovRegReg(buffer, rcx, r15);
@@ -2398,12 +2422,23 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
         .{ .vreg = 0, .kind = .reference, .source = .{ .machine_register = handle_reg orelse return error.TestUnexpectedResult } },
         .{ .vreg = 1, .kind = .scalar32, .source = .{ .constant = 0 } },
     };
+    const caller_values = [_]x64_encoder.DeoptValueSpec{
+        .{ .vreg = 0, .kind = .reference, .source = .{ .machine_register = handle_reg orelse return error.TestUnexpectedResult } },
+        .{ .vreg = 1, .kind = .scalar32, .source = .{ .constant = 91 } },
+    };
+    const inline_frames = [_]x64_encoder.DeoptInlineFrameSpec{.{
+        .method_id = 700,
+        .dex_pc = 1,
+        .register_count = 2,
+        .values = &caller_values,
+    }};
     const points = [_]x64_encoder.DeoptPointSpec{.{
         .id = 5,
         .safepoint_id = site_id orelse return error.TestUnexpectedResult,
         .method_id = 0,
         .dex_pc = 0,
         .values = &point_values,
+        .inline_frames = &inline_frames,
     }};
     var dependency_epoch = std.atomic.Value(u64).init(1);
     const layouts = [_]x64_encoder.FieldLayout{.{ .offset = 8, .storage = .i32 }};
@@ -2422,6 +2457,8 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
     defer native.deinit();
     try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_guards);
     try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_traps);
+    try std.testing.expectEqual(@as(u32, 2), native.stats.deopt_frames);
+    try std.testing.expectEqual(@as(u32, 4), native.stats.deopt_values);
     const native_bytes = try native.finalize();
     defer std.testing.allocator.free(native_bytes);
     const maps = if (native.root_maps) |*value| value else return error.TestUnexpectedResult;
@@ -2468,14 +2505,28 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
         .register_is_ref = &reference_kinds,
         .reference_registers = &references,
     } };
-    var scratch: [2]u64 = undefined;
+    var caller_registers: [2]u32 = @splat(0);
+    var caller_references: [2]u64 = @splat(@as(u64, @bitCast(runtime_value.Handle.none)));
+    var caller_reference_kinds: [2]bool = @splat(false);
+    var reconstructed_callers = [_]runtime_deopt.Frame{.{ .execution = .{
+        .pc = 0,
+        .registers = &caller_registers,
+        .instructions = &.{},
+        .register_is_ref = &caller_reference_kinds,
+        .reference_registers = &caller_references,
+    } }};
+    var scratch: [4]u64 = undefined;
     var stack_anchor: u64 = 0;
     const Resume = struct {
         called: bool = false,
 
         fn run(raw: *anyopaque, frame: *runtime_deopt.Frame) usize {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            self.called = frame.active and frame.execution.register_is_ref[0];
+            const caller = frame.previous orelse return 0;
+            self.called = frame.active and frame.execution.register_is_ref[0] and
+                caller.active and caller.method_id == 700 and caller.execution.pc == 1 and
+                caller.execution.register_is_ref[0] and caller.execution.registers[1] == 91 and
+                caller.previous == null;
             return if (self.called) 77 else 0;
         }
     };
@@ -2483,7 +2534,7 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
     var request = runtime_deopt.Request{
         .table = deopt_table,
         .point_id = 5,
-        .destination = .{ .frame = &reconstructed, .scratch = &scratch },
+        .destination = .{ .frame = &reconstructed, .inline_frames = &reconstructed_callers, .scratch = &scratch },
         .stack_base = @ptrCast(&stack_anchor),
         .stack_max_offset = @sizeOf(@TypeOf(stack_anchor)),
         .resume_context = &resume_state,
@@ -2508,6 +2559,156 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
     try std.testing.expect(try manager.invalidate(0));
     try std.testing.expectEqual(@as(u32, 1), try manager.reclaim());
     try std.testing.expectEqual(@as(u32, 1), metadata_owner.references.load(.acquire));
+}
+
+test "x64 deoptimization captures a managed spill slot and low XMM lane" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+
+    var storage: [64]u8 align(runtime_value.object_alignment) = @splat(0);
+    const regions = [_]runtime_value.Region{try runtime_value.Region.fromSlice(&storage)};
+    var handles = try runtime_value.HandleTable.init(std.testing.allocator, 1, &regions);
+    defer handles.deinit();
+    var registry = try runtime_thread_registry.Registry.init(std.testing.allocator, std.testing.io, 1);
+    defer registry.deinit() catch unreachable;
+    var context = try runtime_thread_registry.ThreadContext.init(std.testing.allocator, 2);
+    defer context.deinit();
+    try registry.register(&context);
+    defer registry.unregister(&context) catch unreachable;
+
+    var shims = try encode(std.testing.allocator, @intFromPtr(&runtime_jit.slowResolveBridge));
+    defer shims.deinit();
+    var stable_cache = jit_memory.Cache.init(std.testing.allocator);
+    defer stable_cache.deinit();
+    const entry_code = try stable_cache.addBytes(shims.entry);
+    const deopt_code = try stable_cache.addBytes(shims.deopt_helper);
+
+    const spill_bits: u64 = 0x1122334455667788;
+    const xmm_bits: u64 = 0x8877665544332211;
+    var target_buffer = code_buffer.Buffer.init(std.testing.allocator);
+    defer target_buffer.deinit();
+    try emitAdjustStack(&target_buffer, true, 16);
+    try emitMovRegImm64(&target_buffer, rax, spill_bits);
+    try target_buffer.emitBytes(&.{ 0x48, 0x89, 0x04, 0x24 }); // mov [rsp], rax
+    try emitMovRegImm64(&target_buffer, rax, xmm_bits);
+    try target_buffer.emitBytes(&.{ 0x66, 0x48, 0x0f, 0x6e, 0xd8 }); // movq xmm3, rax
+    try emitMovRegImm64(&target_buffer, r10, 7);
+    try emitMovRegImm64(&target_buffer, rax, deopt_code.entryAddress());
+    try emitCall(&target_buffer, rax);
+    try emitAdjustStack(&target_buffer, false, 16);
+    try emitMovRegReg(&target_buffer, rax, r10);
+    try target_buffer.emitU8(0xc3);
+    const target_bytes = try target_buffer.finalize();
+    defer std.testing.allocator.free(target_bytes);
+
+    const values = [_]runtime_deopt.ValueSpec{
+        .{ .vreg = 0, .kind = .scalar64, .source = .{ .stack_slot = 0 } },
+        .{ .vreg = 2, .kind = .scalar64, .source = .{ .xmm_register = 3 } },
+    };
+    var deopt_table = try runtime_deopt.Table.init(std.testing.allocator, &.{.{
+        .id = 44,
+        .method_id = 9,
+        .dex_pc = 3,
+        .values = &values,
+    }}, .{
+        .register_count = 4,
+        .native_register_count = 16,
+        .xmm_register_count = 8,
+        .max_dex_pc = 3,
+    });
+    defer deopt_table.deinit();
+    var stack_maps = try runtime_stack_map.Table.init(std.testing.allocator, &.{.{
+        .pc_offset = 7,
+        .roots = &.{},
+        .deopt_id = 44,
+    }}, .{
+        .native_register_count = 16,
+        .interpreter_register_count = 0,
+        .max_frame_depth = 0,
+        .max_shadow_roots = 0,
+    });
+    defer stack_maps.deinit();
+    try deopt_table.validateStackMaps(&stack_maps, true);
+    try deopt_table.validateAllLinked(&stack_maps);
+
+    const MetadataOwner = struct {
+        references: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.references.fetchAdd(1, .acq_rel);
+        }
+
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const previous = self.references.fetchSub(1, .acq_rel);
+            std.debug.assert(previous > 1);
+        }
+    };
+    var owner = MetadataOwner{};
+    var manager = try runtime_code_manager.Manager.init(std.testing.allocator, 1, 1, 1);
+    defer manager.deinit() catch unreachable;
+    var candidate = try manager.prepareWithMetadata(target_bytes, .{
+        .context = &owner,
+        .stack_maps = @intFromPtr(&stack_maps),
+        .deopt_table = @intFromPtr(&deopt_table),
+        .retain = MetadataOwner.retain,
+        .release = MetadataOwner.release,
+    });
+    defer candidate.deinit();
+    try manager.publish(0, &candidate);
+
+    var runtime = try runtime_jit.Runtime.init(std.testing.allocator, &handles, &registry);
+    defer runtime.deinit() catch unreachable;
+    try runtime.installCodeManager(&manager);
+    var registers: [4]u32 = @splat(0);
+    var references: [4]u64 = @splat(@as(u64, @bitCast(runtime_value.Handle.none)));
+    var kinds: [4]bool = @splat(false);
+    var reconstructed = runtime_deopt.Frame{ .execution = .{
+        .pc = 0,
+        .registers = &registers,
+        .instructions = &.{},
+        .register_is_ref = &kinds,
+        .reference_registers = &references,
+    } };
+    var scratch: [2]u64 = undefined;
+    var unused_stack: u64 = 0;
+    const Resume = struct {
+        called: bool = false,
+        expected_spill: u64,
+        expected_xmm: u64,
+
+        fn run(raw: *anyopaque, frame: *runtime_deopt.Frame) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.called = frame.execution.getWide(0) == self.expected_spill and frame.execution.getWide(2) == self.expected_xmm;
+            return if (self.called) 66 else 0;
+        }
+    };
+    var resume_state = Resume{ .expected_spill = spill_bits, .expected_xmm = xmm_bits };
+    var request = runtime_deopt.Request{
+        .table = &deopt_table,
+        .point_id = 44,
+        .destination = .{ .frame = &reconstructed, .scratch = &scratch },
+        .stack_base = @ptrCast(&unused_stack),
+        .stack_max_offset = @sizeOf(@TypeOf(unused_stack)),
+        .resume_context = &resume_state,
+        .resume_fn = Resume.run,
+    };
+    var managed = try runtime.enter(&context);
+    defer managed.deinit();
+    const frame = CallFrame{
+        .image = try managed.registerImage(),
+        .target = 0,
+        .deopt_request = @intFromPtr(&request),
+        .method_id = 0,
+    };
+    const EntryFn = fn (*const CallFrame) callconv(.c) usize;
+    try std.testing.expectEqual(@as(usize, 66), entry_code.typedEntry(EntryFn)(&frame));
+    try std.testing.expect(resume_state.called);
+    try std.testing.expectEqual(runtime_jit.CodeDispatchStatus.deoptimized, managed.native_state.last_code_dispatch);
+    try std.testing.expectEqual(@as(usize, 0), manager.stats().active_leases);
+    try std.testing.expect(try manager.invalidate(0));
+    try std.testing.expectEqual(@as(u32, 1), try manager.reclaim());
+    try std.testing.expectEqual(@as(u32, 1), owner.references.load(.acquire));
 }
 
 test "x64 OSR entry installs the exported physical GP image" {
@@ -2562,6 +2763,7 @@ test "x64 compiler-owned OSR label executes under its code-version lease" {
     const osr_adapter = try shim_cache.addBytes(shims.osr_entry);
 
     const insts = [_]Instruction{
+        .{ .const_ = .{ .dest = 9, .value = 123 } },
         .{ .const_ = .{ .dest = 1, .value = 2 } },
         .{ .goto_ = .{ .offset = 1 } },
         .{ .iget = .{ .field_idx = 1, .dest_or_src = 2, .obj = 0 } },
@@ -2570,33 +2772,21 @@ test "x64 compiler-owned OSR label executes under its code-version lease" {
         .{ .goto_ = .{ .offset = -3 } },
         .{ .return_ = .{ .src = 2 } },
     };
-    var optimized = try optimizer.optimize(std.testing.allocator, &insts, &.{}, .{
-        .enable_loop_resolve_hoisting = false,
-    });
+    var optimized = try optimizer.optimize(std.testing.allocator, &insts, &.{}, .{});
     defer optimized.deinit();
-    var site: ?u32 = null;
-    var dex_pc: ?u32 = null;
-    var header: ?u32 = null;
-    for (optimized.machine.blocks) |block| {
-        for (block.insts) |inst| {
-            if (inst.opcode != .resolve_handle) continue;
-            site = inst.resolve_id;
-            dex_pc = inst.pc;
-            header = block.id;
-        }
-    }
-    const safepoint = site orelse return error.TestUnexpectedResult;
-    const point_pc = dex_pc orelse return error.TestUnexpectedResult;
-    const loop_header = header orelse return error.TestUnexpectedResult;
-    const required = try x64_encoder.osrRequiredRegistersAtSite(std.testing.allocator, &optimized.machine, safepoint);
+    try std.testing.expectEqual(@as(u32, 1), optimized.stats.loop_resolves_hoisted);
+    try std.testing.expectEqual(@as(usize, 1), optimized.barriers.loop_reuses.len);
+    const loop_header = optimized.barriers.loop_reuses[0].header;
+    const point_pc = optimized.machine.blocks[loop_header].insts[0].pc orelse return error.TestUnexpectedResult;
+    const required = try x64_encoder.osrRequiredRegistersAtBlockEntry(std.testing.allocator, &optimized.machine, loop_header);
     defer std.testing.allocator.free(required);
-    var values: [3]x64_encoder.DeoptValueSpec = undefined;
-    var assigned = [_]bool{false} ** 3;
+    var values: [10]x64_encoder.DeoptValueSpec = undefined;
+    var assigned = [_]bool{false} ** 10;
     for (required) |reg| {
         const runtime_class = optimized.machine.runtime_values[reg];
         const value_id = switch (runtime_class) {
             .dalvik => |value| value.value,
-            .derived_ptr => return error.TestUnexpectedResult,
+            .derived_ptr => continue,
         };
         const vreg = optimized.function.values[value_id].reg;
         if (vreg >= values.len or assigned[vreg]) return error.TestUnexpectedResult;
@@ -2611,11 +2801,15 @@ test "x64 compiler-owned OSR label executes under its code-version lease" {
     for (assigned, 0..) |is_assigned, vreg| {
         if (is_assigned) continue;
         if (vreg == 0) return error.TestUnexpectedResult;
-        values[vreg] = .{ .vreg = @intCast(vreg), .kind = .scalar32, .source = .{ .constant = 0 } };
+        values[vreg] = .{
+            .vreg = @intCast(vreg),
+            .kind = .scalar32,
+            .source = .{ .constant = if (vreg == 9) 123 else 0 },
+        };
     }
     const points = [_]x64_encoder.DeoptPointSpec{.{
         .id = 51,
-        .safepoint_id = safepoint,
+        .block_entry = loop_header,
         .method_id = 0,
         .dex_pc = point_pc,
         .values = &values,
@@ -2636,12 +2830,25 @@ test "x64 compiler-owned OSR label executes under its code-version lease" {
             .deopt_helper = deopt_helper.entryAddress(),
             .field_layouts = &layouts,
         },
-        .deopt = .{ .points = &points, .register_count = 3, .max_dex_pc = 6 },
+        .deopt = .{ .points = &points, .register_count = 10, .max_dex_pc = 7 },
         .osr_entries = &osr_specs,
     });
     defer native.deinit();
+    try std.testing.expect(native.stats.frame_bytes > 0);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.osr_frame_landings);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_block_entries);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.osr_landing_safepoints);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.osr_derived_rematerializations);
     const stack_maps = if (native.root_maps) |*table| table else return error.TestUnexpectedResult;
     const deopt_table = if (native.deopt_table) |*table| table else return error.TestUnexpectedResult;
+    var block_entry_map: ?*const runtime_stack_map.Record = null;
+    for (stack_maps.records) |*record| {
+        if (record.deopt_id == 51) block_entry_map = record;
+    }
+    const entry_map = block_entry_map orelse return error.TestUnexpectedResult;
+    for (stack_maps.rootsFor(entry_map)) |root| {
+        try std.testing.expectEqual(runtime_stack_map.LocationKind.native_register, root.kind);
+    }
     const native_bytes = try native.finalize();
     defer std.testing.allocator.free(native_bytes);
 
@@ -2677,9 +2884,13 @@ test "x64 compiler-owned OSR label executes under its code-version lease" {
         var managed = try runtime.enter(&context);
         defer managed.deinit();
         try managed.installRootMaps(stack_maps);
-        var frame_registers: [3]u32 = .{ 0, 2, 0 };
-        var frame_references: [3]u64 = .{ @bitCast(handle), @bitCast(runtime_value.Handle.none), @bitCast(runtime_value.Handle.none) };
-        var frame_reference_kinds: [3]bool = .{ true, false, false };
+        var frame_registers: [10]u32 = @splat(0);
+        frame_registers[1] = 2;
+        frame_registers[9] = 123;
+        var frame_references: [10]u64 = @splat(@as(u64, @bitCast(runtime_value.Handle.none)));
+        frame_references[0] = @bitCast(handle);
+        var frame_reference_kinds: [10]bool = @splat(false);
+        frame_reference_kinds[0] = true;
         var interpreter_frame = runtime_deopt.Frame{
             .method_id = 0,
             .active = true,
@@ -2692,14 +2903,14 @@ test "x64 compiler-owned OSR label executes under its code-version lease" {
             },
         };
         var gp: [16]u64 = @splat(0);
-        var scratch: [19]u64 = undefined;
+        var scratch: [26]u64 = undefined;
         try deopt_table.exportOsr(51, &interpreter_frame, .{ .native_registers = &gp, .scratch = &scratch });
         const target = runtime_jit.codeOsrEnterBridge(&managed.native_state, 0, 0, 51);
         var call_frame = OsrCallFrame{ .image = try managed.registerImage(), .target = target, .gp = gp };
         const EntryFn = fn (*const OsrCallFrame) callconv(.c) usize;
-        const result = osr_adapter.typedEntry(EntryFn)(&call_frame);
-        try std.testing.expectEqual(@as(usize, 0), result);
-        try std.testing.expectEqual(@as(usize, 0), runtime_jit.codeLeaseExitBridge(&managed.native_state, result));
+        const value = osr_adapter.typedEntry(EntryFn)(&call_frame);
+        try std.testing.expectEqual(@as(usize, 0), value);
+        try std.testing.expectEqual(@as(usize, 0), runtime_jit.codeLeaseExitBridge(&managed.native_state, value));
         try std.testing.expectEqual(@as(u64, 0), manager.stats().active_leases);
     }
     try std.testing.expect(try manager.invalidate(0));
