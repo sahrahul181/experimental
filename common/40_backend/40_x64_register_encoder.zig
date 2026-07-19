@@ -206,11 +206,16 @@ pub const Stats = struct {
     osr_derived_rematerializations: u32 = 0,
     osr_remat_restart_edges: u32 = 0,
     frame_bytes: u32 = 0,
+    nonvolatile_frame_bytes: u32 = 0,
     spill_loads: u32 = 0,
     spill_stores: u32 = 0,
     xmm_insts: u32 = 0,
     xmm_spill_loads: u32 = 0,
     xmm_spill_stores: u32 = 0,
+    xmm_negations: u32 = 0,
+    xmm_comparisons: u32 = 0,
+    xmm_conversions: u32 = 0,
+    xmm_saturating_conversions: u32 = 0,
 };
 
 pub const Function = struct {
@@ -239,11 +244,15 @@ pub const Function = struct {
         try self.allocation.verify();
         if (self.block_labels.len != self.source.blocks.len) return error.InvalidMachine;
         if (!std.mem.isAligned(self.stats.frame_bytes, 16) or
+            (self.stats.nonvolatile_frame_bytes != 0 and self.stats.nonvolatile_frame_bytes != 16) or
             ((self.stats.frame_bytes == 0) != (self.allocation.stats.spills == 0))) return error.InvalidMachine;
         const xmm_spill_insts = std.math.add(u32, self.stats.xmm_spill_loads, self.stats.xmm_spill_stores) catch return error.InvalidMachine;
+        const xmm_unary_and_compare = std.math.add(u32, self.stats.xmm_negations, self.stats.xmm_comparisons) catch return error.InvalidMachine;
+        const xmm_semantic_sites = std.math.add(u32, xmm_unary_and_compare, self.stats.xmm_conversions) catch return error.InvalidMachine;
         if (self.stats.xmm_spill_loads > self.stats.spill_loads or
             self.stats.xmm_spill_stores > self.stats.spill_stores or
-            xmm_spill_insts > self.stats.xmm_insts) return error.InvalidMachine;
+            self.stats.xmm_saturating_conversions > self.stats.xmm_conversions or
+            xmm_spill_insts > self.stats.xmm_insts or xmm_semantic_sites > self.stats.xmm_insts) return error.InvalidMachine;
         if (self.stats.edge_copy_sites != self.source.edges.len or self.stats.edge_copy_moves != self.source.stats.edge_moves) return error.InvalidMachine;
         const resolve_sites = std.math.add(u32, self.source.stats.resolves, self.source.stats.loop_epoch_guards) catch return error.InvalidMachine;
         const emitted_resolves = std.math.add(u32, self.source.stats.resolves, self.stats.osr_derived_rematerializations) catch return error.InvalidMachine;
@@ -274,8 +283,9 @@ pub const Function = struct {
         if (self.stats.osr_landing_safepoints > self.stats.osr_entries or
             self.stats.osr_derived_rematerializations < self.stats.osr_landing_safepoints or
             self.stats.osr_remat_restart_edges != self.stats.osr_derived_rematerializations) return error.InvalidMachine;
-        if ((self.stats.frame_bytes == 0 and self.stats.osr_frame_landings != 0) or
-            (self.stats.frame_bytes != 0 and self.stats.osr_frame_landings != self.stats.osr_entries)) return error.InvalidMachine;
+        const has_native_frame = self.stats.frame_bytes != 0 or self.stats.nonvolatile_frame_bytes != 0;
+        if ((!has_native_frame and self.stats.osr_frame_landings != 0) or
+            (has_native_frame and self.stats.osr_frame_landings != self.stats.osr_entries)) return error.InvalidMachine;
         for (self.osr_entries, 0..) |entry, index| {
             if (entry.code_offset == 0 or entry.code_offset >= self.buffer.len() or !std.mem.isAligned(entry.code_offset, 16)) {
                 return error.InvalidMachine;
@@ -340,11 +350,16 @@ pub const Function = struct {
             },
         );
         try writer.print(
-            " xmm_insts={d} xmm_spill_loads={d} xmm_spill_stores={d} deopt_block_entries={d} osr_entries={d} osr_frame_landings={d} osr_landing_safepoints={d} osr_remats={d} osr_restart_edges={d}\n",
+            " nonvolatile_frame_bytes={d} xmm_insts={d} xmm_spill_loads={d} xmm_spill_stores={d} xmm_negations={d} xmm_comparisons={d} xmm_conversions={d} xmm_saturating={d} deopt_block_entries={d} osr_entries={d} osr_frame_landings={d} osr_landing_safepoints={d} osr_remats={d} osr_restart_edges={d}\n",
             .{
+                self.stats.nonvolatile_frame_bytes,
                 self.stats.xmm_insts,
                 self.stats.xmm_spill_loads,
                 self.stats.xmm_spill_stores,
+                self.stats.xmm_negations,
+                self.stats.xmm_comparisons,
+                self.stats.xmm_conversions,
+                self.stats.xmm_saturating_conversions,
                 self.stats.deopt_block_entries,
                 self.stats.osr_entries,
                 self.stats.osr_frame_landings,
@@ -371,7 +386,8 @@ const descriptor_generation_shift: u6 = 44;
 const descriptor_state_shift: u6 = 60;
 const object_alignment_shift: u6 = 3;
 
-const RESOLVER_GP_REGS = [_]regalloc.PhysReg{ .rax, .rcx, .rdx, .rsi, .rdi, .r8, .r9 };
+const WINDOWS_ALLOCATABLE_GP_REGS = [_]regalloc.PhysReg{ .rax, .rcx, .rdx, .r8, .r9 };
+const SYSV_ALLOCATABLE_GP_REGS = [_]regalloc.PhysReg{ .rax, .rcx, .rdx, .rsi, .rdi, .r8, .r9 };
 const WINDOWS_ALLOCATABLE_XMM_REGS = [_]regalloc.PhysReg{ .xmm0, .xmm1, .xmm2, .xmm3 };
 const SYSV_ALLOCATABLE_XMM_REGS = [_]regalloc.PhysReg{ .xmm0, .xmm1, .xmm2, .xmm3, .xmm4, .xmm5 };
 const xmm_scratch_primary: regalloc.PhysReg = if (builtin.os.tag == .windows) .xmm4 else .xmm6;
@@ -379,6 +395,14 @@ const xmm_scratch_secondary: regalloc.PhysReg = if (builtin.os.tag == .windows) 
 
 fn allocatableXmmRegisters() []const regalloc.PhysReg {
     return if (builtin.os.tag == .windows) &WINDOWS_ALLOCATABLE_XMM_REGS else &SYSV_ALLOCATABLE_XMM_REGS;
+}
+
+fn allocatableGpRegisters() []const regalloc.PhysReg {
+    return if (builtin.os.tag == .windows) &WINDOWS_ALLOCATABLE_GP_REGS else &SYSV_ALLOCATABLE_GP_REGS;
+}
+
+fn allGpRegisters() []const regalloc.PhysReg {
+    return &SYSV_ALLOCATABLE_GP_REGS;
 }
 
 const ColdResolve = struct {
@@ -684,21 +708,21 @@ fn emitAdjustStack(buffer: *code_buffer.Buffer, subtract: bool, amount: u32) Err
     }
 }
 
-fn frameSavedBytes(frame_bytes: u32) u32 {
-    return if (builtin.os.tag == .windows and frame_bytes != 0) 2 * @sizeOf(u64) else 0;
+fn frameSavedBytes(preserve_nonvolatile: bool) u32 {
+    return if (builtin.os.tag == .windows and preserve_nonvolatile) 2 * @sizeOf(u64) else 0;
 }
 
-fn emitFrameEnter(buffer: *code_buffer.Buffer, frame_bytes: u32) Error!void {
-    if (frameSavedBytes(frame_bytes) != 0) {
+fn emitFrameEnter(buffer: *code_buffer.Buffer, frame_bytes: u32, preserve_nonvolatile: bool) Error!void {
+    if (frameSavedBytes(preserve_nonvolatile) != 0) {
         try emitPushRaw(buffer, 6); // rsi
         try emitPushRaw(buffer, 7); // rdi
     }
     try emitAdjustStack(buffer, true, frame_bytes);
 }
 
-fn emitFrameLeave(buffer: *code_buffer.Buffer, frame_bytes: u32) Error!void {
+fn emitFrameLeave(buffer: *code_buffer.Buffer, frame_bytes: u32, preserve_nonvolatile: bool) Error!void {
     try emitAdjustStack(buffer, false, frame_bytes);
-    if (frameSavedBytes(frame_bytes) != 0) {
+    if (frameSavedBytes(preserve_nonvolatile) != 0) {
         try emitPopRaw(buffer, 7); // rdi
         try emitPopRaw(buffer, 6); // rsi
     }
@@ -872,6 +896,177 @@ fn emitXmmBinary(
     try emitRex(buffer, false, d, r);
     try buffer.emitBytes(&.{ 0x0f, opcode });
     try emitModRm(buffer, d, r);
+}
+
+fn emitXmmXor(buffer: *code_buffer.Buffer, dst: regalloc.PhysReg, rhs: regalloc.PhysReg, wide: bool) Error!void {
+    const d: u4 = @intCast(try xmmReg(dst));
+    const r: u4 = @intCast(try xmmReg(rhs));
+    if (wide) try buffer.emitU8(0x66); // xorpd; xorps has no mandatory prefix
+    try emitRex(buffer, false, d, r);
+    try buffer.emitBytes(&.{ 0x0f, 0x57 });
+    try emitModRm(buffer, d, r);
+}
+
+fn emitXmmCompare(buffer: *code_buffer.Buffer, lhs: regalloc.PhysReg, rhs: regalloc.PhysReg, wide: bool) Error!void {
+    const l: u4 = @intCast(try xmmReg(lhs));
+    const r: u4 = @intCast(try xmmReg(rhs));
+    if (wide) try buffer.emitU8(0x66); // ucomisd; ucomiss has no mandatory prefix
+    try emitRex(buffer, false, l, r);
+    try buffer.emitBytes(&.{ 0x0f, 0x2e });
+    try emitModRm(buffer, l, r);
+}
+
+fn emitXmmCompareResult(
+    buffer: *code_buffer.Buffer,
+    operation: machine.FloatOperation,
+    dst: regalloc.PhysReg,
+    lhs: regalloc.PhysReg,
+    rhs: regalloc.PhysReg,
+    wide: bool,
+    stats: *Stats,
+) Error!void {
+    if (operation != .compare_l and operation != .compare_g) return error.InvalidMachine;
+    if (dst.class() != .gp or lhs.class() != .xmm or rhs.class() != .xmm) return error.InvalidMachine;
+    const unordered = try buffer.newLabel();
+    const greater = try buffer.newLabel();
+    const less = try buffer.newLabel();
+    const done = try buffer.newLabel();
+
+    try emitXmmCompare(buffer, lhs, rhs, wide);
+    try emitJccOpcode(buffer, 0x8a, unordered); // jp: unordered/NaN
+    try emitJccOpcode(buffer, 0x87, greater); // ja: lhs > rhs
+    try emitJccOpcode(buffer, 0x82, less); // jb: lhs < rhs
+    try emitMovRegImm32(buffer, dst, 0);
+    try emitJump(buffer, done);
+    try buffer.bindLabel(greater);
+    try emitMovRegImm32(buffer, dst, 1);
+    try emitJump(buffer, done);
+    try buffer.bindLabel(less);
+    try emitMovRegImm32(buffer, dst, -1);
+    try emitJump(buffer, done);
+    try buffer.bindLabel(unordered);
+    try emitMovRegImm32(buffer, dst, if (operation == .compare_l) -1 else 1);
+    try buffer.bindLabel(done);
+
+    stats.xmm_insts += 1;
+    stats.native_insts += 11;
+    stats.branches += 3;
+    stats.jumps += 3;
+}
+
+fn emitGpToFloatConvert(
+    buffer: *code_buffer.Buffer,
+    dst: regalloc.PhysReg,
+    src: regalloc.PhysReg,
+    input_wide: bool,
+    output_wide: bool,
+) Error!void {
+    const d: u4 = @intCast(try xmmReg(dst));
+    const s = try x64Reg(src);
+    try buffer.emitU8(if (output_wide) 0xf2 else 0xf3);
+    try emitRex(buffer, input_wide, d, s);
+    try buffer.emitBytes(&.{ 0x0f, 0x2a });
+    try emitModRm(buffer, d, s);
+}
+
+fn emitFloatToGpTruncate(
+    buffer: *code_buffer.Buffer,
+    dst: regalloc.PhysReg,
+    src: regalloc.PhysReg,
+    input_wide: bool,
+    output_wide: bool,
+) Error!void {
+    const d = try x64Reg(dst);
+    const s: u4 = @intCast(try xmmReg(src));
+    try buffer.emitU8(if (input_wide) 0xf2 else 0xf3);
+    try emitRex(buffer, output_wide, d, s);
+    try buffer.emitBytes(&.{ 0x0f, 0x2c });
+    try emitModRm(buffer, d, s);
+}
+
+fn emitFloatWidthConvert(
+    buffer: *code_buffer.Buffer,
+    dst: regalloc.PhysReg,
+    src: regalloc.PhysReg,
+    input_wide: bool,
+) Error!void {
+    const d: u4 = @intCast(try xmmReg(dst));
+    const s: u4 = @intCast(try xmmReg(src));
+    try buffer.emitU8(if (input_wide) 0xf2 else 0xf3);
+    try emitRex(buffer, false, d, s);
+    try buffer.emitBytes(&.{ 0x0f, 0x5a });
+    try emitModRm(buffer, d, s);
+}
+
+fn emitIntegerLimitAsFloat(
+    buffer: *code_buffer.Buffer,
+    dst: regalloc.PhysReg,
+    input_wide: bool,
+    output_wide: bool,
+    upper: bool,
+) Error!void {
+    const integer_limit: i64 = if (output_wide)
+        (if (upper) std.math.maxInt(i64) else std.math.minInt(i64))
+    else if (upper)
+        std.math.maxInt(i32)
+    else
+        std.math.minInt(i32);
+    if (input_wide) {
+        const value: f64 = @floatFromInt(integer_limit);
+        try emitMovRegImm64(buffer, .r11, @bitCast(value));
+    } else {
+        const value: f32 = @floatFromInt(integer_limit);
+        try emitMovRegImm32(buffer, .r11, @bitCast(value));
+    }
+    try emitGpToXmm(buffer, dst, .r11, input_wide);
+}
+
+fn emitSaturatingFloatToInteger(
+    buffer: *code_buffer.Buffer,
+    dst: regalloc.PhysReg,
+    src: regalloc.PhysReg,
+    input_wide: bool,
+    output_wide: bool,
+    stats: *Stats,
+) Error!void {
+    if (dst.class() != .gp or src.class() != .xmm) return error.InvalidMachine;
+    const nan = try buffer.newLabel();
+    const upper = try buffer.newLabel();
+    const done = try buffer.newLabel();
+
+    // CVTT's overwhelmingly common in-range result is accepted immediately.
+    // x86 reports NaN and every overflow as the signed minimum sentinel; only
+    // that uncommon result needs semantic disambiguation.
+    try emitFloatToGpTruncate(buffer, dst, src, input_wide, output_wide);
+    if (output_wide) {
+        try emitMovRegImm64(buffer, .r11, std.math.minInt(i64));
+        try emitCmpRawRaw(buffer, try x64Reg(dst), try x64Reg(.r11), true);
+    } else {
+        try emitCmpRawImm32(buffer, try x64Reg(dst), @bitCast(@as(i32, std.math.minInt(i32))));
+    }
+    try emitJccOpcode(buffer, 0x85, done); // jne: ordinary in-range result
+
+    try emitXmmCompare(buffer, src, src, input_wide);
+    try emitJccOpcode(buffer, 0x8a, nan); // jp: NaN -> zero
+    try emitIntegerLimitAsFloat(buffer, xmm_scratch_secondary, input_wide, output_wide, true);
+    try emitXmmCompare(buffer, src, xmm_scratch_secondary, input_wide);
+    try emitJccOpcode(buffer, 0x83, upper); // jae: saturate to maximum
+    // Ordered values that still produced the minimum sentinel are either the
+    // exact/truncated minimum or lower overflow; Dalvik requires minimum for
+    // both, so the CVTT result is already final.
+    try emitJump(buffer, done);
+
+    try buffer.bindLabel(nan);
+    if (output_wide) try emitMovRegImm64(buffer, dst, 0) else try emitMovRegImm32(buffer, dst, 0);
+    try emitJump(buffer, done);
+    try buffer.bindLabel(upper);
+    if (output_wide) try emitMovRegImm64(buffer, dst, std.math.maxInt(i64)) else try emitMovRegImm32(buffer, dst, std.math.maxInt(i32));
+    try buffer.bindLabel(done);
+
+    stats.xmm_insts += 4;
+    stats.native_insts += if (output_wide) 14 else 13;
+    stats.branches += 3;
+    stats.jumps += 2;
 }
 
 fn isWideType(ty: anytype) bool {
@@ -1201,6 +1396,7 @@ fn emitColdBoundsExceptions(
     cold: []const ColdBoundsException,
     runtime: RuntimeAbi,
     frame_bytes: u32,
+    preserve_nonvolatile: bool,
     stats: *Stats,
 ) Error!void {
     if (cold.len == 0) return;
@@ -1222,7 +1418,7 @@ fn emitColdBoundsExceptions(
         try emitMovRawImm64(buffer, address, @intCast(runtime.bounds_exception_helper));
         try emitCallRaw(buffer, address);
         try emitMovRegImm32(buffer, .rax, 0);
-        try emitFrameLeave(buffer, frame_bytes);
+        try emitFrameLeave(buffer, frame_bytes, preserve_nonvolatile);
         try emitRet(buffer);
         stats.native_insts += 9;
         stats.returns += 1;
@@ -1278,6 +1474,7 @@ fn emitColdDeopts(
     cold: []const ColdDeopt,
     runtime: RuntimeAbi,
     frame_bytes: u32,
+    preserve_nonvolatile: bool,
     stats: *Stats,
 ) Error!void {
     if (cold.len == 0) return;
@@ -1288,7 +1485,7 @@ fn emitColdDeopts(
         try emitMovRawImm64(buffer, scratch_descriptor, runtime.deopt_helper);
         try emitCallRaw(buffer, scratch_descriptor);
         try emitMovRawRaw(buffer, 0, scratch_index, true);
-        try emitFrameLeave(buffer, frame_bytes);
+        try emitFrameLeave(buffer, frame_bytes, preserve_nonvolatile);
         try emitRet(buffer);
         stats.deopt_traps += 1;
         stats.native_insts += 5;
@@ -1321,7 +1518,7 @@ fn abiRegisterParamCount() u32 {
     return if (builtin.os.tag == .windows) 4 else 6;
 }
 
-fn abiStackParamOffset(index: u32, frame_bytes: u32) Error!i32 {
+fn abiStackParamOffset(index: u32, frame_bytes: u32, preserve_nonvolatile: bool) Error!i32 {
     const register_count = abiRegisterParamCount();
     if (index < register_count) return error.InvalidMachine;
     // Windows reserves four eight-byte home slots between the return address
@@ -1330,7 +1527,7 @@ fn abiStackParamOffset(index: u32, frame_bytes: u32) Error!i32 {
     const first: u32 = if (builtin.os.tag == .windows) 40 else 8;
     const argument_delta = std.math.mul(u32, index - register_count, 8) catch return error.UnsupportedInstruction;
     const entry_offset = std.math.add(u32, first, argument_delta) catch return error.UnsupportedInstruction;
-    const frame_and_saves = std.math.add(u32, frame_bytes, frameSavedBytes(frame_bytes)) catch return error.UnsupportedInstruction;
+    const frame_and_saves = std.math.add(u32, frame_bytes, frameSavedBytes(preserve_nonvolatile)) catch return error.UnsupportedInstruction;
     const framed_offset = std.math.add(u32, frame_and_saves, entry_offset) catch return error.UnsupportedInstruction;
     if (framed_offset > std.math.maxInt(i32)) return error.UnsupportedInstruction;
     return @intCast(framed_offset);
@@ -1386,6 +1583,7 @@ fn emitParamMoves(
     spill_plan: *const regalloc.SpillPlan,
     source: *const machine.Function,
     frame_bytes: u32,
+    preserve_nonvolatile: bool,
     stats: *Stats,
 ) Error!void {
     var moves: [6]ParamMove = undefined;
@@ -1470,7 +1668,7 @@ fn emitParamMoves(
             continue;
         }
         const wide = isWideType(source.reg_types[value_id]) or source.isGcRoot(reg);
-        const offset = try abiStackParamOffset(param_index, frame_bytes);
+        const offset = try abiStackParamOffset(param_index, frame_bytes, preserve_nonvolatile);
         switch (allocation.locationOf(reg) orelse return error.InvalidMachine) {
             .phys => |dst| {
                 switch (dst.class()) {
@@ -1723,6 +1921,7 @@ fn encodeInst(
     allocation: *const regalloc.Allocation,
     spill_plan: *const regalloc.SpillPlan,
     frame_bytes: u32,
+    preserve_nonvolatile: bool,
     source: *const machine.Function,
     inst: machine.Inst,
     runtime: ?RuntimeAbi,
@@ -1817,67 +2016,211 @@ fn encodeInst(
             }
         },
         .f32_op, .f64_op => {
-            if (inst.defs.len == 0 or inst.defs.len > 2) return error.InvalidMachine;
             const operation = inst.float_op orelse return error.InvalidMachine;
-            switch (operation) {
-                .add, .sub, .mul, .div => {},
-                else => return error.UnsupportedInstruction,
-            }
             const wide = inst.opcode == .f64_op;
-            if (wide) {
-                if (inst.defs.len != 2 or inst.uses.len != 4) return error.InvalidMachine;
-                if (source.reg_types[inst.defs[0]] != .double or
-                    source.reg_types[inst.uses[0]] != .double or
-                    source.reg_types[inst.uses[2]] != .double) return error.InvalidMachine;
-            } else {
-                if (inst.defs.len != 1 or inst.uses.len != 2) return error.InvalidMachine;
-                if (source.reg_types[inst.defs[0]] != .float or
-                    source.reg_types[inst.uses[0]] != .float or
-                    source.reg_types[inst.uses[1]] != .float) return error.InvalidMachine;
-            }
-            const rhs_use: machine.RegId = inst.uses[if (wide) 2 else 1];
+            switch (operation) {
+                .add, .sub, .mul, .div => {
+                    if (wide) {
+                        if (inst.defs.len != 2 or inst.uses.len != 4) return error.InvalidMachine;
+                        if (source.reg_types[inst.defs[0]] != .double or
+                            source.reg_types[inst.uses[0]] != .double or
+                            source.reg_types[inst.uses[2]] != .double) return error.InvalidMachine;
+                    } else {
+                        if (inst.defs.len != 1 or inst.uses.len != 2) return error.InvalidMachine;
+                        if (source.reg_types[inst.defs[0]] != .float or
+                            source.reg_types[inst.uses[0]] != .float or
+                            source.reg_types[inst.uses[1]] != .float) return error.InvalidMachine;
+                    }
+                    const rhs_use: machine.RegId = inst.uses[if (wide) 2 else 1];
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const lhs_location = allocation.locationOf(inst.uses[0]) orelse return error.InvalidMachine;
+                    const rhs_location = allocation.locationOf(rhs_use) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => xmm_scratch_primary,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .xmm) return error.InvalidMachine;
 
-            const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
-            const lhs_location = allocation.locationOf(inst.uses[0]) orelse return error.InvalidMachine;
-            const rhs_location = allocation.locationOf(rhs_use) orelse return error.InvalidMachine;
-            const dst: regalloc.PhysReg = switch (dst_location) {
-                .phys => |physical| physical,
-                .spill => xmm_scratch_primary,
-                .none => return error.InvalidMachine,
-            };
-            if (dst.class() != .xmm) return error.InvalidMachine;
+                    var saved_rhs: ?regalloc.PhysReg = null;
+                    switch (rhs_location) {
+                        .phys => |rhs| {
+                            if (rhs.class() != .xmm) return error.InvalidMachine;
+                            if (rhs == dst and !sameLocation(lhs_location, rhs_location)) {
+                                try recordPhysicalMove(buffer, xmm_scratch_secondary, rhs, wide, stats);
+                                saved_rhs = xmm_scratch_secondary;
+                            }
+                        },
+                        .spill => {},
+                        .none => return error.InvalidMachine,
+                    }
 
-            var saved_rhs: ?regalloc.PhysReg = null;
-            switch (rhs_location) {
-                .phys => |rhs| {
+                    const lhs = try readInto(buffer, allocation, spill_plan, inst.uses[0], dst, stats);
+                    if (lhs.class() != .xmm) return error.InvalidMachine;
+                    try recordPhysicalMove(buffer, dst, lhs, wide, stats);
+                    const rhs = saved_rhs orelse try readInto(
+                        buffer,
+                        allocation,
+                        spill_plan,
+                        rhs_use,
+                        if (dst == xmm_scratch_primary) xmm_scratch_secondary else xmm_scratch_primary,
+                        stats,
+                    );
                     if (rhs.class() != .xmm) return error.InvalidMachine;
-                    if (rhs == dst and !sameLocation(lhs_location, rhs_location)) {
-                        try recordPhysicalMove(buffer, xmm_scratch_secondary, rhs, wide, stats);
-                        saved_rhs = xmm_scratch_secondary;
+                    try emitXmmBinary(buffer, operation, dst, rhs, wide);
+                    stats.native_insts += 1;
+                    stats.xmm_insts += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
                     }
                 },
-                .spill => {},
-                .none => return error.InvalidMachine,
-            }
-
-            const lhs = try readInto(buffer, allocation, spill_plan, inst.uses[0], dst, stats);
-            if (lhs.class() != .xmm) return error.InvalidMachine;
-            try recordPhysicalMove(buffer, dst, lhs, wide, stats);
-            const rhs = saved_rhs orelse try readInto(
-                buffer,
-                allocation,
-                spill_plan,
-                rhs_use,
-                if (dst == xmm_scratch_primary) xmm_scratch_secondary else xmm_scratch_primary,
-                stats,
-            );
-            if (rhs.class() != .xmm) return error.InvalidMachine;
-            try emitXmmBinary(buffer, operation, dst, rhs, wide);
-            stats.native_insts += 1;
-            stats.xmm_insts += 1;
-            switch (dst_location) {
-                .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
-                else => {},
+                .neg => {
+                    if (wide) {
+                        if (inst.defs.len != 2 or inst.uses.len != 2 or
+                            source.reg_types[inst.defs[0]] != .double or source.reg_types[inst.uses[0]] != .double) return error.InvalidMachine;
+                    } else {
+                        if (inst.defs.len != 1 or inst.uses.len != 1 or
+                            source.reg_types[inst.defs[0]] != .float or source.reg_types[inst.uses[0]] != .float) return error.InvalidMachine;
+                    }
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => xmm_scratch_primary,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .xmm) return error.InvalidMachine;
+                    const src = try readInto(buffer, allocation, spill_plan, inst.uses[0], dst, stats);
+                    if (src.class() != .xmm) return error.InvalidMachine;
+                    try recordPhysicalMove(buffer, dst, src, wide, stats);
+                    if (wide) {
+                        try emitMovRegImm64(buffer, .r10, std.math.minInt(i64));
+                    } else {
+                        try emitMovRegImm32(buffer, .r10, std.math.minInt(i32));
+                    }
+                    try emitGpToXmm(buffer, xmm_scratch_secondary, .r10, wide);
+                    try emitXmmXor(buffer, dst, xmm_scratch_secondary, wide);
+                    stats.native_insts += 3;
+                    stats.xmm_insts += 2;
+                    stats.xmm_negations += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
+                    }
+                },
+                .compare_l, .compare_g => {
+                    if (inst.defs.len != 1 or source.reg_types[inst.defs[0]] != .int) return error.InvalidMachine;
+                    if (wide) {
+                        if (inst.uses.len != 4 or source.reg_types[inst.uses[0]] != .double or
+                            source.reg_types[inst.uses[2]] != .double) return error.InvalidMachine;
+                    } else {
+                        if (inst.uses.len != 2 or source.reg_types[inst.uses[0]] != .float or
+                            source.reg_types[inst.uses[1]] != .float) return error.InvalidMachine;
+                    }
+                    const rhs_use: machine.RegId = inst.uses[if (wide) 2 else 1];
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => .r10,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .gp) return error.InvalidMachine;
+                    const lhs = try readInto(buffer, allocation, spill_plan, inst.uses[0], xmm_scratch_primary, stats);
+                    const rhs = try readInto(buffer, allocation, spill_plan, rhs_use, xmm_scratch_secondary, stats);
+                    try emitXmmCompareResult(buffer, operation, dst, lhs, rhs, wide, stats);
+                    stats.xmm_comparisons += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
+                    }
+                },
+                .int_to_float, .int_to_double, .long_to_float, .long_to_double => {
+                    const input_wide = operation == .long_to_float or operation == .long_to_double;
+                    const output_wide = operation == .int_to_double or operation == .long_to_double;
+                    const expected_defs: usize = if (output_wide) 2 else 1;
+                    const expected_uses: usize = if (input_wide) 2 else 1;
+                    if (wide != output_wide or
+                        inst.defs.len != expected_defs or
+                        inst.uses.len != expected_uses) return error.InvalidMachine;
+                    const expected_src: machine.ValueType = if (input_wide) .long else .int;
+                    const expected_dst: machine.ValueType = if (output_wide) .double else .float;
+                    if (source.reg_types[inst.defs[0]] != expected_dst or source.reg_types[inst.uses[0]] != expected_src) return error.InvalidMachine;
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => xmm_scratch_primary,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .xmm) return error.InvalidMachine;
+                    const src = try readInto(buffer, allocation, spill_plan, inst.uses[0], .r10, stats);
+                    if (src.class() != .gp) return error.InvalidMachine;
+                    try emitGpToFloatConvert(buffer, dst, src, input_wide, output_wide);
+                    stats.xmm_insts += 1;
+                    stats.xmm_conversions += 1;
+                    stats.native_insts += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
+                    }
+                },
+                .float_to_int, .float_to_long, .double_to_int, .double_to_long => {
+                    const input_wide = operation == .double_to_int or operation == .double_to_long;
+                    const output_wide = operation == .float_to_long or operation == .double_to_long;
+                    const expected_defs: usize = if (output_wide) 2 else 1;
+                    const expected_uses: usize = if (input_wide) 2 else 1;
+                    if (wide != input_wide or
+                        inst.defs.len != expected_defs or
+                        inst.uses.len != expected_uses) return error.InvalidMachine;
+                    const expected_src: machine.ValueType = if (input_wide) .double else .float;
+                    const expected_dst: machine.ValueType = if (output_wide) .long else .int;
+                    if (source.reg_types[inst.defs[0]] != expected_dst or source.reg_types[inst.uses[0]] != expected_src) return error.InvalidMachine;
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => .r10,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .gp) return error.InvalidMachine;
+                    const src = try readInto(buffer, allocation, spill_plan, inst.uses[0], xmm_scratch_primary, stats);
+                    if (src.class() != .xmm) return error.InvalidMachine;
+                    try emitSaturatingFloatToInteger(buffer, dst, src, input_wide, output_wide, stats);
+                    stats.xmm_conversions += 1;
+                    stats.xmm_saturating_conversions += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
+                    }
+                },
+                .float_to_double, .double_to_float => {
+                    const input_wide = operation == .double_to_float;
+                    const output_wide = !input_wide;
+                    const expected_defs: usize = if (output_wide) 2 else 1;
+                    const expected_uses: usize = if (input_wide) 2 else 1;
+                    if (wide != input_wide or
+                        inst.defs.len != expected_defs or
+                        inst.uses.len != expected_uses) return error.InvalidMachine;
+                    const expected_src: machine.ValueType = if (input_wide) .double else .float;
+                    const expected_dst: machine.ValueType = if (output_wide) .double else .float;
+                    if (source.reg_types[inst.defs[0]] != expected_dst or source.reg_types[inst.uses[0]] != expected_src) return error.InvalidMachine;
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => xmm_scratch_primary,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .xmm) return error.InvalidMachine;
+                    const src = try readInto(buffer, allocation, spill_plan, inst.uses[0], dst, stats);
+                    if (src.class() != .xmm) return error.InvalidMachine;
+                    try emitFloatWidthConvert(buffer, dst, src, input_wide);
+                    stats.xmm_insts += 1;
+                    stats.xmm_conversions += 1;
+                    stats.native_insts += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
+                    }
+                },
+                else => return error.UnsupportedInstruction,
             }
         },
         // The following resolve performs the same null discrimination and
@@ -2064,7 +2407,7 @@ fn encodeInst(
                 }
             }
             if (inst.uses.len > 2) return error.UnsupportedInstruction;
-            try emitFrameLeave(buffer, frame_bytes);
+            try emitFrameLeave(buffer, frame_bytes, preserve_nonvolatile);
             try emitRet(buffer);
             stats.returns += 1;
             stats.native_insts += 1;
@@ -3144,9 +3487,15 @@ fn collectOsrRequiredRegisters(
 ) Error![]machine.RegId {
     if (specs.len == 0) return allocator.alloc(machine.RegId, 0);
     const options = deopt orelse return error.InvalidDeoptMetadata;
+    const barriers = source.source.barriers orelse return error.InvalidDeoptMetadata;
+    const loops = barriers.loops orelse return error.InvalidDeoptMetadata;
     var required: std.ArrayList(machine.RegId) = .empty;
     errdefer required.deinit(allocator);
-    for (specs) |spec| {
+    for (specs, 0..) |spec, entry_index| {
+        if (entry_index != 0 and specs[entry_index - 1].point_id >= spec.point_id) {
+            return error.InvalidDeoptMetadata;
+        }
+        if (spec.block >= source.blocks.len) return error.InvalidDeoptMetadata;
         var point_index: ?usize = null;
         for (options.points, 0..) |candidate, candidate_index| {
             if (candidate.id == spec.point_id) {
@@ -3165,6 +3514,17 @@ fn collectOsrRequiredRegisters(
             .constant => {},
         };
         const safepoint = try resolveDeoptPosition(source, options, selected_index);
+        if (safepoint.block != spec.block or safepoint.pc != deopt_point.dex_pc) {
+            return error.InvalidDeoptMetadata;
+        }
+        var natural_loop = false;
+        for (loops.loops) |loop| {
+            if (loop.header == spec.block) {
+                natural_loop = true;
+                break;
+            }
+        }
+        if (!natural_loop) return error.InvalidDeoptMetadata;
         for (0..source.reg_types.len) |reg_index| {
             const reg: machine.RegId = @intCast(reg_index);
             if (!try osrRegisterReadBeforeDefinition(allocator, source, safepoint, reg)) continue;
@@ -3299,12 +3659,25 @@ pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Fu
     defer allocator.free(osr_required);
     const must_register = try collectMustRegisterOperands(allocator, source, osr_required);
     defer allocator.free(must_register);
-    var allocation = try regalloc.allocate(allocator, source, .{
-        .gp_registers = &RESOLVER_GP_REGS,
+    var preserve_nonvolatile = false;
+    var allocation = regalloc.allocate(allocator, source, .{
+        .gp_registers = allocatableGpRegisters(),
         .xmm_registers = allocatableXmmRegisters(),
         .distinct_registers = osr_required,
         .must_registers = must_register,
-    });
+    }) catch |err| switch (err) {
+        error.BadAllocation => blk: {
+            if (builtin.os.tag != .windows) return err;
+            preserve_nonvolatile = true;
+            break :blk try regalloc.allocate(allocator, source, .{
+                .gp_registers = allGpRegisters(),
+                .xmm_registers = allocatableXmmRegisters(),
+                .distinct_registers = osr_required,
+                .must_registers = must_register,
+            });
+        },
+        else => return err,
+    };
     errdefer allocation.deinit();
     var spill_plan = try regalloc.planSpills(allocator, &allocation);
     defer spill_plan.deinit();
@@ -3326,7 +3699,11 @@ pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Fu
     defer allocator.free(osr_body_labels);
     for (osr_body_labels) |*label| label.* = try buffer.newLabel();
 
-    var stats: Stats = .{ .blocks = @intCast(source.blocks.len), .frame_bytes = frame_bytes };
+    var stats: Stats = .{
+        .blocks = @intCast(source.blocks.len),
+        .frame_bytes = frame_bytes,
+        .nonvolatile_frame_bytes = frameSavedBytes(preserve_nonvolatile),
+    };
     var root_maps = try buildRootMaps(allocator, source, &allocation, &spill_plan, &stats, options.deopt);
     errdefer if (root_maps) |*maps| maps.deinit();
     var deopt_table = try buildDeoptTable(
@@ -3358,9 +3735,9 @@ pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Fu
             try existing_deopt.validateAllLinked(&root_maps.?);
         }
     }
-    try emitFrameEnter(&buffer, frame_bytes);
-    if (frame_bytes != 0) stats.native_insts += 1;
-    try emitParamMoves(&buffer, &allocation, &spill_plan, source, frame_bytes, &stats);
+    try emitFrameEnter(&buffer, frame_bytes, preserve_nonvolatile);
+    if (frame_bytes != 0 or preserve_nonvolatile) stats.native_insts += 1;
+    try emitParamMoves(&buffer, &allocation, &spill_plan, source, frame_bytes, preserve_nonvolatile, &stats);
 
     var cold: std.ArrayList(ColdResolve) = .empty;
     defer cold.deinit(allocator);
@@ -3379,7 +3756,7 @@ pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Fu
                 for (options.osr_entries, 0..) |osr, osr_index| {
                     if (osr.block != block.id or osr.point_id != point.id) continue;
                     try buffer.alignTo(16, 0x90);
-                    const out_of_line = frame_bytes != 0 or osrBlockNeedsRematerialization(source, osr.block);
+                    const out_of_line = frame_bytes != 0 or preserve_nonvolatile or osrBlockNeedsRematerialization(source, osr.block);
                     try buffer.bindLabel(if (out_of_line) osr_body_labels[osr_index] else osr_labels[osr_index]);
                 }
                 try emitDeoptGuard(allocator, &buffer, options.runtime.?, site_id, &cold_deopts, &stats);
@@ -3393,7 +3770,7 @@ pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Fu
                         for (deopt.points) |point| {
                             if (point.id != osr.point_id or (point.safepoint_id orelse continue) != site_id) continue;
                             try buffer.alignTo(16, 0x90);
-                            const out_of_line = frame_bytes != 0 or osrBlockNeedsRematerialization(source, osr.block);
+                            const out_of_line = frame_bytes != 0 or preserve_nonvolatile or osrBlockNeedsRematerialization(source, osr.block);
                             try buffer.bindLabel(if (out_of_line) osr_body_labels[osr_index] else osr_labels[osr_index]);
                         }
                     }
@@ -3402,7 +3779,7 @@ pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Fu
                     try emitDeoptGuard(allocator, &buffer, options.runtime.?, site_id, &cold_deopts, &stats);
                 }
             }
-            try encodeInst(allocator, &buffer, labels, edge_labels, block.id, &allocation, &spill_plan, frame_bytes, source, inst, options.runtime, &cold, &cold_bounds, &stats);
+            try encodeInst(allocator, &buffer, labels, edge_labels, block.id, &allocation, &spill_plan, frame_bytes, preserve_nonvolatile, source, inst, options.runtime, &cold, &cold_bounds, &stats);
         }
         if (!hasExplicitTransfer(block)) {
             const successors = source.successors[block.id];
@@ -3429,11 +3806,11 @@ pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Fu
     for (osr_labels, 0..) |landing, index| {
         const spec = options.osr_entries[index];
         const rematerializes = osrBlockNeedsRematerialization(source, spec.block);
-        if (frame_bytes == 0 and !rematerializes) continue;
+        if (frame_bytes == 0 and !preserve_nonvolatile and !rematerializes) continue;
         try buffer.alignTo(16, 0x90);
         try buffer.bindLabel(landing);
-        try emitFrameEnter(&buffer, frame_bytes);
-        if (frame_bytes != 0) {
+        try emitFrameEnter(&buffer, frame_bytes, preserve_nonvolatile);
+        if (frame_bytes != 0 or preserve_nonvolatile) {
             stats.osr_frame_landings += 1;
             stats.native_insts += 1;
         }
@@ -3475,8 +3852,8 @@ pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Fu
         stats.native_insts += 1;
     }
     if (options.runtime) |runtime| try emitColdResolves(&buffer, cold.items, runtime, &stats);
-    if (options.runtime) |runtime| try emitColdBoundsExceptions(&buffer, cold_bounds.items, runtime, frame_bytes, &stats);
-    if (options.runtime) |runtime| try emitColdDeopts(&buffer, cold_deopts.items, runtime, frame_bytes, &stats);
+    if (options.runtime) |runtime| try emitColdBoundsExceptions(&buffer, cold_bounds.items, runtime, frame_bytes, preserve_nonvolatile, &stats);
+    if (options.runtime) |runtime| try emitColdDeopts(&buffer, cold_deopts.items, runtime, frame_bytes, preserve_nonvolatile, &stats);
     try buffer.verify();
     const osr_entries = try buildOsrEntries(
         allocator,
@@ -3511,6 +3888,19 @@ pub fn encode(allocator: std.mem.Allocator, source: *const machine.Function) Err
 
 fn optimizedMachine(allocator: std.mem.Allocator, insts: []const Instruction) !*optimizer.OptimizedFunction {
     return try optimizer.optimize(allocator, insts, &.{}, .{});
+}
+
+fn encodedTestInstructions(allocator: std.mem.Allocator, insts: []const Instruction) ![]u8 {
+    var optimized = try optimizedMachine(allocator, insts);
+    defer optimized.deinit();
+    var native = try encode(allocator, &optimized.machine);
+    defer native.deinit();
+    return try native.finalize();
+}
+
+fn addOwnedTestBytes(cache: *jit_memory.Cache, bytes: []u8) !*jit_memory.Allocation {
+    defer std.testing.allocator.free(bytes);
+    return try cache.addBytes(bytes);
 }
 
 fn expectBinaryI32(insts: []const Instruction, a: i32, b: i32, expected: i32) !void {
@@ -3715,6 +4105,332 @@ test "x64_register_encoder preserves scalar XMM rhs across two-address aliases" 
     const result_bits = allocation.typedEntry(Fn)(@bitCast(@as(f32, 10)), @bitCast(@as(f32, 3)));
     const result: f32 = @bitCast(result_bits);
     try std.testing.expectApproxEqAbs(@as(f32, 2.1), result, 0.000001);
+}
+
+test "x64_register_encoder executes bit-exact scalar XMM negation" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const float_insts = [_]Instruction{
+        .{ .neg_float = .{ .dest = 1, .src = 0 } },
+        .{ .return_ = .{ .src = 1 } },
+    };
+    var float_optimized = try optimizedMachine(std.testing.allocator, &float_insts);
+    defer float_optimized.deinit();
+    try std.testing.expectEqual(machine.FloatOperation.neg, float_optimized.machine.blocks[0].insts[0].float_op.?);
+    var float_native = try encode(std.testing.allocator, &float_optimized.machine);
+    defer float_native.deinit();
+    try std.testing.expectEqual(@as(u32, 1), float_native.stats.xmm_negations);
+    const float_bytes = try float_native.finalize();
+    defer std.testing.allocator.free(float_bytes);
+    var float_cache = jit_memory.Cache.init(std.testing.allocator);
+    defer float_cache.deinit();
+    const float_allocation = try float_cache.addBytes(float_bytes);
+    const FloatFn = fn (u32) callconv(.c) u32;
+    const negate_float = float_allocation.typedEntry(FloatFn);
+    try std.testing.expectEqual(@as(u32, 0x80000000), negate_float(0x00000000));
+    try std.testing.expectEqual(@as(u32, 0x00000000), negate_float(0x80000000));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -1.5))), negate_float(@bitCast(@as(f32, 1.5))));
+    try std.testing.expectEqual(@as(u32, 0xffc12345), negate_float(0x7fc12345));
+
+    const double_insts = [_]Instruction{
+        .{ .neg_double = .{ .dest = 2, .src = 0 } },
+        .{ .return_wide = .{ .src = 2 } },
+    };
+    var double_optimized = try optimizedMachine(std.testing.allocator, &double_insts);
+    defer double_optimized.deinit();
+    var double_native = try encode(std.testing.allocator, &double_optimized.machine);
+    defer double_native.deinit();
+    try std.testing.expectEqual(@as(u32, 1), double_native.stats.xmm_negations);
+    const double_bytes = try double_native.finalize();
+    defer std.testing.allocator.free(double_bytes);
+    var double_cache = jit_memory.Cache.init(std.testing.allocator);
+    defer double_cache.deinit();
+    const double_allocation = try double_cache.addBytes(double_bytes);
+    const DoubleFn = fn (u64, u64) callconv(.c) u64;
+    const negate_double = double_allocation.typedEntry(DoubleFn);
+    try std.testing.expectEqual(@as(u64, 0x8000000000000000), negate_double(0, 0));
+    try std.testing.expectEqual(@as(u64, 0), negate_double(0x8000000000000000, 0));
+    try std.testing.expectEqual(@as(u64, 0xfff8123456789abc), negate_double(0x7ff8123456789abc, 0));
+}
+
+const F32CompareCase = struct {
+    lhs: f32,
+    rhs: f32,
+    expected: i32,
+};
+
+fn expectF32Compare(insts: []const Instruction, operation: machine.FloatOperation, cases: []const F32CompareCase) !void {
+    var optimized = try optimizedMachine(std.testing.allocator, insts);
+    defer optimized.deinit();
+    try std.testing.expectEqual(operation, optimized.machine.blocks[0].insts[0].float_op.?);
+    var native = try encode(std.testing.allocator, &optimized.machine);
+    defer native.deinit();
+    try std.testing.expectEqual(@as(u32, 1), native.stats.xmm_comparisons);
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const allocation = try cache.addBytes(bytes);
+    const Fn = fn (u32, u32) callconv(.c) i32;
+    const compare = allocation.typedEntry(Fn);
+    for (cases) |case| try std.testing.expectEqual(case.expected, compare(@bitCast(case.lhs), @bitCast(case.rhs)));
+}
+
+test "x64_register_encoder executes Dalvik float compare NaN policy" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const nan = std.math.nan(f32);
+    const common_cases = [_]F32CompareCase{
+        .{ .lhs = -3, .rhs = 2, .expected = -1 },
+        .{ .lhs = 2, .rhs = 2, .expected = 0 },
+        .{ .lhs = 9, .rhs = 2, .expected = 1 },
+        .{ .lhs = -0.0, .rhs = 0.0, .expected = 0 },
+        .{ .lhs = -std.math.inf(f32), .rhs = std.math.inf(f32), .expected = -1 },
+    };
+    try expectF32Compare(&.{
+        .{ .cmpl_float = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
+        .{ .return_ = .{ .src = 2 } },
+    }, .compare_l, &common_cases);
+    try expectF32Compare(&.{
+        .{ .cmpg_float = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
+        .{ .return_ = .{ .src = 2 } },
+    }, .compare_g, &common_cases);
+    try expectF32Compare(&.{
+        .{ .cmpl_float = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
+        .{ .return_ = .{ .src = 2 } },
+    }, .compare_l, &.{
+        .{ .lhs = nan, .rhs = 1, .expected = -1 },
+        .{ .lhs = 1, .rhs = nan, .expected = -1 },
+    });
+    try expectF32Compare(&.{
+        .{ .cmpg_float = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
+        .{ .return_ = .{ .src = 2 } },
+    }, .compare_g, &.{
+        .{ .lhs = nan, .rhs = 1, .expected = 1 },
+        .{ .lhs = 1, .rhs = nan, .expected = 1 },
+    });
+}
+
+test "x64_register_encoder executes Dalvik double compare NaN policy" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .cmpg_double = .{ .dest = 4, .src1 = 0, .src2 = 2 } },
+        .{ .return_ = .{ .src = 4 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    try std.testing.expectEqual(machine.FloatOperation.compare_g, optimized.machine.blocks[0].insts[0].float_op.?);
+    var native = try encode(std.testing.allocator, &optimized.machine);
+    defer native.deinit();
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const allocation = try cache.addBytes(bytes);
+    const Fn = fn (u64, u64, u64, u64) callconv(.c) i32;
+    const compare = allocation.typedEntry(Fn);
+    try std.testing.expectEqual(@as(i32, -1), compare(@bitCast(@as(f64, -4.0)), 0, @bitCast(@as(f64, 7.0)), 0));
+    try std.testing.expectEqual(@as(i32, 0), compare(@bitCast(@as(f64, -0.0)), 0, @bitCast(@as(f64, 0.0)), 0));
+    try std.testing.expectEqual(@as(i32, 1), compare(@bitCast(std.math.nan(f64)), 0, @bitCast(@as(f64, 1.0)), 0));
+}
+
+test "x64_register_encoder compares through scalar XMM pressure and spills" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .add_float = .{ .dest = 7, .src1 = 0, .src2 = 1 } },
+        .{ .add_float = .{ .dest = 8, .src1 = 2, .src2 = 3 } },
+        .{ .add_float = .{ .dest = 9, .src1 = 4, .src2 = 5 } },
+        .{ .add_float = .{ .dest = 10, .src1 = 7, .src2 = 6 } },
+        .{ .cmpl_float = .{ .dest = 11, .src1 = 10, .src2 = 8 } },
+        .{ .return_ = .{ .src = 11 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    var native = try encode(std.testing.allocator, &optimized.machine);
+    defer native.deinit();
+    try std.testing.expect(native.allocation.stats.spills > 0);
+    try std.testing.expect(native.stats.xmm_spill_loads > 0);
+    try std.testing.expect(native.stats.xmm_spill_stores > 0);
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const allocation = try cache.addBytes(bytes);
+    const Fn = fn (u32, u32, u32, u32, u32, u32, u32) callconv(.c) i32;
+    const result = allocation.typedEntry(Fn)(
+        @bitCast(@as(f32, 1)),
+        @bitCast(@as(f32, 2)),
+        @bitCast(@as(f32, 3)),
+        @bitCast(@as(f32, 4)),
+        @bitCast(@as(f32, 5)),
+        @bitCast(@as(f32, 6)),
+        @bitCast(@as(f32, 7)),
+    );
+    try std.testing.expectEqual(@as(i32, 1), result);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, edgeEncodingFailureProbe, .{&optimized.machine});
+}
+
+test "x64_register_encoder converts signed integers to float and double" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const int_float_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .int_to_float = .{ .dest = 1, .src = 0 } },
+        .{ .return_ = .{ .src = 1 } },
+    });
+    const IntFloatFn = fn (i32) callconv(.c) u32;
+    const int_to_float = (try addOwnedTestBytes(&cache, int_float_bytes)).typedEntry(IntFloatFn);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatFromInt(std.math.minInt(i32))))), int_to_float(std.math.minInt(i32)));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatFromInt(std.math.maxInt(i32))))), int_to_float(std.math.maxInt(i32)));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatFromInt(@as(i32, 123456789))))), int_to_float(123456789));
+
+    const int_double_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .int_to_double = .{ .dest = 1, .src = 0 } },
+        .{ .return_wide = .{ .src = 1 } },
+    });
+    const IntDoubleFn = fn (i32) callconv(.c) u64;
+    const int_to_double = (try addOwnedTestBytes(&cache, int_double_bytes)).typedEntry(IntDoubleFn);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, @floatFromInt(std.math.minInt(i32))))), int_to_double(std.math.minInt(i32)));
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, @floatFromInt(std.math.maxInt(i32))))), int_to_double(std.math.maxInt(i32)));
+
+    const long_float_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .long_to_float = .{ .dest = 2, .src = 0 } },
+        .{ .return_ = .{ .src = 2 } },
+    });
+    const LongFloatFn = fn (i64, i64) callconv(.c) u32;
+    const long_to_float = (try addOwnedTestBytes(&cache, long_float_bytes)).typedEntry(LongFloatFn);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatFromInt(std.math.minInt(i64))))), long_to_float(std.math.minInt(i64), 0));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatFromInt(std.math.maxInt(i64))))), long_to_float(std.math.maxInt(i64), 0));
+
+    const long_double_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .long_to_double = .{ .dest = 2, .src = 0 } },
+        .{ .return_wide = .{ .src = 2 } },
+    });
+    const LongDoubleFn = fn (i64, i64) callconv(.c) u64;
+    const long_to_double = (try addOwnedTestBytes(&cache, long_double_bytes)).typedEntry(LongDoubleFn);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, @floatFromInt(std.math.maxInt(i64))))), long_to_double(std.math.maxInt(i64), 0));
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, @floatFromInt(std.math.minInt(i64))))), long_to_double(std.math.minInt(i64), 0));
+}
+
+test "x64_register_encoder changes scalar XMM precision" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const widen_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .float_to_double = .{ .dest = 1, .src = 0 } },
+        .{ .return_wide = .{ .src = 1 } },
+    });
+    const WidenFn = fn (u32) callconv(.c) u64;
+    const widen = (try addOwnedTestBytes(&cache, widen_bytes)).typedEntry(WidenFn);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, @floatCast(@as(f32, 1.25))))), widen(@bitCast(@as(f32, 1.25))));
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, -0.0))), widen(@bitCast(@as(f32, -0.0))));
+    try std.testing.expectEqual(@as(u64, @bitCast(std.math.inf(f64))), widen(@bitCast(std.math.inf(f32))));
+
+    const narrow_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .double_to_float = .{ .dest = 2, .src = 0 } },
+        .{ .return_ = .{ .src = 2 } },
+    });
+    const NarrowFn = fn (u64, u64) callconv(.c) u32;
+    const narrow = (try addOwnedTestBytes(&cache, narrow_bytes)).typedEntry(NarrowFn);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatCast(@as(f64, 1.25))))), narrow(@bitCast(@as(f64, 1.25)), 0));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -0.0))), narrow(@bitCast(@as(f64, -0.0)), 0));
+    try std.testing.expectEqual(@as(u32, @bitCast(std.math.inf(f32))), narrow(@bitCast(std.math.inf(f64)), 0));
+}
+
+test "x64_register_encoder saturates float and double integer conversions" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const float_int_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .float_to_int = .{ .dest = 1, .src = 0 } },
+        .{ .return_ = .{ .src = 1 } },
+    });
+    const FloatIntFn = fn (u32) callconv(.c) i32;
+    const float_to_int = (try addOwnedTestBytes(&cache, float_int_bytes)).typedEntry(FloatIntFn);
+    try std.testing.expectEqual(@as(i32, 0), float_to_int(@bitCast(std.math.nan(f32))));
+    try std.testing.expectEqual(std.math.maxInt(i32), float_to_int(@bitCast(std.math.inf(f32))));
+    try std.testing.expectEqual(std.math.minInt(i32), float_to_int(@bitCast(-std.math.inf(f32))));
+    try std.testing.expectEqual(std.math.maxInt(i32), float_to_int(@bitCast(@as(f32, @floatFromInt(std.math.maxInt(i32))))));
+    try std.testing.expectEqual(std.math.minInt(i32), float_to_int(@bitCast(@as(f32, @floatFromInt(std.math.minInt(i32))))));
+    try std.testing.expectEqual(@as(i32, 42), float_to_int(@bitCast(@as(f32, 42.875))));
+    try std.testing.expectEqual(@as(i32, -42), float_to_int(@bitCast(@as(f32, -42.875))));
+
+    const float_long_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .float_to_long = .{ .dest = 1, .src = 0 } },
+        .{ .return_wide = .{ .src = 1 } },
+    });
+    const FloatLongFn = fn (u32) callconv(.c) i64;
+    const float_to_long = (try addOwnedTestBytes(&cache, float_long_bytes)).typedEntry(FloatLongFn);
+    try std.testing.expectEqual(@as(i64, 0), float_to_long(@bitCast(std.math.nan(f32))));
+    try std.testing.expectEqual(std.math.maxInt(i64), float_to_long(@bitCast(std.math.inf(f32))));
+    try std.testing.expectEqual(std.math.minInt(i64), float_to_long(@bitCast(-std.math.inf(f32))));
+    try std.testing.expectEqual(std.math.maxInt(i64), float_to_long(@bitCast(@as(f32, @floatFromInt(std.math.maxInt(i64))))));
+    try std.testing.expectEqual(std.math.minInt(i64), float_to_long(@bitCast(@as(f32, @floatFromInt(std.math.minInt(i64))))));
+    try std.testing.expectEqual(@as(i64, 12345), float_to_long(@bitCast(@as(f32, 12345.75))));
+
+    const double_int_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .double_to_int = .{ .dest = 2, .src = 0 } },
+        .{ .return_ = .{ .src = 2 } },
+    });
+    const DoubleIntFn = fn (u64, u64) callconv(.c) i32;
+    const double_to_int = (try addOwnedTestBytes(&cache, double_int_bytes)).typedEntry(DoubleIntFn);
+    try std.testing.expectEqual(@as(i32, 0), double_to_int(@bitCast(std.math.nan(f64)), 0));
+    try std.testing.expectEqual(std.math.maxInt(i32), double_to_int(@bitCast(@as(f64, @floatFromInt(std.math.maxInt(i32))) + 1024.0), 0));
+    try std.testing.expectEqual(std.math.minInt(i32), double_to_int(@bitCast(@as(f64, @floatFromInt(std.math.minInt(i32))) - 1024.0), 0));
+    try std.testing.expectEqual(std.math.maxInt(i32), double_to_int(@bitCast(@as(f64, @floatFromInt(std.math.maxInt(i32)))), 0));
+    try std.testing.expectEqual(std.math.minInt(i32), double_to_int(@bitCast(@as(f64, @floatFromInt(std.math.minInt(i32)))), 0));
+    try std.testing.expectEqual(@as(i32, -42), double_to_int(@bitCast(@as(f64, -42.875)), 0));
+
+    const double_long_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .double_to_long = .{ .dest = 2, .src = 0 } },
+        .{ .return_wide = .{ .src = 2 } },
+    });
+    const DoubleLongFn = fn (u64, u64) callconv(.c) i64;
+    const double_to_long = (try addOwnedTestBytes(&cache, double_long_bytes)).typedEntry(DoubleLongFn);
+    try std.testing.expectEqual(@as(i64, 0), double_to_long(@bitCast(std.math.nan(f64)), 0));
+    try std.testing.expectEqual(std.math.maxInt(i64), double_to_long(@bitCast(std.math.inf(f64)), 0));
+    try std.testing.expectEqual(std.math.minInt(i64), double_to_long(@bitCast(-std.math.inf(f64)), 0));
+    try std.testing.expectEqual(std.math.maxInt(i64), double_to_long(@bitCast(@as(f64, @floatFromInt(std.math.maxInt(i64)))), 0));
+    try std.testing.expectEqual(std.math.minInt(i64), double_to_long(@bitCast(@as(f64, @floatFromInt(std.math.minInt(i64)))), 0));
+    try std.testing.expectEqual(@as(i64, 1234567890123), double_to_long(@bitCast(@as(f64, 1234567890123.75)), 0));
+}
+
+test "x64_register_encoder converts through scalar XMM pressure and spills" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .add_float = .{ .dest = 7, .src1 = 0, .src2 = 1 } },
+        .{ .add_float = .{ .dest = 8, .src1 = 2, .src2 = 3 } },
+        .{ .add_float = .{ .dest = 9, .src1 = 4, .src2 = 5 } },
+        .{ .add_float = .{ .dest = 10, .src1 = 7, .src2 = 6 } },
+        .{ .float_to_int = .{ .dest = 11, .src = 10 } },
+        .{ .return_ = .{ .src = 11 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    var native = try encode(std.testing.allocator, &optimized.machine);
+    defer native.deinit();
+    try std.testing.expect(native.allocation.stats.spills > 0);
+    try std.testing.expect(native.stats.xmm_spill_loads > 0);
+    try std.testing.expect(native.stats.xmm_spill_stores > 0);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.xmm_saturating_conversions);
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const allocation = try cache.addBytes(bytes);
+    const Fn = fn (u32, u32, u32, u32, u32, u32, u32) callconv(.c) i32;
+    const result = allocation.typedEntry(Fn)(
+        @bitCast(@as(f32, 1)),
+        @bitCast(@as(f32, 2)),
+        @bitCast(@as(f32, 3)),
+        @bitCast(@as(f32, 4)),
+        @bitCast(@as(f32, 5)),
+        @bitCast(@as(f32, 6)),
+        @bitCast(@as(f32, 7)),
+    );
+    try std.testing.expectEqual(@as(i32, 10), result);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, edgeEncodingFailureProbe, .{&optimized.machine});
 }
 
 test "x64_register_encoder executes scalar double constants and arithmetic" {
@@ -4262,7 +4978,7 @@ test "x64 compiler translates deoptimization values after register allocation" {
         .deopt = .{ .points = &duplicate_points, .register_count = 3, .max_dex_pc = 2 },
     }));
 
-    var allocation = try regalloc.allocate(std.testing.allocator, &optimized.machine, .{ .gp_registers = &RESOLVER_GP_REGS });
+    var allocation = try regalloc.allocate(std.testing.allocator, &optimized.machine, .{ .gp_registers = allGpRegisters() });
     defer allocation.deinit();
     try ensureNoSpills(&allocation);
     var spill_plan = try regalloc.planSpills(std.testing.allocator, &allocation);
@@ -4548,11 +5264,12 @@ test "x64 compiler publishes a frameful OSR landing stub" {
     const bytes = try native.finalize();
     defer std.testing.allocator.free(bytes);
     try std.testing.expect(entry.code_offset < bytes.len);
-    if (builtin.os.tag == .windows) {
+    if (builtin.os.tag == .windows and native.stats.nonvolatile_frame_bytes != 0) {
         try std.testing.expectEqual(@as(u8, 0x56), bytes[entry.code_offset]); // push rsi
         try std.testing.expectEqual(@as(u8, 0x57), bytes[entry.code_offset + 1]); // push rdi
     } else {
-        try std.testing.expectEqualSlices(&.{ 0x48, 0x83 }, bytes[entry.code_offset..][0..2]);
+        try std.testing.expectEqual(@as(u8, 0x48), bytes[entry.code_offset]);
+        try std.testing.expect(bytes[entry.code_offset + 1] == 0x83 or bytes[entry.code_offset + 1] == 0x81);
     }
 }
 
@@ -4844,7 +5561,7 @@ test "x64 root liveness translates live phi destinations on predecessor edges" {
     try std.testing.expectEqual(@as(usize, 2), optimized.machine.edges.len);
     try std.testing.expectEqual(@as(u32, 4), optimized.machine.stats.resolves);
 
-    var allocation = try regalloc.allocate(std.testing.allocator, &optimized.machine, .{ .gp_registers = &RESOLVER_GP_REGS });
+    var allocation = try regalloc.allocate(std.testing.allocator, &optimized.machine, .{ .gp_registers = allGpRegisters() });
     defer allocation.deinit();
     try ensureNoSpills(&allocation);
     var spill_plan = try regalloc.planSpills(std.testing.allocator, &allocation);

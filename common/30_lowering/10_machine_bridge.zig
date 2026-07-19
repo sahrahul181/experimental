@@ -36,6 +36,7 @@ pub const VerifyError = error{
 pub const RegId = u32;
 pub const INVALID_REG: RegId = std.math.maxInt(RegId);
 pub const FloatOperation = lowering.FloatOperation;
+pub const ValueType = typedir.Type;
 
 pub const Opcode = enum(u8) {
     mov,
@@ -582,7 +583,7 @@ fn updateStats(inst: Inst, stats: *Stats) void {
     if (inst.flags.cse) stats.cse += 1;
 }
 
-fn setScalarXmmType(reg_types: []typedir.Type, reg: RegId, ty: typedir.Type) Error!void {
+fn setMachineType(reg_types: []typedir.Type, reg: RegId, ty: typedir.Type) Error!void {
     if (reg >= reg_types.len) return error.InvalidLowering;
     const current = reg_types[reg];
     if (current == ty) return;
@@ -603,17 +604,61 @@ fn setScalarXmmType(reg_types: []typedir.Type, reg: RegId, ty: typedir.Type) Err
 fn refineScalarXmmTypes(reg_types: []typedir.Type, source: *const lowering.Function) Error!void {
     for (source.blocks) |block| for (block.insts) |inst| {
         const operation = inst.float_op orelse continue;
-        switch (operation) {
-            .add, .sub, .mul, .div, .rem, .neg => {},
-            else => continue,
-        }
         const ty: typedir.Type = switch (inst.kind) {
             .f32_op => .float,
             .f64_op => .double,
             else => return error.InvalidLowering,
         };
-        for (inst.defs) |reg| try setScalarXmmType(reg_types, reg, ty);
-        for (inst.uses) |reg| try setScalarXmmType(reg_types, reg, ty);
+        switch (operation) {
+            .add, .sub, .mul, .div, .rem, .neg => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, ty);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, ty);
+            },
+            .compare_l, .compare_g => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .int);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, ty);
+            },
+            .int_to_float => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .float);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .int);
+            },
+            .int_to_double => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .double);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .int);
+            },
+            .long_to_float => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .float);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .long);
+            },
+            .long_to_double => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .double);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .long);
+            },
+            .float_to_int => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .int);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .float);
+            },
+            .float_to_long => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .long);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .float);
+            },
+            .float_to_double => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .double);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .float);
+            },
+            .double_to_int => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .int);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .double);
+            },
+            .double_to_long => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .long);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .double);
+            },
+            .double_to_float => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .float);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .double);
+            },
+        }
     };
 }
 

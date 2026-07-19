@@ -829,6 +829,40 @@ fn floatOperation(inst: Instruction) ?FloatOperation {
     };
 }
 
+fn floatKind(inst: Instruction) ?Kind {
+    return switch (inst) {
+        .add_float,
+        .sub_float,
+        .mul_float,
+        .div_float,
+        .rem_float,
+        .neg_float,
+        .cmpl_float,
+        .cmpg_float,
+        .int_to_float,
+        .long_to_float,
+        .float_to_int,
+        .float_to_long,
+        .float_to_double,
+        => .f32_op,
+        .add_double,
+        .sub_double,
+        .mul_double,
+        .div_double,
+        .rem_double,
+        .neg_double,
+        .cmpl_double,
+        .cmpg_double,
+        .int_to_double,
+        .long_to_double,
+        .double_to_int,
+        .double_to_long,
+        .double_to_float,
+        => .f64_op,
+        else => null,
+    };
+}
+
 fn arithmeticImmediate(inst: Instruction) i64 {
     return switch (inst) {
         .add_int_lit8,
@@ -1110,12 +1144,13 @@ fn lowerOperation(
             }
         },
         else => {
-            const kind = lowerArithmetic(op.inst, tinfo.lowering);
+            const float_op = floatOperation(op.inst);
+            const kind = floatKind(op.inst) orelse lowerArithmetic(op.inst, tinfo.lowering);
             try appendInst(list, allocator, try ownOperands(allocator, .{
                 .kind = kind,
                 .pc = op.pc,
                 .imm = arithmeticImmediate(op.inst),
-                .float_op = if (kind == .f32_op or kind == .f64_op) floatOperation(op.inst) else null,
+                .float_op = float_op,
                 .field_idx = fieldIndex(op.inst),
                 .flags = flags,
             }, op.defs, op.uses), stats);
