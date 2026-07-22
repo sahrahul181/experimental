@@ -64,6 +64,10 @@ pub fn allocateDefault(allocator: std.mem.Allocator, function: *const machine.Fu
     return allocate(allocator, function, .{});
 }
 
+pub fn planSpills(allocator: std.mem.Allocator, allocation: *const Allocation) Error!SpillPlan {
+    return spill_rewrite.build(allocator, allocation);
+}
+
 pub fn build(allocator: std.mem.Allocator, function: *const machine.Function, options: Options) Error!Result {
     var allocation = try linear_scan.allocate(allocator, function, options);
     errdefer allocation.deinit();

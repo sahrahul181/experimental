@@ -366,11 +366,7 @@ fn collectUsesDefs(allocator: std.mem.Allocator, inst: Instruction, uses: *std.A
         .not_int,
         .neg_float,
         .int_to_float,
-        .int_to_double,
         .float_to_int,
-        .float_to_double,
-        .double_to_int,
-        .double_to_float,
         .int_to_byte,
         .int_to_char,
         .int_to_short,
@@ -378,7 +374,7 @@ fn collectUsesDefs(allocator: std.mem.Allocator, inst: Instruction, uses: *std.A
             try appendReg(uses, allocator, op.src);
             try appendReg(defs, allocator, op.dest);
         },
-        .int_to_long, .float_to_long => |op| {
+        .int_to_long, .int_to_double, .float_to_long, .float_to_double => |op| {
             try appendReg(uses, allocator, op.src);
             try appendWide(defs, allocator, op.dest);
         },
@@ -388,10 +384,12 @@ fn collectUsesDefs(allocator: std.mem.Allocator, inst: Instruction, uses: *std.A
         .long_to_int,
         .long_to_float,
         .long_to_double,
+        .double_to_int,
         .double_to_long,
+        .double_to_float,
         => |op| {
             try appendWide(uses, allocator, op.src);
-            if (inst == .long_to_int or inst == .long_to_float) {
+            if (inst == .long_to_int or inst == .long_to_float or inst == .double_to_int or inst == .double_to_float) {
                 try appendReg(defs, allocator, op.dest);
             } else {
                 try appendWide(defs, allocator, op.dest);
@@ -855,6 +853,32 @@ test "ssa tracks wide register slots" {
     try std.testing.expectEqual(@as(usize, 2), block.ops[2].defs.len);
     try std.testing.expectEqual(block.ops[2].defs[0], block.ops[3].uses[0]);
     try std.testing.expectEqual(block.ops[2].defs[1], block.ops[3].uses[1]);
+}
+
+test "ssa gives scalar double conversions canonical wide pairs" {
+    const insts = [_]Instruction{
+        .{ .int_to_double = .{ .dest = 4, .src = 0 } },
+        .{ .double_to_int = .{ .dest = 6, .src = 4 } },
+        .{ .float_to_double = .{ .dest = 7, .src = 1 } },
+        .{ .double_to_float = .{ .dest = 9, .src = 7 } },
+        .{ .return_ = .{ .src = 9 } },
+    };
+    var graph = try cfg.build(std.testing.allocator, &insts);
+    defer graph.deinit();
+    var tree = try dom.build(std.testing.allocator, &graph);
+    defer tree.deinit();
+    var function = try build(std.testing.allocator, &graph, &tree);
+    defer function.deinit();
+
+    const block = function.blocks[graph.entry];
+    try std.testing.expectEqual(@as(usize, 1), block.ops[0].uses.len);
+    try std.testing.expectEqual(@as(usize, 2), block.ops[0].defs.len);
+    try std.testing.expectEqual(@as(usize, 2), block.ops[1].uses.len);
+    try std.testing.expectEqual(@as(usize, 1), block.ops[1].defs.len);
+    try std.testing.expectEqual(@as(usize, 1), block.ops[2].uses.len);
+    try std.testing.expectEqual(@as(usize, 2), block.ops[2].defs.len);
+    try std.testing.expectEqual(@as(usize, 2), block.ops[3].uses.len);
+    try std.testing.expectEqual(@as(usize, 1), block.ops[3].defs.len);
 }
 
 test "ssa creates parameter values for live-in registers" {

@@ -96,6 +96,8 @@ pub const Kind = enum(u8) {
     call_static,
     call_virtual,
     call_quick,
+    monitor_enter,
+    monitor_exit,
     branch,
     cond_branch,
     switch_,
@@ -103,6 +105,30 @@ pub const Kind = enum(u8) {
     throw_,
     memory_barrier,
     unsupported,
+};
+
+/// Preserves the bytecode operation after type-directed lowering selects the
+/// scalar SSE lane width. Unsupported operations remain explicit so a backend
+/// can fail closed instead of silently choosing the wrong floating semantics.
+pub const FloatOperation = enum(u8) {
+    add,
+    sub,
+    mul,
+    div,
+    rem,
+    neg,
+    compare_l,
+    compare_g,
+    int_to_float,
+    int_to_double,
+    long_to_float,
+    long_to_double,
+    float_to_int,
+    float_to_long,
+    float_to_double,
+    double_to_int,
+    double_to_long,
+    double_to_float,
 };
 
 pub const Flags = packed struct {
@@ -121,6 +147,7 @@ pub const Inst = struct {
     target: ?cfg.BlockId = null,
     false_target: ?cfg.BlockId = null,
     imm: i64 = 0,
+    float_op: ?FloatOperation = null,
     field_idx: ?u32 = null,
     address: ?RuntimeValueId = null,
     state_handle: ?RuntimeValueId = null,
@@ -128,6 +155,7 @@ pub const Inst = struct {
     resolve_id: ?barrier_phase.ResolveId = null,
     guard_site_id: ?u32 = null,
     exception_site_id: ?u32 = null,
+    monitor_site_id: ?u32 = null,
     pre_write: barrier_phase.PreWriteBarrier = .none,
     post_write: barrier_phase.PostWriteBarrier = .none,
     flags: Flags = .{},
@@ -159,6 +187,7 @@ pub const Stats = struct {
     handle_resolves: u32 = 0,
     loop_epoch_guards: u32 = 0,
     bounds_exception_sites: u32 = 0,
+    monitor_sites: u32 = 0,
     pointer_accesses: u32 = 0,
     satb_barriers: u32 = 0,
     card_barriers: u32 = 0,
@@ -217,15 +246,17 @@ pub const Function = struct {
         } else if (self.resolve_values.len != 0 or self.runtime_values.len != self.source.values.len) {
             return error.InvalidInput;
         }
-        const exception_site_base: u32 = if (self.barriers) |barriers|
+        const monitor_site_base: u32 = if (self.barriers) |barriers|
             std.math.add(u32, @intCast(barriers.resolves.len), barriers.stats.loop_epoch_guards) catch return error.BadInstruction
         else
             0;
+        const exception_site_base = std.math.add(u32, monitor_site_base, self.stats.monitor_sites) catch return error.BadInstruction;
         const loop_guard_count: u32 = if (self.barriers) |barriers| barriers.stats.loop_epoch_guards else 0;
         const loop_guard_seen = try self.allocator.alloc(bool, loop_guard_count);
         defer self.allocator.free(loop_guard_seen);
         @memset(loop_guard_seen, false);
         var verified_exception_sites: u32 = 0;
+        var verified_monitor_sites: u32 = 0;
         for (self.blocks, 0..) |block, i| {
             if (block.id != i) return error.BadBlock;
             for (block.insts) |inst| {
@@ -251,13 +282,19 @@ pub const Function = struct {
                     },
                     .check_bounds, .field_load_ptr, .field_store_ptr, .array_load_ptr, .array_store_ptr, .satb_pre_write, .card_mark => if (inst.address != null) try self.verifyAddress(inst),
                     .call_direct, .call_static, .call_virtual, .call_quick => if (inst.address != null) try self.verifyAddress(inst),
+                    .monitor_enter, .monitor_exit => {
+                        if (inst.address != null or inst.state_handle == null or inst.reloc_token != null or inst.resolve_id != null or
+                            !self.isGcRoot(inst.state_handle.?)) return error.BadInstruction;
+                    },
                     else => {},
                 }
+                if ((inst.kind == .f32_op or inst.kind == .f64_op) != (inst.float_op != null)) return error.BadInstruction;
                 for (inst.uses) |use| switch (self.runtime_values[use]) {
                     .dalvik => {},
                     .derived_ptr => return error.BadInstruction,
                 };
-                if (inst.address == null and inst.state_handle != null and inst.kind != .resolve_handle) return error.BadInstruction;
+                if (inst.address == null and inst.state_handle != null and inst.kind != .resolve_handle and
+                    inst.kind != .monitor_enter and inst.kind != .monitor_exit) return error.BadInstruction;
                 const permits_address = switch (inst.kind) {
                     .field_load_ptr,
                     .field_store_ptr,
@@ -277,6 +314,14 @@ pub const Function = struct {
                 if (inst.address != null and !permits_address) return error.BadInstruction;
                 if (inst.address == null and inst.kind != .resolve_handle and (inst.reloc_token != null or inst.resolve_id != null)) return error.BadInstruction;
                 if ((inst.kind == .loop_epoch_guard) != (inst.guard_site_id != null)) return error.BadInstruction;
+                const is_monitor = inst.kind == .monitor_enter or inst.kind == .monitor_exit;
+                if (is_monitor != (inst.monitor_site_id != null)) return error.BadInstruction;
+                if (is_monitor) {
+                    const expected = std.math.add(u32, monitor_site_base, verified_monitor_sites) catch return error.BadInstruction;
+                    if (inst.monitor_site_id.? != expected or inst.defs.len != 0 or inst.uses.len != 1 or
+                        inst.state_handle == null or inst.uses[0] != inst.state_handle.?) return error.BadInstruction;
+                    verified_monitor_sites += 1;
+                }
                 const is_mapped_bounds = inst.kind == .check_bounds and inst.address != null;
                 if (is_mapped_bounds != (inst.exception_site_id != null)) return error.BadInstruction;
                 if (is_mapped_bounds) {
@@ -299,6 +344,7 @@ pub const Function = struct {
         for (loop_guard_seen) |seen| if (!seen) return error.BadInstruction;
         if (loop_guard_count != self.stats.loop_epoch_guards) return error.BadInstruction;
         if (verified_exception_sites != self.stats.bounds_exception_sites) return error.BadInstruction;
+        if (verified_monitor_sites != self.stats.monitor_sites) return error.BadInstruction;
     }
 
     fn verifyResolve(self: *const Function, inst: Inst) VerifyError!void {
@@ -779,6 +825,64 @@ fn lowerArithmetic(inst: Instruction, choice: typed_ir.LoweringChoice) Kind {
     };
 }
 
+fn floatOperation(inst: Instruction) ?FloatOperation {
+    return switch (inst) {
+        .add_float, .add_double => .add,
+        .sub_float, .sub_double => .sub,
+        .mul_float, .mul_double => .mul,
+        .div_float, .div_double => .div,
+        .rem_float, .rem_double => .rem,
+        .neg_float, .neg_double => .neg,
+        .cmpl_float, .cmpl_double => .compare_l,
+        .cmpg_float, .cmpg_double => .compare_g,
+        .int_to_float => .int_to_float,
+        .int_to_double => .int_to_double,
+        .long_to_float => .long_to_float,
+        .long_to_double => .long_to_double,
+        .float_to_int => .float_to_int,
+        .float_to_long => .float_to_long,
+        .float_to_double => .float_to_double,
+        .double_to_int => .double_to_int,
+        .double_to_long => .double_to_long,
+        .double_to_float => .double_to_float,
+        else => null,
+    };
+}
+
+fn floatKind(inst: Instruction) ?Kind {
+    return switch (inst) {
+        .add_float,
+        .sub_float,
+        .mul_float,
+        .div_float,
+        .rem_float,
+        .neg_float,
+        .cmpl_float,
+        .cmpg_float,
+        .int_to_float,
+        .long_to_float,
+        .float_to_int,
+        .float_to_long,
+        .float_to_double,
+        => .f32_op,
+        .add_double,
+        .sub_double,
+        .mul_double,
+        .div_double,
+        .rem_double,
+        .neg_double,
+        .cmpl_double,
+        .cmpg_double,
+        .int_to_double,
+        .long_to_double,
+        .double_to_int,
+        .double_to_long,
+        .double_to_float,
+        => .f64_op,
+        else => null,
+    };
+}
+
 fn arithmeticImmediate(inst: Instruction) i64 {
     return switch (inst) {
         .add_int_lit8,
@@ -823,7 +927,30 @@ fn lowerCallKind(inst: Instruction, info: typed_ir.OpInfo) Kind {
     };
 }
 
-fn nextBoundsExceptionSite(inputs: Inputs, cursor: *u32) !u32 {
+fn nextBoundsExceptionSite(inputs: Inputs, monitor_count: u32, cursor: *u32) !u32 {
+    const barriers = inputs.barriers orelse return error.InvalidInput;
+    const resolve_and_guards = std.math.add(u32, @intCast(barriers.resolves.len), barriers.stats.loop_epoch_guards) catch return error.InvalidInput;
+    const base = std.math.add(u32, resolve_and_guards, monitor_count) catch return error.InvalidInput;
+    const site = std.math.add(u32, base, cursor.*) catch return error.InvalidInput;
+    cursor.* = std.math.add(u32, cursor.*, 1) catch return error.InvalidInput;
+    return site;
+}
+
+fn countMonitorSites(inputs: Inputs) !u32 {
+    var count: u32 = 0;
+    for (inputs.function.blocks) |block| {
+        for (block.ops, 0..) |op, op_index| {
+            if (opDead(inputs, block.id, op_index)) continue;
+            switch (op.inst) {
+                .monitor_enter, .monitor_exit => count = std.math.add(u32, count, 1) catch return error.InvalidInput,
+                else => {},
+            }
+        }
+    }
+    return count;
+}
+
+fn nextMonitorSite(inputs: Inputs, cursor: *u32) !u32 {
     const barriers = inputs.barriers orelse return error.InvalidInput;
     const base = std.math.add(u32, @intCast(barriers.resolves.len), barriers.stats.loop_epoch_guards) catch return error.InvalidInput;
     const site = std.math.add(u32, base, cursor.*) catch return error.InvalidInput;
@@ -840,6 +967,8 @@ fn lowerOperation(
     list: *std.ArrayList(Inst),
     stats: *Stats,
     bounds_exception_cursor: *u32,
+    monitor_cursor: *u32,
+    monitor_count: u32,
 ) !void {
     if (opDead(inputs, block_id, op_index)) {
         stats.skipped_dead += 1;
@@ -920,7 +1049,7 @@ fn lowerOperation(
             if (access) |state| {
                 try emitResolve(allocator, state, op.pc, list, stats);
                 if (!flags.bounds_check_elided) {
-                    const exception_site = try nextBoundsExceptionSite(inputs, bounds_exception_cursor);
+                    const exception_site = try nextBoundsExceptionSite(inputs, monitor_count, bounds_exception_cursor);
                     try appendInst(list, allocator, .{
                         .kind = .check_bounds,
                         .pc = op.pc,
@@ -955,7 +1084,7 @@ fn lowerOperation(
             if (access) |state| {
                 try emitResolve(allocator, state, op.pc, list, stats);
                 if (!flags.bounds_check_elided) {
-                    const exception_site = try nextBoundsExceptionSite(inputs, bounds_exception_cursor);
+                    const exception_site = try nextBoundsExceptionSite(inputs, monitor_count, bounds_exception_cursor);
                     try appendInst(list, allocator, .{
                         .kind = .check_bounds,
                         .pc = op.pc,
@@ -1059,12 +1188,31 @@ fn lowerOperation(
                 try appendInst(list, allocator, try ownOperands(allocator, .{ .kind = kind, .pc = op.pc, .flags = flags }, op.defs, op.uses), stats);
             }
         },
+        .monitor_enter, .monitor_exit => {
+            if (op.uses.len != 1) return error.InvalidInput;
+            const barriers = inputs.barriers orelse return error.InvalidInput;
+            const raw_handle = op.uses[0];
+            if (raw_handle >= barriers.canonical_handles.len) return error.InvalidInput;
+            const handle = barriers.canonical_handles[raw_handle];
+            const site = try nextMonitorSite(inputs, monitor_cursor);
+            try appendInst(list, allocator, .{
+                .kind = if (op.inst == .monitor_enter) .monitor_enter else .monitor_exit,
+                .pc = op.pc,
+                .uses = try dupeValues(allocator, &[_]RuntimeValueId{handle}),
+                .state_handle = handle,
+                .monitor_site_id = site,
+                .flags = flags,
+            }, stats);
+            stats.monitor_sites += 1;
+        },
         else => {
-            const kind = lowerArithmetic(op.inst, tinfo.lowering);
+            const float_op = floatOperation(op.inst);
+            const kind = floatKind(op.inst) orelse lowerArithmetic(op.inst, tinfo.lowering);
             try appendInst(list, allocator, try ownOperands(allocator, .{
                 .kind = kind,
                 .pc = op.pc,
                 .imm = arithmeticImmediate(op.inst),
+                .float_op = float_op,
                 .field_idx = fieldIndex(op.inst),
                 .flags = flags,
             }, op.defs, op.uses), stats);
@@ -1129,6 +1277,17 @@ pub fn build(allocator: std.mem.Allocator, inputs: Inputs) Error!Function {
                     .derived_ptr => return error.InvalidInput,
                 }
             },
+            .monitor_enter, .monitor_exit => {
+                if (op.uses.len != 1) return error.InvalidInput;
+                const raw = op.uses[0];
+                if (raw >= inputs.function.values.len) return error.InvalidInput;
+                const canonical = if (inputs.barriers) |barriers| barriers.canonical_handles[raw] else raw;
+                if (canonical >= inputs.function.values.len) return error.InvalidInput;
+                switch (runtime_values[canonical]) {
+                    .dalvik => |*handle| handle.gc_root = true,
+                    .derived_ptr => return error.InvalidInput,
+                }
+            },
             else => {},
         };
     }
@@ -1165,6 +1324,8 @@ pub fn build(allocator: std.mem.Allocator, inputs: Inputs) Error!Function {
 
     var stats: Stats = .{ .runtime_values = @intCast(runtime_value_count) };
     var bounds_exception_cursor: u32 = 0;
+    var monitor_cursor: u32 = 0;
+    const expected_monitor_sites = try countMonitorSites(inputs);
     for (inputs.function.blocks, 0..) |block, block_i| {
         var list: std.ArrayList(Inst) = .empty;
         errdefer {
@@ -1189,7 +1350,7 @@ pub fn build(allocator: std.mem.Allocator, inputs: Inputs) Error!Function {
                 try emitLoopEpochGuards(allocator, inputs, @intCast(block_i), &list, &stats);
                 emitted_hoists = true;
             }
-            try lowerOperation(allocator, inputs, @intCast(block_i), op_i, op, &list, &stats, &bounds_exception_cursor);
+            try lowerOperation(allocator, inputs, @intCast(block_i), op_i, op, &list, &stats, &bounds_exception_cursor, &monitor_cursor, expected_monitor_sites);
         }
         if (!emitted_hoists) {
             try emitHoistedResolves(allocator, inputs, @intCast(block_i), &list, &stats);
@@ -1200,6 +1361,7 @@ pub fn build(allocator: std.mem.Allocator, inputs: Inputs) Error!Function {
         built_blocks += 1;
     }
     if (bounds_exception_cursor != stats.bounds_exception_sites) return error.InvalidInput;
+    if (monitor_cursor != stats.monitor_sites or monitor_cursor != expected_monitor_sites) return error.InvalidInput;
 
     return .{
         .allocator = allocator,

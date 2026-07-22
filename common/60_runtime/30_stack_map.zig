@@ -72,6 +72,7 @@ pub const Record = struct {
 };
 
 pub const Error = error{
+    DuplicateRequiredSafepoint,
     DuplicateLocation,
     EmptyTable,
     InvalidFlags,
@@ -79,6 +80,7 @@ pub const Error = error{
     InvalidStackAlignment,
     MissingSafepoint,
     OutOfBounds,
+    UnexpectedSafepoint,
     TooManyLocations,
     UnsortedSafepoints,
 };
@@ -139,6 +141,20 @@ pub const Table = struct {
         };
     }
 
+    /// Constructs a table and transactionally proves exact coverage of the
+    /// caller's sorted reachable-CFG safepoint manifest.
+    pub fn initCovered(
+        allocator: std.mem.Allocator,
+        specs: []const MapSpec,
+        required_sites: []const u32,
+        options: ValidationOptions,
+    ) (Error || std.mem.Allocator.Error)!Table {
+        var table = try init(allocator, specs, options);
+        errdefer table.deinit();
+        try table.verifyCoverage(required_sites);
+        return table;
+    }
+
     pub fn deinit(self: *Table) void {
         self.allocator.free(self.locations);
         self.allocator.free(self.records);
@@ -160,6 +176,27 @@ pub const Table = struct {
             }
         }
         return error.MissingSafepoint;
+    }
+
+    /// Rejects both missing maps and orphan maps. Required ids must be strictly
+    /// increasing, matching the dense manifest proven from reachable machine
+    /// blocks; comparison is linear and allocation-free.
+    pub fn verifyCoverage(self: *const Table, required_sites: []const u32) Error!void {
+        for (required_sites, 0..) |site, index| {
+            if (index != 0 and required_sites[index - 1] >= site) return error.DuplicateRequiredSafepoint;
+        }
+        var required_index: usize = 0;
+        var record_index: usize = 0;
+        while (required_index < required_sites.len and record_index < self.records.len) {
+            const required = required_sites[required_index];
+            const actual = self.records[record_index].pc_offset;
+            if (actual < required) return error.UnexpectedSafepoint;
+            if (actual > required) return error.MissingSafepoint;
+            required_index += 1;
+            record_index += 1;
+        }
+        if (required_index != required_sites.len) return error.MissingSafepoint;
+        if (record_index != self.records.len) return error.UnexpectedSafepoint;
     }
 
     pub fn rootsFor(self: *const Table, record: *const Record) []const RootLocation {
@@ -285,6 +322,70 @@ test "table validates and performs exact binary lookup" {
     try std.testing.expectError(error.MissingSafepoint, table.find(43));
 }
 
+test "covered table rejects missing orphan and duplicate CFG sites" {
+    const empty_roots = [_]RootLocation{};
+    const specs = [_]MapSpec{
+        .{ .pc_offset = 2, .roots = &empty_roots },
+        .{ .pc_offset = 5, .roots = &empty_roots },
+        .{ .pc_offset = 9, .roots = &empty_roots },
+    };
+    var table = try Table.initCovered(std.testing.allocator, &specs, &.{ 2, 5, 9 }, test_options);
+    defer table.deinit();
+    try table.verifyCoverage(&.{ 2, 5, 9 });
+    try std.testing.expectError(error.MissingSafepoint, table.verifyCoverage(&.{ 2, 4, 5, 9 }));
+    try std.testing.expectError(error.UnexpectedSafepoint, table.verifyCoverage(&.{ 2, 9 }));
+    try std.testing.expectError(error.DuplicateRequiredSafepoint, table.verifyCoverage(&.{ 2, 5, 5, 9 }));
+
+    try std.testing.expectError(
+        error.MissingSafepoint,
+        Table.initCovered(std.testing.allocator, &specs, &.{ 2, 4, 5, 9 }, test_options),
+    );
+}
+
+test "covered table supports concurrent allocation-free verification and lookup" {
+    const roots = [_]RootLocation{RootLocation.nativeRegister(1)};
+    const specs = [_]MapSpec{
+        .{ .pc_offset = 1, .roots = &roots },
+        .{ .pc_offset = 3, .roots = &roots },
+        .{ .pc_offset = 7, .roots = &roots },
+    };
+    const required = [_]u32{ 1, 3, 7 };
+    var table = try Table.initCovered(std.testing.allocator, &specs, &required, test_options);
+    defer table.deinit();
+    var failed = std.atomic.Value(bool).init(false);
+
+    const Worker = struct {
+        table: *const Table,
+        required: []const u32,
+        failed: *std.atomic.Value(bool),
+
+        fn run(self: *@This()) void {
+            for (0..10_000) |_| {
+                self.table.verifyCoverage(self.required) catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+                const record = self.table.find(3) catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+                if (self.table.rootsFor(record).len != 1) {
+                    self.failed.store(true, .release);
+                    return;
+                }
+            }
+        }
+    };
+    var workers: [4]Worker = undefined;
+    var threads: [4]std.Thread = undefined;
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{ .table = &table, .required = &required, .failed = &failed };
+        thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
+    }
+    for (threads) |thread| thread.join();
+    try std.testing.expect(!failed.load(.acquire));
+}
+
 test "table rejects ambiguity and malformed locations" {
     const duplicate = [_]RootLocation{
         RootLocation.nativeRegister(1),
@@ -359,7 +460,7 @@ fn allocationFailureInit(allocator: std.mem.Allocator) !void {
         RootLocation.stackSlot(0),
     };
     const specs = [_]MapSpec{.{ .pc_offset = 1, .roots = &roots }};
-    var table = try Table.init(allocator, &specs, test_options);
+    var table = try Table.initCovered(allocator, &specs, &.{1}, test_options);
     defer table.deinit();
 }
 

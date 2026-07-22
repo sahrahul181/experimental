@@ -903,6 +903,31 @@ pub const ConcurrentCollector = struct {
         return self.handles;
     }
 
+    /// Confirms that a runtime allocator's variable reference payload agrees
+    /// with the collector's immutable scanner metadata.
+    pub fn supportsTrailingReferenceLayout(
+        self: *const ConcurrentCollector,
+        layout_id: u32,
+        data_offset: u32,
+        element_stride: u32,
+    ) bool {
+        const layout = self.findLayout(layout_id) orelse return false;
+        const trailing = layout.trailing_references orelse return false;
+        return layout.minimum_size == data_offset and
+            trailing.offset == data_offset and
+            trailing.stride == element_stride;
+    }
+
+    /// Validates the immutable mutator binding consumed by interpreter/JIT
+    /// poll adapters. The owner-local buffer cursor remains private.
+    pub fn ownsThreadBuffer(
+        self: *const ConcurrentCollector,
+        buffer: *const SatbBuffer,
+        context: *const thread_registry.ThreadContext,
+    ) bool {
+        return buffer.collector == self and buffer.thread_context == context;
+    }
+
     pub fn isStaticRootSlot(self: *const ConcurrentCollector, slot_address: usize) bool {
         var low: usize = 0;
         var high = self.static_root_slots.len;

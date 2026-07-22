@@ -1,9 +1,9 @@
 //! Register-allocated x86-64 encoder.
 //!
-//! This backend emits a no-frame native subset from the register-machine IR
-//! after physical register allocation. It has no stack-slot traffic on the
-//! supported path; if allocation spills or an operation is outside the native
-//! register subset, it fails explicitly.
+//! This backend emits a register-allocated native subset from the
+//! register-machine IR. Spill slots live in one deterministic, 16-byte-aligned
+//! managed frame addressed from rsp. Operations whose private runtime ABI does
+//! not yet have a proven spill-scratch policy continue to fail explicitly.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -26,7 +26,9 @@ pub const Error = code_buffer.Error || regalloc.Error || runtime_stack_map.Error
     InvalidDeoptMetadata,
     InvalidRuntimeAbi,
     MissingBarrierHelper,
+    MissingNumericHelper,
     MissingExceptionHelper,
+    MissingMonitorHelper,
     MissingArrayLayout,
     MissingFieldLayout,
     MissingStaticFieldLayout,
@@ -47,18 +49,67 @@ pub const DeoptValueSpec = struct {
     source: DeoptSource,
 };
 
+pub const DeoptMonitorSpec = struct {
+    source: DeoptSource,
+    kind: runtime_deopt.MonitorKind = .explicit,
+};
+
+pub const DeoptInlineFrameSpec = struct {
+    /// Stable compiler activation identity. Method ids alone are insufficient
+    /// because recursive inlining may contain the same method more than once.
+    activation_id: u32,
+    method_id: u32,
+    dex_pc: u32,
+    register_count: u16,
+    values: []const DeoptValueSpec,
+    monitors: []const DeoptMonitorSpec = &.{},
+};
+
 pub const DeoptPointSpec = struct {
     id: u32,
-    safepoint_id: u32,
+    /// Existing machine safepoint carrying this state. Omit when the compiler
+    /// must create a position at `block_entry`.
+    safepoint_id: ?u32 = null,
+    /// Compiler-owned position immediately before the first instruction in a
+    /// block. Exactly one of this field and `safepoint_id` must be present.
+    block_entry: ?cfg.BlockId = null,
     method_id: u32,
     dex_pc: u32,
     values: []const DeoptValueSpec,
+    /// Leaf identity in the compiler-owned inline activation tree. Zero is the
+    /// non-inlined root activation and requires an empty caller chain.
+    activation_id: u32 = 0,
+    /// Outer-to-inner caller activations materialized before the leaf frame.
+    inline_frames: []const DeoptInlineFrameSpec = &.{},
+    /// Held monitors acquired by the leaf activation, in acquisition order.
+    monitors: []const DeoptMonitorSpec = &.{},
+};
+
+/// One immutable activation created by the compiler's call-inlining planner.
+/// `parent_dex_pc` is the bytecode position at which the parent resumes if this
+/// activation deoptimizes. IDs are compilation-local and sorted; parent IDs
+/// must precede children, making the provenance graph acyclic by construction.
+pub const InlineActivationSpec = struct {
+    id: u32,
+    parent_id: u32,
+    method_id: u32,
+    register_count: u16,
+    parent_dex_pc: u32,
 };
 
 pub const DeoptOptions = struct {
     points: []const DeoptPointSpec,
     register_count: u16,
     max_dex_pc: u32,
+    /// Monitor stack already owned when control enters the machine CFG. This
+    /// includes the outer synchronized-method monitor and OSR-held monitors.
+    entry_monitors: []const DeoptMonitorSpec = &.{},
+    /// Sorted monitor-enter safepoint ids that open synchronized inlined
+    /// regions. Unlisted monitor-enter operations are explicit bytecode locks.
+    synchronized_monitor_enter_sites: []const u32 = &.{},
+    /// Compiler-owned activation namespace used to authenticate every supplied
+    /// inline frame chain. Empty is valid only when every point is non-inlined.
+    inline_activations: []const InlineActivationSpec = &.{},
 };
 
 pub const OsrEntrySpec = struct {
@@ -83,6 +134,10 @@ pub const RuntimeAbi = struct {
     card_mark_helper: usize = 0,
     card_mark_repeat_helper: usize = 0,
     static_root_post_write_helper: usize = 0,
+    monitor_enter_helper: usize = 0,
+    monitor_exit_helper: usize = 0,
+    f32_remainder_helper: usize = 0,
+    f64_remainder_helper: usize = 0,
     deopt_epoch_address: usize = 0,
     compiled_deopt_epoch: u64 = 0,
     deopt_helper: usize = 0,
@@ -173,16 +228,41 @@ pub const Stats = struct {
     card_barriers: u32 = 0,
     card_repeat_barriers: u32 = 0,
     static_root_barriers: u32 = 0,
+    monitor_enters: u32 = 0,
+    monitor_exits: u32 = 0,
     root_map_sites: u32 = 0,
     root_map_locations: u32 = 0,
     edge_copy_sites: u32 = 0,
     edge_copy_moves: u32 = 0,
     edge_copy_cycles: u32 = 0,
     deopt_points: u32 = 0,
+    deopt_frames: u32 = 0,
+    deopt_inline_activations: u32 = 0,
     deopt_values: u32 = 0,
+    deopt_monitors: u32 = 0,
+    deopt_xmm_values: u32 = 0,
+    deopt_stack_values: u32 = 0,
+    deopt_block_entries: u32 = 0,
     deopt_guards: u32 = 0,
     deopt_traps: u32 = 0,
     osr_entries: u32 = 0,
+    osr_frame_landings: u32 = 0,
+    osr_landing_safepoints: u32 = 0,
+    osr_derived_rematerializations: u32 = 0,
+    osr_remat_restart_edges: u32 = 0,
+    frame_bytes: u32 = 0,
+    nonvolatile_frame_bytes: u32 = 0,
+    spill_loads: u32 = 0,
+    spill_stores: u32 = 0,
+    xmm_insts: u32 = 0,
+    xmm_spill_loads: u32 = 0,
+    xmm_spill_stores: u32 = 0,
+    xmm_negations: u32 = 0,
+    xmm_comparisons: u32 = 0,
+    xmm_conversions: u32 = 0,
+    xmm_saturating_conversions: u32 = 0,
+    xmm_remainders: u32 = 0,
+    numeric_helper_calls: u32 = 0,
 };
 
 pub const Function = struct {
@@ -210,13 +290,32 @@ pub const Function = struct {
         self.source.verify() catch return error.InvalidMachine;
         try self.allocation.verify();
         if (self.block_labels.len != self.source.blocks.len) return error.InvalidMachine;
+        if (!std.mem.isAligned(self.stats.frame_bytes, 16) or
+            (self.stats.nonvolatile_frame_bytes != 0 and self.stats.nonvolatile_frame_bytes != 16) or
+            ((self.stats.frame_bytes == 0) != (self.allocation.stats.spills == 0))) return error.InvalidMachine;
+        const xmm_spill_insts = std.math.add(u32, self.stats.xmm_spill_loads, self.stats.xmm_spill_stores) catch return error.InvalidMachine;
+        const xmm_unary_and_compare = std.math.add(u32, self.stats.xmm_negations, self.stats.xmm_comparisons) catch return error.InvalidMachine;
+        const xmm_conversion_and_remainder = std.math.add(u32, self.stats.xmm_conversions, self.stats.xmm_remainders) catch return error.InvalidMachine;
+        const xmm_semantic_sites = std.math.add(u32, xmm_unary_and_compare, xmm_conversion_and_remainder) catch return error.InvalidMachine;
+        if (self.stats.xmm_spill_loads > self.stats.spill_loads or
+            self.stats.xmm_spill_stores > self.stats.spill_stores or
+            self.stats.xmm_saturating_conversions > self.stats.xmm_conversions or
+            self.stats.numeric_helper_calls != self.stats.xmm_remainders or
+            xmm_spill_insts > self.stats.xmm_insts or xmm_semantic_sites > self.stats.xmm_insts) return error.InvalidMachine;
         if (self.stats.edge_copy_sites != self.source.edges.len or self.stats.edge_copy_moves != self.source.stats.edge_moves) return error.InvalidMachine;
         const resolve_sites = std.math.add(u32, self.source.stats.resolves, self.source.stats.loop_epoch_guards) catch return error.InvalidMachine;
-        const safepoint_sites = std.math.add(u32, resolve_sites, self.source.stats.bounds_exception_sites) catch return error.InvalidMachine;
-        if (self.stats.descriptor_loads != self.source.stats.resolves or self.stats.fast_resolves != self.source.stats.resolves or
-            self.stats.cold_resolve_sites != resolve_sites or self.stats.loop_epoch_guards != self.source.stats.loop_epoch_guards or
+        const emitted_resolves = std.math.add(u32, self.source.stats.resolves, self.stats.osr_derived_rematerializations) catch return error.InvalidMachine;
+        const emitted_cold_resolves = std.math.add(u32, resolve_sites, self.stats.osr_derived_rematerializations) catch return error.InvalidMachine;
+        const monitor_sites = std.math.add(u32, self.source.stats.monitor_sites, self.source.stats.bounds_exception_sites) catch return error.InvalidMachine;
+        const machine_safepoint_sites = std.math.add(u32, resolve_sites, monitor_sites) catch return error.InvalidMachine;
+        const emitted_monitor_sites = std.math.add(u32, self.stats.monitor_enters, self.stats.monitor_exits) catch return error.InvalidMachine;
+        const deopt_sites = std.math.add(u32, machine_safepoint_sites, self.stats.deopt_block_entries) catch return error.InvalidMachine;
+        const safepoint_sites = std.math.add(u32, deopt_sites, self.stats.osr_landing_safepoints) catch return error.InvalidMachine;
+        if (self.stats.descriptor_loads != emitted_resolves or self.stats.fast_resolves != emitted_resolves or
+            self.stats.cold_resolve_sites != emitted_cold_resolves or self.stats.loop_epoch_guards != self.source.stats.loop_epoch_guards or
             self.stats.loop_epoch_slow_sites != self.source.stats.loop_epoch_guards or
-            self.stats.bounds_exception_sites != self.source.stats.bounds_exception_sites) return error.InvalidMachine;
+            self.stats.bounds_exception_sites != self.source.stats.bounds_exception_sites or
+            emitted_monitor_sites != self.source.stats.monitor_sites) return error.InvalidMachine;
         if ((safepoint_sites == 0) != (self.root_maps == null)) return error.InvalidMachine;
         if (self.root_maps) |maps| {
             if (maps.records.len != safepoint_sites or self.stats.root_map_sites != safepoint_sites) return error.InvalidMachine;
@@ -224,13 +323,21 @@ pub const Function = struct {
         }
         if ((self.stats.deopt_points == 0) != (self.deopt_table == null)) return error.InvalidMachine;
         if (self.deopt_table) |table| {
-            if (table.records.len != self.stats.deopt_points or table.values.len != self.stats.deopt_values) return error.InvalidMachine;
-            if (self.stats.deopt_guards != self.stats.deopt_points or self.stats.deopt_traps != self.stats.deopt_points) return error.InvalidMachine;
+            if (table.records.len != self.stats.deopt_points or table.frames.len != self.stats.deopt_frames or
+                table.values.len != self.stats.deopt_values or table.monitors.len != self.stats.deopt_monitors) return error.InvalidMachine;
+            if (self.stats.deopt_block_entries > self.stats.deopt_points or
+                self.stats.deopt_guards != self.stats.deopt_points or self.stats.deopt_traps != self.stats.deopt_points) return error.InvalidMachine;
             const maps = &(self.root_maps orelse return error.InvalidMachine);
             table.validateStackMaps(maps, false) catch return error.InvalidMachine;
             table.validateAllLinked(maps) catch return error.InvalidMachine;
         }
         if (self.osr_entries.len != self.stats.osr_entries) return error.InvalidMachine;
+        if (self.stats.osr_landing_safepoints > self.stats.osr_entries or
+            self.stats.osr_derived_rematerializations < self.stats.osr_landing_safepoints or
+            self.stats.osr_remat_restart_edges != self.stats.osr_derived_rematerializations) return error.InvalidMachine;
+        const has_native_frame = self.stats.frame_bytes != 0 or self.stats.nonvolatile_frame_bytes != 0;
+        if ((!has_native_frame and self.stats.osr_frame_landings != 0) or
+            (has_native_frame and self.stats.osr_frame_landings != self.stats.osr_entries)) return error.InvalidMachine;
         for (self.osr_entries, 0..) |entry, index| {
             if (entry.code_offset == 0 or entry.code_offset >= self.buffer.len() or !std.mem.isAligned(entry.code_offset, 16)) {
                 return error.InvalidMachine;
@@ -259,7 +366,7 @@ pub const Function = struct {
 
     pub fn print(self: *const Function, writer: anytype) !void {
         try writer.print(
-            "x64_register_encoder bytes={d} blocks={d} native_insts={d} moves={d} constants={d} returns={d} jumps={d} branches={d} descriptor_loads={d} fast_resolves={d} cold_resolves={d} loop_guards={d} loop_slow={d} bounds={d} bounds_exceptions={d} array_loads={d} array_stores={d} ptr_loads={d} ptr_stores={d} satb={d} satb_repeats={d} cards={d} card_repeats={d} root_sites={d} root_locations={d} edge_sites={d} edge_moves={d} edge_cycles={d}\n",
+            "x64_register_encoder bytes={d} blocks={d} native_insts={d} moves={d} constants={d} returns={d} jumps={d} branches={d} descriptor_loads={d} fast_resolves={d} cold_resolves={d} loop_guards={d} loop_slow={d} bounds={d} bounds_exceptions={d} array_loads={d} array_stores={d} ptr_loads={d} ptr_stores={d} satb={d} satb_repeats={d} cards={d} card_repeats={d} root_sites={d} root_locations={d} edge_sites={d} edge_moves={d} edge_cycles={d} frame_bytes={d} spill_loads={d} spill_stores={d}",
             .{
                 self.buffer.len(),
                 self.stats.blocks,
@@ -289,6 +396,30 @@ pub const Function = struct {
                 self.stats.edge_copy_sites,
                 self.stats.edge_copy_moves,
                 self.stats.edge_copy_cycles,
+                self.stats.frame_bytes,
+                self.stats.spill_loads,
+                self.stats.spill_stores,
+            },
+        );
+        try writer.print(
+            " nonvolatile_frame_bytes={d} xmm_insts={d} xmm_spill_loads={d} xmm_spill_stores={d} xmm_negations={d} xmm_comparisons={d} xmm_conversions={d} xmm_saturating={d} xmm_remainders={d} numeric_helper_calls={d} deopt_block_entries={d} osr_entries={d} osr_frame_landings={d} osr_landing_safepoints={d} osr_remats={d} osr_restart_edges={d}\n",
+            .{
+                self.stats.nonvolatile_frame_bytes,
+                self.stats.xmm_insts,
+                self.stats.xmm_spill_loads,
+                self.stats.xmm_spill_stores,
+                self.stats.xmm_negations,
+                self.stats.xmm_comparisons,
+                self.stats.xmm_conversions,
+                self.stats.xmm_saturating_conversions,
+                self.stats.xmm_remainders,
+                self.stats.numeric_helper_calls,
+                self.stats.deopt_block_entries,
+                self.stats.osr_entries,
+                self.stats.osr_frame_landings,
+                self.stats.osr_landing_safepoints,
+                self.stats.osr_derived_rematerializations,
+                self.stats.osr_remat_restart_edges,
             },
         );
         try self.allocation.print(writer);
@@ -309,7 +440,24 @@ const descriptor_generation_shift: u6 = 44;
 const descriptor_state_shift: u6 = 60;
 const object_alignment_shift: u6 = 3;
 
-const RESOLVER_GP_REGS = [_]regalloc.PhysReg{ .rax, .rcx, .rdx, .rsi, .rdi, .r8, .r9 };
+const WINDOWS_ALLOCATABLE_GP_REGS = [_]regalloc.PhysReg{ .rax, .rcx, .rdx, .r8, .r9 };
+const SYSV_ALLOCATABLE_GP_REGS = [_]regalloc.PhysReg{ .rax, .rcx, .rdx, .rsi, .rdi, .r8, .r9 };
+const WINDOWS_ALLOCATABLE_XMM_REGS = [_]regalloc.PhysReg{ .xmm0, .xmm1, .xmm2, .xmm3 };
+const SYSV_ALLOCATABLE_XMM_REGS = [_]regalloc.PhysReg{ .xmm0, .xmm1, .xmm2, .xmm3, .xmm4, .xmm5 };
+const xmm_scratch_primary: regalloc.PhysReg = if (builtin.os.tag == .windows) .xmm4 else .xmm6;
+const xmm_scratch_secondary: regalloc.PhysReg = if (builtin.os.tag == .windows) .xmm5 else .xmm7;
+
+fn allocatableXmmRegisters() []const regalloc.PhysReg {
+    return if (builtin.os.tag == .windows) &WINDOWS_ALLOCATABLE_XMM_REGS else &SYSV_ALLOCATABLE_XMM_REGS;
+}
+
+fn allocatableGpRegisters() []const regalloc.PhysReg {
+    return if (builtin.os.tag == .windows) &WINDOWS_ALLOCATABLE_GP_REGS else &SYSV_ALLOCATABLE_GP_REGS;
+}
+
+fn allGpRegisters() []const regalloc.PhysReg {
+    return &SYSV_ALLOCATABLE_GP_REGS;
+}
 
 const ColdResolve = struct {
     entry: code_buffer.LabelId,
@@ -317,6 +465,8 @@ const ColdResolve = struct {
     handle: regalloc.PhysReg,
     destination: regalloc.PhysReg,
     site_key: u64,
+    epoch_restart: ?code_buffer.LabelId = null,
+    epoch_slot_offset: i32 = 0,
 };
 
 const ColdBoundsException = struct {
@@ -343,6 +493,20 @@ fn x64Reg(reg: regalloc.PhysReg) Error!u4 {
         .r9 => 9,
         .r10 => 10,
         .r11 => 11,
+        else => error.UnsupportedInstruction,
+    };
+}
+
+fn xmmReg(reg: regalloc.PhysReg) Error!u3 {
+    return switch (reg) {
+        .xmm0 => 0,
+        .xmm1 => 1,
+        .xmm2 => 2,
+        .xmm3 => 3,
+        .xmm4 => 4,
+        .xmm5 => 5,
+        .xmm6 => 6,
+        .xmm7 => 7,
         else => error.UnsupportedInstruction,
     };
 }
@@ -575,12 +739,148 @@ fn emitBarrierCall(buffer: *code_buffer.Buffer, helper: usize) Error!void {
     try emitPopRaw(buffer, 0);
 }
 
+/// Calls a no-safepoint preserve-all numeric adapter. Raw operands are in
+/// r10/r11 and the raw result returns in r10; rax may contain a live managed
+/// value and is therefore preserved by the generated caller.
+fn emitNumericCall(buffer: *code_buffer.Buffer, helper: usize) Error!void {
+    if (helper == 0) return error.MissingNumericHelper;
+    try emitPushRaw(buffer, 0);
+    try emitMovRawImm64(buffer, 0, helper);
+    try emitCallRaw(buffer, 0);
+    try emitPopRaw(buffer, 0);
+}
+
+/// Calls a safepointing preserve-all adapter. The adapter captures the exact
+/// root-map locations before entering the runtime and reloads r12 after a
+/// handshake. r10 carries the canonical Handle and r11 the site key.
+fn emitMonitorCall(buffer: *code_buffer.Buffer, helper: usize) Error!void {
+    if (helper == 0) return error.MissingMonitorHelper;
+    try emitPushRaw(buffer, 0);
+    try emitMovRawImm64(buffer, 0, helper);
+    try emitCallRaw(buffer, 0);
+    try emitPopRaw(buffer, 0);
+}
+
 fn physOf(allocation: *const regalloc.Allocation, reg: machine.RegId) Error!regalloc.PhysReg {
     return switch (allocation.locationOf(reg) orelse return error.InvalidMachine) {
         .phys => |phys| phys,
         .spill => error.SpillsUnsupported,
         .none => error.InvalidMachine,
     };
+}
+
+fn spillSlot(plan: *const regalloc.SpillPlan, reg: machine.RegId) Error!regalloc.SpillSlot {
+    return spillSlotFor(plan, reg) orelse error.InvalidMachine;
+}
+
+fn emitAdjustStack(buffer: *code_buffer.Buffer, subtract: bool, amount: u32) Error!void {
+    if (amount == 0) return;
+    if (!std.mem.isAligned(amount, 16)) return error.InvalidMachine;
+    if (amount <= std.math.maxInt(i8)) {
+        try buffer.emitBytes(&.{ 0x48, 0x83, if (subtract) 0xec else 0xc4, @intCast(amount) });
+    } else {
+        try buffer.emitBytes(&.{ 0x48, 0x81, if (subtract) 0xec else 0xc4 });
+        try buffer.emitU32(amount);
+    }
+}
+
+fn frameSavedBytes(preserve_nonvolatile: bool) u32 {
+    return if (builtin.os.tag == .windows and preserve_nonvolatile) 2 * @sizeOf(u64) else 0;
+}
+
+fn emitFrameEnter(buffer: *code_buffer.Buffer, frame_bytes: u32, preserve_nonvolatile: bool) Error!void {
+    if (frameSavedBytes(preserve_nonvolatile) != 0) {
+        try emitPushRaw(buffer, 6); // rsi
+        try emitPushRaw(buffer, 7); // rdi
+    }
+    try emitAdjustStack(buffer, true, frame_bytes);
+}
+
+fn emitFrameLeave(buffer: *code_buffer.Buffer, frame_bytes: u32, preserve_nonvolatile: bool) Error!void {
+    try emitAdjustStack(buffer, false, frame_bytes);
+    if (frameSavedBytes(preserve_nonvolatile) != 0) {
+        try emitPopRaw(buffer, 7); // rdi
+        try emitPopRaw(buffer, 6); // rsi
+    }
+}
+
+fn emitSpillLoad(
+    buffer: *code_buffer.Buffer,
+    slot: regalloc.SpillSlot,
+    dst: regalloc.PhysReg,
+    stats: *Stats,
+) Error!void {
+    if (slot.byte_offset > std.math.maxInt(i32) or (slot.size != 4 and slot.size != 8)) return error.UnsupportedInstruction;
+    switch (dst.class()) {
+        .gp => try emitMovRawFromMemory(buffer, try x64Reg(dst), 4, @intCast(slot.byte_offset), slot.size == 8),
+        .xmm => {
+            try emitXmmMemory(buffer, dst, 4, @intCast(slot.byte_offset), slot.size == 8, true);
+            stats.xmm_insts += 1;
+            stats.xmm_spill_loads += 1;
+        },
+    }
+    stats.spill_loads += 1;
+    stats.native_insts += 1;
+}
+
+fn emitSpillStore(
+    buffer: *code_buffer.Buffer,
+    slot: regalloc.SpillSlot,
+    src: regalloc.PhysReg,
+    stats: *Stats,
+) Error!void {
+    if (slot.byte_offset > std.math.maxInt(i32) or (slot.size != 4 and slot.size != 8)) return error.UnsupportedInstruction;
+    switch (src.class()) {
+        .gp => try emitMovMemoryFromRaw(buffer, 4, @intCast(slot.byte_offset), try x64Reg(src), slot.size == 8),
+        .xmm => {
+            try emitXmmMemory(buffer, src, 4, @intCast(slot.byte_offset), slot.size == 8, false);
+            stats.xmm_insts += 1;
+            stats.xmm_spill_stores += 1;
+        },
+    }
+    stats.spill_stores += 1;
+    stats.native_insts += 1;
+}
+
+fn readInto(
+    buffer: *code_buffer.Buffer,
+    allocation: *const regalloc.Allocation,
+    plan: *const regalloc.SpillPlan,
+    reg: machine.RegId,
+    scratch: regalloc.PhysReg,
+    stats: *Stats,
+) Error!regalloc.PhysReg {
+    return switch (allocation.locationOf(reg) orelse return error.InvalidMachine) {
+        .phys => |physical| physical,
+        .spill => {
+            try emitSpillLoad(buffer, try spillSlot(plan, reg), scratch, stats);
+            return scratch;
+        },
+        .none => error.InvalidMachine,
+    };
+}
+
+fn writeFrom(
+    buffer: *code_buffer.Buffer,
+    allocation: *const regalloc.Allocation,
+    plan: *const regalloc.SpillPlan,
+    reg: machine.RegId,
+    src: regalloc.PhysReg,
+    wide: bool,
+    stats: *Stats,
+) Error!void {
+    switch (allocation.locationOf(reg) orelse return error.InvalidMachine) {
+        .phys => |physical| {
+            try emitPhysicalMove(buffer, physical, src, wide);
+            if (physical != src) {
+                stats.register_moves += 1;
+                stats.native_insts += 1;
+                stats.xmm_insts += @intFromBool(physical.class() == .xmm or src.class() == .xmm);
+            }
+        },
+        .spill => try emitSpillStore(buffer, try spillSlot(plan, reg), src, stats),
+        .none => return error.InvalidMachine,
+    }
 }
 
 fn emitRex(buffer: *code_buffer.Buffer, w: bool, reg: u4, rm: u4) Error!void {
@@ -593,6 +893,256 @@ fn emitRex(buffer: *code_buffer.Buffer, w: bool, reg: u4, rm: u4) Error!void {
 
 fn emitModRm(buffer: *code_buffer.Buffer, reg: u4, rm: u4) Error!void {
     try buffer.emitU8(0xc0 | ((@as(u8, reg) & 7) << 3) | (@as(u8, rm) & 7));
+}
+
+fn emitXmmMemory(
+    buffer: *code_buffer.Buffer,
+    xmm: regalloc.PhysReg,
+    base: u4,
+    displacement: i32,
+    wide: bool,
+    load: bool,
+) Error!void {
+    const x: u4 = @intCast(try xmmReg(xmm));
+    try buffer.emitU8(if (wide) 0xf2 else 0xf3);
+    try emitRex(buffer, false, x, base);
+    try buffer.emitU8(0x0f);
+    try buffer.emitU8(if (load) 0x10 else 0x11);
+    try emitMemoryOperand(buffer, x, base, displacement);
+}
+
+fn emitXmmRegReg(buffer: *code_buffer.Buffer, dst: regalloc.PhysReg, src: regalloc.PhysReg) Error!void {
+    if (dst == src) return;
+    const d: u4 = @intCast(try xmmReg(dst));
+    const s: u4 = @intCast(try xmmReg(src));
+    try emitRex(buffer, false, d, s);
+    try buffer.emitBytes(&.{ 0x0f, 0x28 }); // movaps xmm, xmm
+    try emitModRm(buffer, d, s);
+}
+
+fn emitGpToXmm(buffer: *code_buffer.Buffer, dst: regalloc.PhysReg, src: regalloc.PhysReg, wide: bool) Error!void {
+    const d: u4 = @intCast(try xmmReg(dst));
+    const s = try x64Reg(src);
+    try buffer.emitU8(0x66);
+    try emitRex(buffer, wide, d, s);
+    try buffer.emitBytes(&.{ 0x0f, 0x6e });
+    try emitModRm(buffer, d, s);
+}
+
+fn emitXmmToGp(buffer: *code_buffer.Buffer, dst: regalloc.PhysReg, src: regalloc.PhysReg, wide: bool) Error!void {
+    const d = try x64Reg(dst);
+    const s: u4 = @intCast(try xmmReg(src));
+    try buffer.emitU8(0x66);
+    try emitRex(buffer, wide, s, d);
+    try buffer.emitBytes(&.{ 0x0f, 0x7e });
+    try emitModRm(buffer, s, d);
+}
+
+fn emitPhysicalMove(buffer: *code_buffer.Buffer, dst: regalloc.PhysReg, src: regalloc.PhysReg, wide: bool) Error!void {
+    if (dst == src) return;
+    switch (dst.class()) {
+        .gp => switch (src.class()) {
+            .gp => try emitMovRegReg(buffer, dst, src, wide),
+            .xmm => try emitXmmToGp(buffer, dst, src, wide),
+        },
+        .xmm => switch (src.class()) {
+            .gp => try emitGpToXmm(buffer, dst, src, wide),
+            .xmm => try emitXmmRegReg(buffer, dst, src),
+        },
+    }
+}
+
+fn emitXmmBinary(
+    buffer: *code_buffer.Buffer,
+    operation: machine.FloatOperation,
+    dst: regalloc.PhysReg,
+    rhs: regalloc.PhysReg,
+    wide: bool,
+) Error!void {
+    const d: u4 = @intCast(try xmmReg(dst));
+    const r: u4 = @intCast(try xmmReg(rhs));
+    const opcode: u8 = switch (operation) {
+        .add => 0x58,
+        .sub => 0x5c,
+        .mul => 0x59,
+        .div => 0x5e,
+        else => return error.UnsupportedInstruction,
+    };
+    try buffer.emitU8(if (wide) 0xf2 else 0xf3);
+    try emitRex(buffer, false, d, r);
+    try buffer.emitBytes(&.{ 0x0f, opcode });
+    try emitModRm(buffer, d, r);
+}
+
+fn emitXmmXor(buffer: *code_buffer.Buffer, dst: regalloc.PhysReg, rhs: regalloc.PhysReg, wide: bool) Error!void {
+    const d: u4 = @intCast(try xmmReg(dst));
+    const r: u4 = @intCast(try xmmReg(rhs));
+    if (wide) try buffer.emitU8(0x66); // xorpd; xorps has no mandatory prefix
+    try emitRex(buffer, false, d, r);
+    try buffer.emitBytes(&.{ 0x0f, 0x57 });
+    try emitModRm(buffer, d, r);
+}
+
+fn emitXmmCompare(buffer: *code_buffer.Buffer, lhs: regalloc.PhysReg, rhs: regalloc.PhysReg, wide: bool) Error!void {
+    const l: u4 = @intCast(try xmmReg(lhs));
+    const r: u4 = @intCast(try xmmReg(rhs));
+    if (wide) try buffer.emitU8(0x66); // ucomisd; ucomiss has no mandatory prefix
+    try emitRex(buffer, false, l, r);
+    try buffer.emitBytes(&.{ 0x0f, 0x2e });
+    try emitModRm(buffer, l, r);
+}
+
+fn emitXmmCompareResult(
+    buffer: *code_buffer.Buffer,
+    operation: machine.FloatOperation,
+    dst: regalloc.PhysReg,
+    lhs: regalloc.PhysReg,
+    rhs: regalloc.PhysReg,
+    wide: bool,
+    stats: *Stats,
+) Error!void {
+    if (operation != .compare_l and operation != .compare_g) return error.InvalidMachine;
+    if (dst.class() != .gp or lhs.class() != .xmm or rhs.class() != .xmm) return error.InvalidMachine;
+    const unordered = try buffer.newLabel();
+    const greater = try buffer.newLabel();
+    const less = try buffer.newLabel();
+    const done = try buffer.newLabel();
+
+    try emitXmmCompare(buffer, lhs, rhs, wide);
+    try emitJccOpcode(buffer, 0x8a, unordered); // jp: unordered/NaN
+    try emitJccOpcode(buffer, 0x87, greater); // ja: lhs > rhs
+    try emitJccOpcode(buffer, 0x82, less); // jb: lhs < rhs
+    try emitMovRegImm32(buffer, dst, 0);
+    try emitJump(buffer, done);
+    try buffer.bindLabel(greater);
+    try emitMovRegImm32(buffer, dst, 1);
+    try emitJump(buffer, done);
+    try buffer.bindLabel(less);
+    try emitMovRegImm32(buffer, dst, -1);
+    try emitJump(buffer, done);
+    try buffer.bindLabel(unordered);
+    try emitMovRegImm32(buffer, dst, if (operation == .compare_l) -1 else 1);
+    try buffer.bindLabel(done);
+
+    stats.xmm_insts += 1;
+    stats.native_insts += 11;
+    stats.branches += 3;
+    stats.jumps += 3;
+}
+
+fn emitGpToFloatConvert(
+    buffer: *code_buffer.Buffer,
+    dst: regalloc.PhysReg,
+    src: regalloc.PhysReg,
+    input_wide: bool,
+    output_wide: bool,
+) Error!void {
+    const d: u4 = @intCast(try xmmReg(dst));
+    const s = try x64Reg(src);
+    try buffer.emitU8(if (output_wide) 0xf2 else 0xf3);
+    try emitRex(buffer, input_wide, d, s);
+    try buffer.emitBytes(&.{ 0x0f, 0x2a });
+    try emitModRm(buffer, d, s);
+}
+
+fn emitFloatToGpTruncate(
+    buffer: *code_buffer.Buffer,
+    dst: regalloc.PhysReg,
+    src: regalloc.PhysReg,
+    input_wide: bool,
+    output_wide: bool,
+) Error!void {
+    const d = try x64Reg(dst);
+    const s: u4 = @intCast(try xmmReg(src));
+    try buffer.emitU8(if (input_wide) 0xf2 else 0xf3);
+    try emitRex(buffer, output_wide, d, s);
+    try buffer.emitBytes(&.{ 0x0f, 0x2c });
+    try emitModRm(buffer, d, s);
+}
+
+fn emitFloatWidthConvert(
+    buffer: *code_buffer.Buffer,
+    dst: regalloc.PhysReg,
+    src: regalloc.PhysReg,
+    input_wide: bool,
+) Error!void {
+    const d: u4 = @intCast(try xmmReg(dst));
+    const s: u4 = @intCast(try xmmReg(src));
+    try buffer.emitU8(if (input_wide) 0xf2 else 0xf3);
+    try emitRex(buffer, false, d, s);
+    try buffer.emitBytes(&.{ 0x0f, 0x5a });
+    try emitModRm(buffer, d, s);
+}
+
+fn emitIntegerLimitAsFloat(
+    buffer: *code_buffer.Buffer,
+    dst: regalloc.PhysReg,
+    input_wide: bool,
+    output_wide: bool,
+    upper: bool,
+) Error!void {
+    const integer_limit: i64 = if (output_wide)
+        (if (upper) std.math.maxInt(i64) else std.math.minInt(i64))
+    else if (upper)
+        std.math.maxInt(i32)
+    else
+        std.math.minInt(i32);
+    if (input_wide) {
+        const value: f64 = @floatFromInt(integer_limit);
+        try emitMovRegImm64(buffer, .r11, @bitCast(value));
+    } else {
+        const value: f32 = @floatFromInt(integer_limit);
+        try emitMovRegImm32(buffer, .r11, @bitCast(value));
+    }
+    try emitGpToXmm(buffer, dst, .r11, input_wide);
+}
+
+fn emitSaturatingFloatToInteger(
+    buffer: *code_buffer.Buffer,
+    dst: regalloc.PhysReg,
+    src: regalloc.PhysReg,
+    input_wide: bool,
+    output_wide: bool,
+    stats: *Stats,
+) Error!void {
+    if (dst.class() != .gp or src.class() != .xmm) return error.InvalidMachine;
+    const nan = try buffer.newLabel();
+    const upper = try buffer.newLabel();
+    const done = try buffer.newLabel();
+
+    // CVTT's overwhelmingly common in-range result is accepted immediately.
+    // x86 reports NaN and every overflow as the signed minimum sentinel; only
+    // that uncommon result needs semantic disambiguation.
+    try emitFloatToGpTruncate(buffer, dst, src, input_wide, output_wide);
+    if (output_wide) {
+        try emitMovRegImm64(buffer, .r11, std.math.minInt(i64));
+        try emitCmpRawRaw(buffer, try x64Reg(dst), try x64Reg(.r11), true);
+    } else {
+        try emitCmpRawImm32(buffer, try x64Reg(dst), @bitCast(@as(i32, std.math.minInt(i32))));
+    }
+    try emitJccOpcode(buffer, 0x85, done); // jne: ordinary in-range result
+
+    try emitXmmCompare(buffer, src, src, input_wide);
+    try emitJccOpcode(buffer, 0x8a, nan); // jp: NaN -> zero
+    try emitIntegerLimitAsFloat(buffer, xmm_scratch_secondary, input_wide, output_wide, true);
+    try emitXmmCompare(buffer, src, xmm_scratch_secondary, input_wide);
+    try emitJccOpcode(buffer, 0x83, upper); // jae: saturate to maximum
+    // Ordered values that still produced the minimum sentinel are either the
+    // exact/truncated minimum or lower overflow; Dalvik requires minimum for
+    // both, so the CVTT result is already final.
+    try emitJump(buffer, done);
+
+    try buffer.bindLabel(nan);
+    if (output_wide) try emitMovRegImm64(buffer, dst, 0) else try emitMovRegImm32(buffer, dst, 0);
+    try emitJump(buffer, done);
+    try buffer.bindLabel(upper);
+    if (output_wide) try emitMovRegImm64(buffer, dst, std.math.maxInt(i64)) else try emitMovRegImm32(buffer, dst, std.math.maxInt(i32));
+    try buffer.bindLabel(done);
+
+    stats.xmm_insts += 4;
+    stats.native_insts += if (output_wide) 14 else 13;
+    stats.branches += 3;
+    stats.jumps += 2;
 }
 
 fn isWideType(ty: anytype) bool {
@@ -616,6 +1166,28 @@ fn emitMovRegImm32(buffer: *code_buffer.Buffer, dst: regalloc.PhysReg, value: i3
     try emitRex(buffer, false, 0, d);
     try buffer.emitU8(0xb8 + @as(u8, d & 7));
     try buffer.emitU32(@bitCast(value));
+}
+
+fn emitMovRegImm64(buffer: *code_buffer.Buffer, dst: regalloc.PhysReg, value: i64) Error!void {
+    try emitMovRawImm64(buffer, try x64Reg(dst), @bitCast(value));
+}
+
+fn valueClass(ty: anytype) regalloc.RegClass {
+    return if (ty == .float or ty == .double) .xmm else .gp;
+}
+
+fn recordPhysicalMove(
+    buffer: *code_buffer.Buffer,
+    dst: regalloc.PhysReg,
+    src: regalloc.PhysReg,
+    wide: bool,
+    stats: *Stats,
+) Error!void {
+    if (dst == src) return;
+    try emitPhysicalMove(buffer, dst, src, wide);
+    stats.register_moves += 1;
+    stats.native_insts += 1;
+    stats.xmm_insts += @intFromBool(dst.class() == .xmm or src.class() == .xmm);
 }
 
 fn emitBinaryRegReg(buffer: *code_buffer.Buffer, opcode: machine.Opcode, dst: regalloc.PhysReg, rhs: regalloc.PhysReg) Error!void {
@@ -867,6 +1439,7 @@ fn emitBoundsExceptionCheck(
     allocator: std.mem.Allocator,
     buffer: *code_buffer.Buffer,
     allocation: *const regalloc.Allocation,
+    spill_plan: *const regalloc.SpillPlan,
     inst: machine.Inst,
     runtime: RuntimeAbi,
     cold: *std.ArrayList(ColdBoundsException),
@@ -876,7 +1449,7 @@ fn emitBoundsExceptionCheck(
     if (inst.defs.len != 0 or inst.uses.len != 1) return error.InvalidMachine;
     const address = try physOf(allocation, inst.address orelse return error.InvalidMachine);
     const handle = try physOf(allocation, inst.state_handle orelse return error.InvalidMachine);
-    const index = try physOf(allocation, inst.uses[0]);
+    const index = try readInto(buffer, allocation, spill_plan, inst.uses[0], .r10, stats);
     if (address == handle or address == index or handle == index) return error.InvalidMachine;
     const site_id = inst.exception_site_id orelse return error.InvalidMachine;
     const layout = try referenceArrayLayout(runtime);
@@ -898,6 +1471,8 @@ fn emitColdBoundsExceptions(
     buffer: *code_buffer.Buffer,
     cold: []const ColdBoundsException,
     runtime: RuntimeAbi,
+    frame_bytes: u32,
+    preserve_nonvolatile: bool,
     stats: *Stats,
 ) Error!void {
     if (cold.len == 0) return;
@@ -919,6 +1494,7 @@ fn emitColdBoundsExceptions(
         try emitMovRawImm64(buffer, address, @intCast(runtime.bounds_exception_helper));
         try emitCallRaw(buffer, address);
         try emitMovRegImm32(buffer, .rax, 0);
+        try emitFrameLeave(buffer, frame_bytes, preserve_nonvolatile);
         try emitRet(buffer);
         stats.native_insts += 9;
         stats.returns += 1;
@@ -936,6 +1512,13 @@ fn emitColdResolves(buffer: *code_buffer.Buffer, cold: []const ColdResolve, runt
         try emitMovRawImm64(buffer, call_target, @intCast(runtime.slow_resolve_helper));
         try emitCallRaw(buffer, call_target);
         try emitMovRawRaw(buffer, try x64Reg(site.destination), scratch_index, true);
+        if (site.epoch_restart) |restart| {
+            try emitMovRawFromMemory(buffer, scratch_descriptor, 4, site.epoch_slot_offset, true);
+            try emitCmpRawRaw(buffer, acknowledged_epoch, scratch_descriptor, true);
+            try emitJccOpcode(buffer, 0x85, restart); // jne: helper acknowledged relocation
+            stats.native_insts += 3;
+            stats.branches += 1;
+        }
         try emitJump(buffer, site.continuation);
         stats.native_insts += 6;
         stats.jumps += 1;
@@ -966,6 +1549,8 @@ fn emitColdDeopts(
     buffer: *code_buffer.Buffer,
     cold: []const ColdDeopt,
     runtime: RuntimeAbi,
+    frame_bytes: u32,
+    preserve_nonvolatile: bool,
     stats: *Stats,
 ) Error!void {
     if (cold.len == 0) return;
@@ -976,6 +1561,7 @@ fn emitColdDeopts(
         try emitMovRawImm64(buffer, scratch_descriptor, runtime.deopt_helper);
         try emitCallRaw(buffer, scratch_descriptor);
         try emitMovRawRaw(buffer, 0, scratch_index, true);
+        try emitFrameLeave(buffer, frame_bytes, preserve_nonvolatile);
         try emitRet(buffer);
         stats.deopt_traps += 1;
         stats.native_insts += 5;
@@ -1004,6 +1590,25 @@ fn abiParamReg(index: u32) Error!regalloc.PhysReg {
     };
 }
 
+fn abiRegisterParamCount() u32 {
+    return if (builtin.os.tag == .windows) 4 else 6;
+}
+
+fn abiStackParamOffset(index: u32, frame_bytes: u32, preserve_nonvolatile: bool) Error!i32 {
+    const register_count = abiRegisterParamCount();
+    if (index < register_count) return error.InvalidMachine;
+    // Windows reserves four eight-byte home slots between the return address
+    // and its first stack argument. SysV places its first stack argument
+    // immediately above the return address.
+    const first: u32 = if (builtin.os.tag == .windows) 40 else 8;
+    const argument_delta = std.math.mul(u32, index - register_count, 8) catch return error.UnsupportedInstruction;
+    const entry_offset = std.math.add(u32, first, argument_delta) catch return error.UnsupportedInstruction;
+    const frame_and_saves = std.math.add(u32, frame_bytes, frameSavedBytes(preserve_nonvolatile)) catch return error.UnsupportedInstruction;
+    const framed_offset = std.math.add(u32, frame_and_saves, entry_offset) catch return error.UnsupportedInstruction;
+    if (framed_offset > std.math.maxInt(i32)) return error.UnsupportedInstruction;
+    return @intCast(framed_offset);
+}
+
 const ParamMove = struct {
     dst: regalloc.PhysReg,
     src: regalloc.PhysReg,
@@ -1026,31 +1631,67 @@ fn removeParamMove(moves: []ParamMove, count: *usize, index: usize) void {
 }
 
 fn recordParamMove(buffer: *code_buffer.Buffer, move: ParamMove, stats: *Stats) Error!void {
-    try emitMovRegReg(buffer, move.dst, move.src, move.wide);
+    try emitPhysicalMove(buffer, move.dst, move.src, move.wide);
     stats.register_moves += 1;
     stats.native_insts += 1;
+    stats.xmm_insts += @intFromBool(move.dst.class() == .xmm or move.src.class() == .xmm);
+}
+
+fn parameterIsUsed(source: *const machine.Function, reg: machine.RegId) bool {
+    for (source.blocks) |block| {
+        for (block.insts) |inst| {
+            for (inst.uses) |used| if (used == reg) return true;
+            if (inst.address == reg or inst.state_handle == reg) return true;
+        }
+    }
+    for (source.edges) |edge| {
+        for (edge.moves) |move| if (move.src == reg) return true;
+    }
+    return false;
 }
 
 /// Materialize ABI parameters as a true parallel copy. A linear sequence is
 /// incorrect when an allocated destination is also a later ABI source. Cycles
-/// are broken with a register that is absent from the complete move graph, so
-/// the generated function remains frameless and performs no memory traffic.
-fn emitParamMoves(buffer: *code_buffer.Buffer, allocation: *const regalloc.Allocation, source: *const machine.Function, stats: *Stats) Error!void {
+/// are broken with a register that is absent from the complete move graph.
+fn emitParamMoves(
+    buffer: *code_buffer.Buffer,
+    allocation: *const regalloc.Allocation,
+    spill_plan: *const regalloc.SpillPlan,
+    source: *const machine.Function,
+    frame_bytes: u32,
+    preserve_nonvolatile: bool,
+    stats: *Stats,
+) Error!void {
     var moves: [6]ParamMove = undefined;
     var move_count: usize = 0;
     var param_index: u32 = 0;
+    // Save stack-assigned parameters before any register parallel copy can
+    // overwrite their incoming ABI register.
     for (source.value_kinds, 0..) |kind, value_id| {
         if (kind != .parameter) continue;
-        const dst = try physOf(allocation, @intCast(value_id));
+        const parameter_reg: machine.RegId = @intCast(value_id);
+        const used = parameterIsUsed(source, parameter_reg);
+        if (param_index >= abiRegisterParamCount()) {
+            param_index += 1;
+            continue;
+        }
+        if (!used) {
+            param_index += 1;
+            continue;
+        }
         const src = try abiParamReg(param_index);
         // Runtime root metadata is authoritative even while bytecode type
         // inference remains directional/unknown. Handles always carry a
         // 32-bit generation above their 32-bit table index.
         const wide = isWideType(source.reg_types[value_id]) or source.isGcRoot(@intCast(value_id));
-        if (dst != src) {
-            if (move_count == moves.len) return error.UnsupportedInstruction;
-            moves[move_count] = .{ .dst = dst, .src = src, .wide = wide };
-            move_count += 1;
+        switch (allocation.locationOf(@intCast(value_id)) orelse return error.InvalidMachine) {
+            .phys => |dst| if (dst != src) {
+                if (move_count == moves.len) return error.UnsupportedInstruction;
+                moves[move_count] = .{ .dst = dst, .src = src, .wide = wide };
+                move_count += 1;
+            },
+            .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, @intCast(value_id)), src, stats),
+            .none => return error.InvalidMachine,
         }
         param_index += 1;
     }
@@ -1086,13 +1727,68 @@ fn emitParamMoves(buffer: *code_buffer.Buffer, allocation: *const regalloc.Alloc
             if (move.src == saved_source) move.src = scratch;
         }
     }
+
+    // Register sources are now dead. Stack arguments can be loaded directly
+    // into their final physical destination, or through r10 for stack slots.
+    param_index = 0;
+    for (source.value_kinds, 0..) |kind, value_id| {
+        if (kind != .parameter) continue;
+        const reg: machine.RegId = @intCast(value_id);
+        const used = parameterIsUsed(source, reg);
+        if (param_index < abiRegisterParamCount()) {
+            param_index += 1;
+            continue;
+        }
+        if (!used) {
+            param_index += 1;
+            continue;
+        }
+        const wide = isWideType(source.reg_types[value_id]) or source.isGcRoot(reg);
+        const offset = try abiStackParamOffset(param_index, frame_bytes, preserve_nonvolatile);
+        switch (allocation.locationOf(reg) orelse return error.InvalidMachine) {
+            .phys => |dst| {
+                switch (dst.class()) {
+                    .gp => try emitMovRawFromMemory(buffer, try x64Reg(dst), 4, offset, wide),
+                    .xmm => {
+                        try emitXmmMemory(buffer, dst, 4, offset, wide, true);
+                        stats.xmm_insts += 1;
+                    },
+                }
+                stats.native_insts += 1;
+            },
+            .spill => {
+                try emitMovRawFromMemory(buffer, scratch_index, 4, offset, wide);
+                stats.native_insts += 1;
+                try emitSpillStore(buffer, try spillSlot(spill_plan, reg), .r10, stats);
+            },
+            .none => return error.InvalidMachine,
+        }
+        param_index += 1;
+    }
 }
 
 const EdgeCopy = struct {
-    dst: regalloc.PhysReg,
-    src: regalloc.PhysReg,
+    dst: regalloc.Location,
+    src: regalloc.Location,
+    dst_reg: machine.RegId,
+    src_reg: machine.RegId,
     wide: bool,
+    class: regalloc.RegClass,
 };
+
+fn sameLocation(a: regalloc.Location, b: regalloc.Location) bool {
+    return switch (a) {
+        .none => b == .none,
+        .phys => |reg| switch (b) {
+            .phys => |other| reg == other,
+            else => false,
+        },
+        .spill => |slot| switch (b) {
+            .spill => |other| slot == other,
+            else => false,
+        },
+    };
+}
 
 fn removeEdgeCopy(copies: []EdgeCopy, count: *usize, index: usize) void {
     var cursor = index;
@@ -1100,20 +1796,54 @@ fn removeEdgeCopy(copies: []EdgeCopy, count: *usize, index: usize) void {
     count.* -= 1;
 }
 
-fn emitRecordedEdgeCopy(buffer: *code_buffer.Buffer, copy: EdgeCopy, stats: *Stats) Error!void {
-    try emitMovRegReg(buffer, copy.dst, copy.src, copy.wide);
-    stats.register_moves += 1;
-    stats.native_insts += 1;
+fn emitRecordedEdgeCopy(
+    buffer: *code_buffer.Buffer,
+    spill_plan: ?*const regalloc.SpillPlan,
+    copy: EdgeCopy,
+    stats: *Stats,
+) Error!void {
+    switch (copy.src) {
+        .none => return error.InvalidMachine,
+        .phys => |src| switch (copy.dst) {
+            .none => return error.InvalidMachine,
+            .phys => |dst| {
+                if (dst.class() != copy.class or src.class() != copy.class) return error.InvalidMachine;
+                try emitPhysicalMove(buffer, dst, src, copy.wide);
+                stats.register_moves += 1;
+                stats.native_insts += 1;
+                stats.xmm_insts += @intFromBool(copy.class == .xmm);
+            },
+            .spill => {
+                if (src.class() != copy.class) return error.InvalidMachine;
+                const plan = spill_plan orelse return error.InvalidMachine;
+                try emitSpillStore(buffer, try spillSlot(plan, copy.dst_reg), src, stats);
+            },
+        },
+        .spill => switch (copy.dst) {
+            .none => return error.InvalidMachine,
+            .phys => |dst| {
+                if (dst.class() != copy.class) return error.InvalidMachine;
+                const plan = spill_plan orelse return error.InvalidMachine;
+                try emitSpillLoad(buffer, try spillSlot(plan, copy.src_reg), dst, stats);
+            },
+            .spill => {
+                const plan = spill_plan orelse return error.InvalidMachine;
+                const scratch: regalloc.PhysReg = if (copy.class == .xmm) xmm_scratch_secondary else .r11;
+                try emitSpillLoad(buffer, try spillSlot(plan, copy.src_reg), scratch, stats);
+                try emitSpillStore(buffer, try spillSlot(plan, copy.dst_reg), scratch, stats);
+            },
+        },
+    }
 }
 
-fn emitParallelEdgeCopies(buffer: *code_buffer.Buffer, copies: []EdgeCopy, stats: *Stats) Error!void {
+fn emitParallelEdgeCopies(buffer: *code_buffer.Buffer, spill_plan: ?*const regalloc.SpillPlan, copies: []EdgeCopy, stats: *Stats) Error!void {
     var count = copies.len;
     while (count != 0) {
         var ready: ?usize = null;
         for (copies[0..count], 0..) |candidate, index| {
             var destination_is_source = false;
             for (copies[0..count], 0..) |other, other_index| {
-                if (other_index != index and other.src == candidate.dst) {
+                if (other_index != index and sameLocation(other.src, candidate.dst)) {
                     destination_is_source = true;
                     break;
                 }
@@ -1125,16 +1855,28 @@ fn emitParallelEdgeCopies(buffer: *code_buffer.Buffer, copies: []EdgeCopy, stats
         }
 
         if (ready) |index| {
-            try emitRecordedEdgeCopy(buffer, copies[index], stats);
+            try emitRecordedEdgeCopy(buffer, spill_plan, copies[index], stats);
             removeEdgeCopy(copies, &count, index);
             continue;
         }
 
         const saved_source = copies[0].src;
-        if (saved_source == .r10) return error.InvalidMachine;
-        try emitRecordedEdgeCopy(buffer, .{ .dst = .r10, .src = saved_source, .wide = true }, stats);
+        const scratch: regalloc.PhysReg = if (copies[0].class == .xmm) xmm_scratch_secondary else .r10;
+        if (sameLocation(saved_source, .{ .phys = scratch })) return error.InvalidMachine;
+        try emitRecordedEdgeCopy(buffer, spill_plan, .{
+            .dst = .{ .phys = scratch },
+            .src = saved_source,
+            .dst_reg = std.math.maxInt(machine.RegId),
+            .src_reg = copies[0].src_reg,
+            .wide = true,
+            .class = copies[0].class,
+        }, stats);
         for (copies[0..count]) |*copy| {
-            if (copy.src == saved_source) copy.src = .r10;
+            if (sameLocation(copy.src, saved_source)) {
+                if (copy.class != copies[0].class) return error.InvalidMachine;
+                copy.src = .{ .phys = scratch };
+                copy.src_reg = std.math.maxInt(machine.RegId);
+            }
         }
         stats.edge_copy_cycles += 1;
     }
@@ -1144,6 +1886,7 @@ fn emitEdgeCopies(
     allocator: std.mem.Allocator,
     buffer: *code_buffer.Buffer,
     allocation: *const regalloc.Allocation,
+    spill_plan: *const regalloc.SpillPlan,
     source: *const machine.Function,
     edge: machine.EdgeMoves,
     stats: *Stats,
@@ -1152,25 +1895,62 @@ fn emitEdgeCopies(
     defer allocator.free(copies);
     var count: usize = 0;
     var physical_destinations = [_]bool{false} ** 16;
+    var xmm_destinations = [_]bool{false} ** 8;
+    var spill_destinations = try allocator.alloc(bool, spill_plan.slots.len);
+    defer allocator.free(spill_destinations);
+    @memset(spill_destinations, false);
     for (edge.moves) |move| {
         if (move.dst >= source.reg_types.len or move.src >= source.reg_types.len) return error.InvalidMachine;
-        const dst = try physOf(allocation, move.dst);
-        const src = try physOf(allocation, move.src);
-        if (dst.class() != src.class()) return error.InvalidMachine;
-        if (dst.class() != .gp) return error.UnsupportedInstruction;
-        if (dst == .r10 or dst == .r11 or src == .r10 or src == .r11) return error.InvalidMachine;
-        const physical = try x64Reg(dst);
-        if (physical_destinations[physical]) return error.InvalidMachine;
-        physical_destinations[physical] = true;
-        if (dst == src) continue;
+        const class = valueClass(move.ty);
+        const dst = allocation.locationOf(move.dst) orelse return error.InvalidMachine;
+        const src = allocation.locationOf(move.src) orelse return error.InvalidMachine;
+        switch (dst) {
+            .phys => |physical_reg| {
+                if (physical_reg.class() != class) return error.InvalidMachine;
+                switch (physical_reg.class()) {
+                    .gp => {
+                        if (physical_reg == .r10 or physical_reg == .r11) return error.UnsupportedInstruction;
+                        const physical = try x64Reg(physical_reg);
+                        if (physical_destinations[physical]) return error.InvalidMachine;
+                        physical_destinations[physical] = true;
+                    },
+                    .xmm => {
+                        if (physical_reg == xmm_scratch_primary or physical_reg == xmm_scratch_secondary) return error.UnsupportedInstruction;
+                        const physical = try xmmReg(physical_reg);
+                        if (xmm_destinations[physical]) return error.InvalidMachine;
+                        xmm_destinations[physical] = true;
+                    },
+                }
+            },
+            .spill => |slot| {
+                if (slot >= spill_destinations.len or spill_destinations[slot]) return error.InvalidMachine;
+                spill_destinations[slot] = true;
+            },
+            .none => return error.InvalidMachine,
+        }
+        switch (src) {
+            .phys => |physical_reg| {
+                if (physical_reg.class() != class) return error.InvalidMachine;
+                switch (physical_reg.class()) {
+                    .gp => if (physical_reg == .r10 or physical_reg == .r11) return error.UnsupportedInstruction,
+                    .xmm => if (physical_reg == xmm_scratch_primary or physical_reg == xmm_scratch_secondary) return error.UnsupportedInstruction,
+                }
+            },
+            .spill => {},
+            .none => return error.InvalidMachine,
+        }
+        if (sameLocation(dst, src)) continue;
         copies[count] = .{
             .dst = dst,
             .src = src,
+            .dst_reg = move.dst,
+            .src_reg = move.src,
             .wide = isWideType(move.ty) or source.isGcRoot(move.dst) or source.isGcRoot(move.src),
+            .class = class,
         };
         count += 1;
     }
-    try emitParallelEdgeCopies(buffer, copies[0..count], stats);
+    try emitParallelEdgeCopies(buffer, spill_plan, copies[0..count], stats);
 }
 
 fn edgeTargetLabel(
@@ -1215,6 +1995,9 @@ fn encodeInst(
     edge_labels: []const code_buffer.LabelId,
     block_id: cfg.BlockId,
     allocation: *const regalloc.Allocation,
+    spill_plan: *const regalloc.SpillPlan,
+    frame_bytes: u32,
+    preserve_nonvolatile: bool,
     source: *const machine.Function,
     inst: machine.Inst,
     runtime: ?RuntimeAbi,
@@ -1225,30 +2008,337 @@ fn encodeInst(
     switch (inst.opcode) {
         .const_i32 => {
             if (inst.defs.len != 1) return error.InvalidMachine;
-            try emitMovRegImm32(buffer, try physOf(allocation, inst.defs[0]), @intCast(inst.imm));
+            const ty = source.reg_types[inst.defs[0]];
+            const class = valueClass(ty);
+            switch (allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine) {
+                .phys => |dst| {
+                    if (dst.class() != class) return error.InvalidMachine;
+                    if (class == .xmm) {
+                        try emitMovRegImm32(buffer, .r10, @intCast(inst.imm));
+                        try emitGpToXmm(buffer, dst, .r10, false);
+                        stats.native_insts += 2;
+                        stats.xmm_insts += 1;
+                    } else {
+                        try emitMovRegImm32(buffer, dst, @intCast(inst.imm));
+                        stats.native_insts += 1;
+                    }
+                },
+                .spill => {
+                    try emitMovRegImm32(buffer, .r10, @intCast(inst.imm));
+                    stats.native_insts += 1;
+                    try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), .r10, stats);
+                },
+                .none => return error.InvalidMachine,
+            }
             stats.constants += 1;
-            stats.native_insts += 1;
+        },
+        .const_i64 => {
+            if (inst.defs.len == 0 or inst.defs.len > 2) return error.InvalidMachine;
+            const ty = source.reg_types[inst.defs[0]];
+            const class = valueClass(ty);
+            switch (allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine) {
+                .phys => |dst| {
+                    if (dst.class() != class) return error.InvalidMachine;
+                    if (class == .xmm) {
+                        try emitMovRegImm64(buffer, .r10, inst.imm);
+                        try emitGpToXmm(buffer, dst, .r10, true);
+                        stats.native_insts += 2;
+                        stats.xmm_insts += 1;
+                    } else {
+                        try emitMovRegImm64(buffer, dst, inst.imm);
+                        stats.native_insts += 1;
+                    }
+                },
+                .spill => {
+                    try emitMovRegImm64(buffer, .r10, inst.imm);
+                    stats.native_insts += 1;
+                    try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), .r10, stats);
+                },
+                .none => return error.InvalidMachine,
+            }
+            stats.constants += 1;
         },
         .mov => {
-            if (inst.defs.len != 1 or inst.uses.len != 1) return error.UnsupportedInstruction;
-            const dst = try physOf(allocation, inst.defs[0]);
-            const src = try physOf(allocation, inst.uses[0]);
-            const wide = isWideType(source.reg_types[inst.defs[0]]);
-            try emitMovRegReg(buffer, dst, src, wide);
-            stats.register_moves += 1;
-            stats.native_insts += 1;
+            if (inst.defs.len == 0 or inst.defs.len > 2 or inst.uses.len != inst.defs.len) return error.UnsupportedInstruction;
+            const ty = source.reg_types[inst.defs[0]];
+            const class = valueClass(ty);
+            if (valueClass(source.reg_types[inst.uses[0]]) != class) return error.InvalidMachine;
+            const wide = isWideType(ty) or source.isGcRoot(inst.defs[0]) or source.isGcRoot(inst.uses[0]);
+            const scratch: regalloc.PhysReg = if (class == .xmm) xmm_scratch_primary else .r10;
+            const src = try readInto(buffer, allocation, spill_plan, inst.uses[0], scratch, stats);
+            if (src.class() != class) return error.InvalidMachine;
+            try writeFrom(buffer, allocation, spill_plan, inst.defs[0], src, wide, stats);
         },
         .add_i32, .sub_i32, .mul_i32, .and_i32, .or_i32, .xor_i32 => {
             if (inst.defs.len != 1 or (inst.uses.len != 1 and inst.uses.len != 2)) return error.InvalidMachine;
-            const dst = try physOf(allocation, inst.defs[0]);
-            try emitMovRegReg(buffer, dst, try physOf(allocation, inst.uses[0]), false);
+            const dst: regalloc.PhysReg = switch (allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine) {
+                .phys => |physical| physical,
+                .spill => .r10,
+                .none => return error.InvalidMachine,
+            };
+            const lhs = try readInto(buffer, allocation, spill_plan, inst.uses[0], dst, stats);
+            try emitMovRegReg(buffer, dst, lhs, false);
             if (inst.uses.len == 2) {
-                try emitBinaryRegReg(buffer, inst.opcode, dst, try physOf(allocation, inst.uses[1]));
+                const rhs = try readInto(buffer, allocation, spill_plan, inst.uses[1], if (dst == .r10) .r11 else .r10, stats);
+                try emitBinaryRegReg(buffer, inst.opcode, dst, rhs);
             } else {
                 if (inst.imm < std.math.minInt(i32) or inst.imm > std.math.maxInt(i32)) return error.UnsupportedInstruction;
                 try emitBinaryRegImm32(buffer, inst.opcode, dst, @intCast(inst.imm));
             }
             stats.native_insts += 2;
+            switch (allocation.locationOf(inst.defs[0]).?) {
+                .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                else => {},
+            }
+        },
+        .f32_op, .f64_op => {
+            const operation = inst.float_op orelse return error.InvalidMachine;
+            const wide = inst.opcode == .f64_op;
+            switch (operation) {
+                .add, .sub, .mul, .div => {
+                    if (wide) {
+                        if (inst.defs.len != 2 or inst.uses.len != 4) return error.InvalidMachine;
+                        if (source.reg_types[inst.defs[0]] != .double or
+                            source.reg_types[inst.uses[0]] != .double or
+                            source.reg_types[inst.uses[2]] != .double) return error.InvalidMachine;
+                    } else {
+                        if (inst.defs.len != 1 or inst.uses.len != 2) return error.InvalidMachine;
+                        if (source.reg_types[inst.defs[0]] != .float or
+                            source.reg_types[inst.uses[0]] != .float or
+                            source.reg_types[inst.uses[1]] != .float) return error.InvalidMachine;
+                    }
+                    const rhs_use: machine.RegId = inst.uses[if (wide) 2 else 1];
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const lhs_location = allocation.locationOf(inst.uses[0]) orelse return error.InvalidMachine;
+                    const rhs_location = allocation.locationOf(rhs_use) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => xmm_scratch_primary,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .xmm) return error.InvalidMachine;
+
+                    var saved_rhs: ?regalloc.PhysReg = null;
+                    switch (rhs_location) {
+                        .phys => |rhs| {
+                            if (rhs.class() != .xmm) return error.InvalidMachine;
+                            if (rhs == dst and !sameLocation(lhs_location, rhs_location)) {
+                                try recordPhysicalMove(buffer, xmm_scratch_secondary, rhs, wide, stats);
+                                saved_rhs = xmm_scratch_secondary;
+                            }
+                        },
+                        .spill => {},
+                        .none => return error.InvalidMachine,
+                    }
+
+                    const lhs = try readInto(buffer, allocation, spill_plan, inst.uses[0], dst, stats);
+                    if (lhs.class() != .xmm) return error.InvalidMachine;
+                    try recordPhysicalMove(buffer, dst, lhs, wide, stats);
+                    const rhs = saved_rhs orelse try readInto(
+                        buffer,
+                        allocation,
+                        spill_plan,
+                        rhs_use,
+                        if (dst == xmm_scratch_primary) xmm_scratch_secondary else xmm_scratch_primary,
+                        stats,
+                    );
+                    if (rhs.class() != .xmm) return error.InvalidMachine;
+                    try emitXmmBinary(buffer, operation, dst, rhs, wide);
+                    stats.native_insts += 1;
+                    stats.xmm_insts += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
+                    }
+                },
+                .rem => {
+                    if (wide) {
+                        if (inst.defs.len != 2 or inst.uses.len != 4 or
+                            source.reg_types[inst.defs[0]] != .double or
+                            source.reg_types[inst.uses[0]] != .double or
+                            source.reg_types[inst.uses[2]] != .double) return error.InvalidMachine;
+                    } else {
+                        if (inst.defs.len != 1 or inst.uses.len != 2 or
+                            source.reg_types[inst.defs[0]] != .float or
+                            source.reg_types[inst.uses[0]] != .float or
+                            source.reg_types[inst.uses[1]] != .float) return error.InvalidMachine;
+                    }
+                    const abi = runtime orelse return error.MissingRuntimeAbi;
+                    const rhs_use: machine.RegId = inst.uses[if (wide) 2 else 1];
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => xmm_scratch_primary,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .xmm) return error.InvalidMachine;
+
+                    // The helper ABI transports raw bits through reserved GP
+                    // scratch, so operand location and the platform float ABI
+                    // cannot affect Dalvik remainder semantics.
+                    const lhs = try readInto(buffer, allocation, spill_plan, inst.uses[0], xmm_scratch_primary, stats);
+                    if (lhs.class() != .xmm) return error.InvalidMachine;
+                    try emitXmmToGp(buffer, .r10, lhs, wide);
+                    const rhs = try readInto(buffer, allocation, spill_plan, rhs_use, xmm_scratch_primary, stats);
+                    if (rhs.class() != .xmm) return error.InvalidMachine;
+                    try emitXmmToGp(buffer, .r11, rhs, wide);
+                    try emitNumericCall(buffer, if (wide) abi.f64_remainder_helper else abi.f32_remainder_helper);
+                    try emitGpToXmm(buffer, dst, .r10, wide);
+                    stats.native_insts += 7;
+                    stats.xmm_insts += 3;
+                    stats.xmm_remainders += 1;
+                    stats.numeric_helper_calls += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
+                    }
+                },
+                .neg => {
+                    if (wide) {
+                        if (inst.defs.len != 2 or inst.uses.len != 2 or
+                            source.reg_types[inst.defs[0]] != .double or source.reg_types[inst.uses[0]] != .double) return error.InvalidMachine;
+                    } else {
+                        if (inst.defs.len != 1 or inst.uses.len != 1 or
+                            source.reg_types[inst.defs[0]] != .float or source.reg_types[inst.uses[0]] != .float) return error.InvalidMachine;
+                    }
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => xmm_scratch_primary,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .xmm) return error.InvalidMachine;
+                    const src = try readInto(buffer, allocation, spill_plan, inst.uses[0], dst, stats);
+                    if (src.class() != .xmm) return error.InvalidMachine;
+                    try recordPhysicalMove(buffer, dst, src, wide, stats);
+                    if (wide) {
+                        try emitMovRegImm64(buffer, .r10, std.math.minInt(i64));
+                    } else {
+                        try emitMovRegImm32(buffer, .r10, std.math.minInt(i32));
+                    }
+                    try emitGpToXmm(buffer, xmm_scratch_secondary, .r10, wide);
+                    try emitXmmXor(buffer, dst, xmm_scratch_secondary, wide);
+                    stats.native_insts += 3;
+                    stats.xmm_insts += 2;
+                    stats.xmm_negations += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
+                    }
+                },
+                .compare_l, .compare_g => {
+                    if (inst.defs.len != 1 or source.reg_types[inst.defs[0]] != .int) return error.InvalidMachine;
+                    if (wide) {
+                        if (inst.uses.len != 4 or source.reg_types[inst.uses[0]] != .double or
+                            source.reg_types[inst.uses[2]] != .double) return error.InvalidMachine;
+                    } else {
+                        if (inst.uses.len != 2 or source.reg_types[inst.uses[0]] != .float or
+                            source.reg_types[inst.uses[1]] != .float) return error.InvalidMachine;
+                    }
+                    const rhs_use: machine.RegId = inst.uses[if (wide) 2 else 1];
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => .r10,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .gp) return error.InvalidMachine;
+                    const lhs = try readInto(buffer, allocation, spill_plan, inst.uses[0], xmm_scratch_primary, stats);
+                    const rhs = try readInto(buffer, allocation, spill_plan, rhs_use, xmm_scratch_secondary, stats);
+                    try emitXmmCompareResult(buffer, operation, dst, lhs, rhs, wide, stats);
+                    stats.xmm_comparisons += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
+                    }
+                },
+                .int_to_float, .int_to_double, .long_to_float, .long_to_double => {
+                    const input_wide = operation == .long_to_float or operation == .long_to_double;
+                    const output_wide = operation == .int_to_double or operation == .long_to_double;
+                    const expected_defs: usize = if (output_wide) 2 else 1;
+                    const expected_uses: usize = if (input_wide) 2 else 1;
+                    if (wide != output_wide or
+                        inst.defs.len != expected_defs or
+                        inst.uses.len != expected_uses) return error.InvalidMachine;
+                    const expected_src: machine.ValueType = if (input_wide) .long else .int;
+                    const expected_dst: machine.ValueType = if (output_wide) .double else .float;
+                    if (source.reg_types[inst.defs[0]] != expected_dst or source.reg_types[inst.uses[0]] != expected_src) return error.InvalidMachine;
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => xmm_scratch_primary,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .xmm) return error.InvalidMachine;
+                    const src = try readInto(buffer, allocation, spill_plan, inst.uses[0], .r10, stats);
+                    if (src.class() != .gp) return error.InvalidMachine;
+                    try emitGpToFloatConvert(buffer, dst, src, input_wide, output_wide);
+                    stats.xmm_insts += 1;
+                    stats.xmm_conversions += 1;
+                    stats.native_insts += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
+                    }
+                },
+                .float_to_int, .float_to_long, .double_to_int, .double_to_long => {
+                    const input_wide = operation == .double_to_int or operation == .double_to_long;
+                    const output_wide = operation == .float_to_long or operation == .double_to_long;
+                    const expected_defs: usize = if (output_wide) 2 else 1;
+                    const expected_uses: usize = if (input_wide) 2 else 1;
+                    if (wide != input_wide or
+                        inst.defs.len != expected_defs or
+                        inst.uses.len != expected_uses) return error.InvalidMachine;
+                    const expected_src: machine.ValueType = if (input_wide) .double else .float;
+                    const expected_dst: machine.ValueType = if (output_wide) .long else .int;
+                    if (source.reg_types[inst.defs[0]] != expected_dst or source.reg_types[inst.uses[0]] != expected_src) return error.InvalidMachine;
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => .r10,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .gp) return error.InvalidMachine;
+                    const src = try readInto(buffer, allocation, spill_plan, inst.uses[0], xmm_scratch_primary, stats);
+                    if (src.class() != .xmm) return error.InvalidMachine;
+                    try emitSaturatingFloatToInteger(buffer, dst, src, input_wide, output_wide, stats);
+                    stats.xmm_conversions += 1;
+                    stats.xmm_saturating_conversions += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
+                    }
+                },
+                .float_to_double, .double_to_float => {
+                    const input_wide = operation == .double_to_float;
+                    const output_wide = !input_wide;
+                    const expected_defs: usize = if (output_wide) 2 else 1;
+                    const expected_uses: usize = if (input_wide) 2 else 1;
+                    if (wide != input_wide or
+                        inst.defs.len != expected_defs or
+                        inst.uses.len != expected_uses) return error.InvalidMachine;
+                    const expected_src: machine.ValueType = if (input_wide) .double else .float;
+                    const expected_dst: machine.ValueType = if (output_wide) .double else .float;
+                    if (source.reg_types[inst.defs[0]] != expected_dst or source.reg_types[inst.uses[0]] != expected_src) return error.InvalidMachine;
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => xmm_scratch_primary,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .xmm) return error.InvalidMachine;
+                    const src = try readInto(buffer, allocation, spill_plan, inst.uses[0], dst, stats);
+                    if (src.class() != .xmm) return error.InvalidMachine;
+                    try emitFloatWidthConvert(buffer, dst, src, input_wide);
+                    stats.xmm_insts += 1;
+                    stats.xmm_conversions += 1;
+                    stats.native_insts += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
+                    }
+                },
+            }
         },
         // The following resolve performs the same null discrimination and
         // transfers failure to the runtime helper, so no duplicate branch is
@@ -1256,7 +2346,7 @@ fn encodeInst(
         .check_null => {},
         .check_bounds => {
             if (inst.uses.len != 1 or source.isGcRoot(inst.uses[0])) return error.InvalidMachine;
-            try emitBoundsExceptionCheck(allocator, buffer, allocation, inst, runtime orelse return error.MissingRuntimeAbi, cold_bounds, stats);
+            try emitBoundsExceptionCheck(allocator, buffer, allocation, spill_plan, inst, runtime orelse return error.MissingRuntimeAbi, cold_bounds, stats);
         },
         .resolve_handle => try emitResolve(allocator, buffer, allocation, inst, runtime orelse return error.MissingRuntimeAbi, cold, stats),
         .loop_epoch_guard => try emitLoopEpochGuard(allocator, buffer, allocation, inst, cold, stats),
@@ -1265,13 +2355,19 @@ fn encodeInst(
             const abi = runtime orelse return error.MissingRuntimeAbi;
             const layout = try referenceArrayLayout(abi);
             if (!source.isGcRoot(inst.defs[0]) or source.isGcRoot(inst.uses[0])) return error.InvalidRuntimeAbi;
-            const destination = try x64Reg(try physOf(allocation, inst.defs[0]));
+            const destination_reg: regalloc.PhysReg = switch (allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine) {
+                .phys => |physical| physical,
+                .spill => .r11,
+                .none => return error.InvalidMachine,
+            };
+            const destination = try x64Reg(destination_reg);
             const address = try x64Reg(try physOf(allocation, inst.address orelse return error.InvalidMachine));
-            const index = try x64Reg(try physOf(allocation, inst.uses[0]));
+            const index = try x64Reg(try readInto(buffer, allocation, spill_plan, inst.uses[0], .r10, stats));
             try emitMovRawRaw(buffer, scratch_index, index, false);
             try emitRexX(buffer, true, destination, scratch_index, address);
             try buffer.emitU8(0x8b);
             try emitIndexedMemoryOperand(buffer, destination, address, scratch_index, 3, @intCast(layout.data_offset));
+            try writeFrom(buffer, allocation, spill_plan, inst.defs[0], destination_reg, true, stats);
             stats.array_loads += 1;
             stats.pointer_loads += 1;
             stats.native_insts += 2;
@@ -1281,9 +2377,15 @@ fn encodeInst(
             const abi = runtime orelse return error.MissingRuntimeAbi;
             const layout = try fieldLayout(abi, inst.field_idx);
             try verifyFieldType(source, inst.defs[0], layout.storage);
-            const dst = try x64Reg(try physOf(allocation, inst.defs[0]));
+            const destination_reg: regalloc.PhysReg = switch (allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine) {
+                .phys => |physical| physical,
+                .spill => .r10,
+                .none => return error.InvalidMachine,
+            };
+            const dst = try x64Reg(destination_reg);
             const address = try x64Reg(try physOf(allocation, inst.address orelse return error.InvalidMachine));
             try emitLoadField(buffer, dst, address, @intCast(layout.offset), layout.storage);
+            try writeFrom(buffer, allocation, spill_plan, inst.defs[0], destination_reg, layout.storage == .i64 or layout.storage == .reference, stats);
             stats.pointer_loads += 1;
             stats.native_insts += 1;
         },
@@ -1299,7 +2401,7 @@ fn encodeInst(
             } else {
                 if (inst.uses.len != 1 or source.isGcRoot(inst.uses[0])) return error.InvalidMachine;
                 const layout = try referenceArrayLayout(abi);
-                const index = try x64Reg(try physOf(allocation, inst.uses[0]));
+                const index = try x64Reg(try readInto(buffer, allocation, spill_plan, inst.uses[0], .r10, stats));
                 try emitArrayElementAddress(buffer, scratch_index, address, index, layout);
             }
             const repeat_proven = inst.pre_write == .satb_repeat_guarded;
@@ -1315,8 +2417,8 @@ fn encodeInst(
             const abi = runtime orelse return error.MissingRuntimeAbi;
             const layout = try referenceArrayLayout(abi);
             if (!source.isGcRoot(inst.uses[0]) or source.isGcRoot(inst.uses[1])) return error.InvalidRuntimeAbi;
-            const value = try x64Reg(try physOf(allocation, inst.uses[0]));
-            const index = try x64Reg(try physOf(allocation, inst.uses[1]));
+            const value = try x64Reg(try readInto(buffer, allocation, spill_plan, inst.uses[0], .r11, stats));
+            const index = try x64Reg(try readInto(buffer, allocation, spill_plan, inst.uses[1], .r10, stats));
             const address = try x64Reg(try physOf(allocation, inst.address orelse return error.InvalidMachine));
             try emitArrayElementAddress(buffer, scratch_index, address, index, layout);
             try emitMovMemoryFromRaw(buffer, scratch_index, 0, value, true);
@@ -1329,7 +2431,7 @@ fn encodeInst(
             const abi = runtime orelse return error.MissingRuntimeAbi;
             const layout = try fieldLayout(abi, inst.field_idx);
             try verifyFieldType(source, inst.uses[0], layout.storage);
-            const src = try x64Reg(try physOf(allocation, inst.uses[0]));
+            const src = try x64Reg(try readInto(buffer, allocation, spill_plan, inst.uses[0], .r10, stats));
             const address = try x64Reg(try physOf(allocation, inst.address orelse return error.InvalidMachine));
             try emitStoreField(buffer, address, @intCast(layout.offset), src, layout.storage);
             stats.pointer_stores += 1;
@@ -1351,7 +2453,7 @@ fn encodeInst(
             const abi = runtime orelse return error.MissingRuntimeAbi;
             const layout = try staticFieldLayout(abi, inst.field_idx);
             try verifyFieldType(source, inst.uses[0], layout.storage);
-            const value = try x64Reg(try physOf(allocation, inst.uses[0]));
+            const value = try x64Reg(try readInto(buffer, allocation, spill_plan, inst.uses[0], .r11, stats));
             try emitMovRawImm64(buffer, scratch_index, layout.address);
             try emitStoreField(buffer, scratch_index, 0, value, layout.storage);
             stats.pointer_stores += @intFromBool(layout.storage == .reference);
@@ -1362,7 +2464,7 @@ fn encodeInst(
             const abi = runtime orelse return error.MissingRuntimeAbi;
             const layout = try staticFieldLayout(abi, inst.field_idx);
             if (layout.storage != .reference or !source.isGcRoot(inst.uses[0])) return error.InvalidRuntimeAbi;
-            const stored = try x64Reg(try physOf(allocation, inst.uses[0]));
+            const stored = try x64Reg(try readInto(buffer, allocation, spill_plan, inst.uses[0], .r11, stats));
             try emitMovRawImm64(buffer, scratch_index, layout.address);
             try emitMovRawRaw(buffer, scratch_descriptor, stored, true);
             try emitBarrierCall(buffer, abi.static_root_post_write_helper);
@@ -1373,7 +2475,7 @@ fn encodeInst(
             if (inst.defs.len != 0 or inst.uses.len != 1) return error.InvalidMachine;
             const abi = runtime orelse return error.MissingRuntimeAbi;
             const destination = try x64Reg(try physOf(allocation, inst.state_handle orelse return error.InvalidMachine));
-            const stored = try x64Reg(try physOf(allocation, inst.uses[0]));
+            const stored = try x64Reg(try readInto(buffer, allocation, spill_plan, inst.uses[0], .r11, stats));
             const repeat_proven = inst.post_write == .card_repeat_guarded;
             if (inst.post_write == .none) return error.InvalidMachine;
             try emitMovRawRaw(buffer, scratch_index, destination, true);
@@ -1383,6 +2485,24 @@ fn encodeInst(
             stats.card_repeat_barriers += @intFromBool(repeat_proven);
             stats.native_insts += 6;
         },
+        .monitor_enter, .monitor_exit => {
+            if (inst.defs.len != 0 or inst.uses.len != 1 or !source.isGcRoot(inst.uses[0]) or
+                inst.state_handle == null or inst.state_handle.? != inst.uses[0]) return error.InvalidMachine;
+            const abi = runtime orelse return error.MissingRuntimeAbi;
+            const site = inst.monitor_site_id orelse return error.InvalidMachine;
+            const handle = try x64Reg(try readInto(buffer, allocation, spill_plan, inst.uses[0], .r10, stats));
+            try emitMovRawRaw(buffer, scratch_index, handle, true);
+            const pc = inst.pc orelse return error.InvalidMachine;
+            const site_key = (@as(u64, pc) << 32) | site;
+            try emitMovRawImm64(buffer, scratch_descriptor, site_key);
+            try emitMonitorCall(buffer, if (inst.opcode == .monitor_enter) abi.monitor_enter_helper else abi.monitor_exit_helper);
+            if (inst.opcode == .monitor_enter) {
+                stats.monitor_enters += 1;
+            } else {
+                stats.monitor_exits += 1;
+            }
+            stats.native_insts += 5;
+        },
         .jump => {
             try emitJump(buffer, try edgeTargetLabel(source, labels, edge_labels, block_id, inst.target));
             stats.jumps += 1;
@@ -1391,9 +2511,11 @@ fn encodeInst(
         .branch => {
             const condition = inst.condition orelse return error.InvalidMachine;
             if (inst.uses.len == 1) {
-                try emitCmpRegZero(buffer, try physOf(allocation, inst.uses[0]));
+                try emitCmpRegZero(buffer, try readInto(buffer, allocation, spill_plan, inst.uses[0], .r10, stats));
             } else if (inst.uses.len == 2) {
-                try emitCmpRegs(buffer, try physOf(allocation, inst.uses[0]), try physOf(allocation, inst.uses[1]));
+                const lhs = try readInto(buffer, allocation, spill_plan, inst.uses[0], .r10, stats);
+                const rhs = try readInto(buffer, allocation, spill_plan, inst.uses[1], .r11, stats);
+                try emitCmpRegs(buffer, lhs, rhs);
             } else {
                 return error.InvalidMachine;
             }
@@ -1404,12 +2526,23 @@ fn encodeInst(
             stats.native_insts += 3;
         },
         .ret => {
-            if (inst.uses.len == 1) {
-                const src = try physOf(allocation, inst.uses[0]);
-                const wide = isWideType(source.reg_types[inst.uses[0]]);
-                try emitMovRegReg(buffer, .rax, src, wide);
+            if (inst.uses.len == 1 or inst.uses.len == 2) {
+                const ty = source.reg_types[inst.uses[0]];
+                if (inst.uses.len == 2 and ty != .long and ty != .double) return error.InvalidMachine;
+                const wide = isWideType(ty) or source.isGcRoot(inst.uses[0]);
+                if (valueClass(ty) == .xmm) {
+                    const src = try readInto(buffer, allocation, spill_plan, inst.uses[0], xmm_scratch_primary, stats);
+                    if (src.class() != .xmm) return error.InvalidMachine;
+                    try emitXmmToGp(buffer, .rax, src, wide);
+                    stats.native_insts += 1;
+                    stats.xmm_insts += 1;
+                } else {
+                    const src = try readInto(buffer, allocation, spill_plan, inst.uses[0], .rax, stats);
+                    try recordPhysicalMove(buffer, .rax, src, wide, stats);
+                }
             }
-            if (inst.uses.len > 1) return error.UnsupportedInstruction;
+            if (inst.uses.len > 2) return error.UnsupportedInstruction;
+            try emitFrameLeave(buffer, frame_bytes, preserve_nonvolatile);
             try emitRet(buffer);
             stats.returns += 1;
             stats.native_insts += 1;
@@ -1462,15 +2595,46 @@ fn instructionSafepointId(inst: machine.Inst) ?u32 {
         inst.guard_site_id
     else if (inst.opcode == .check_bounds)
         inst.exception_site_id
+    else if (inst.opcode == .monitor_enter or inst.opcode == .monitor_exit)
+        inst.monitor_site_id
     else
         null;
 }
 
-fn deoptIdForSite(options: ?DeoptOptions, site_id: u32) Error!?u32 {
+fn blockEntryDeoptCount(options: ?DeoptOptions) Error!u32 {
+    const deopt = options orelse return 0;
+    var count: u32 = 0;
+    for (deopt.points) |point| {
+        if ((point.safepoint_id == null) == (point.block_entry == null)) return error.InvalidDeoptMetadata;
+        if (point.block_entry != null) count = std.math.add(u32, count, 1) catch return error.InvalidDeoptMetadata;
+    }
+    return count;
+}
+
+fn deoptPointSiteId(source: *const machine.Function, options: DeoptOptions, point_index: usize) Error!u32 {
+    if (point_index >= options.points.len) return error.InvalidDeoptMetadata;
+    const point = options.points[point_index];
+    if ((point.safepoint_id == null) == (point.block_entry == null)) return error.InvalidDeoptMetadata;
+    if (point.safepoint_id) |site_id| return site_id;
+
+    const block = point.block_entry orelse return error.InvalidDeoptMetadata;
+    if (block >= source.blocks.len or source.blocks[block].insts.len == 0 or
+        source.blocks[block].insts[0].pc != point.dex_pc) return error.InvalidDeoptMetadata;
+    var ordinal: u32 = 0;
+    for (options.points[0..point_index]) |previous| {
+        if (previous.block_entry) |previous_block| {
+            if (previous_block == block) return error.InvalidDeoptMetadata;
+            ordinal = std.math.add(u32, ordinal, 1) catch return error.InvalidDeoptMetadata;
+        }
+    }
+    return std.math.add(u32, try machineSafepointCount(source), ordinal) catch return error.InvalidDeoptMetadata;
+}
+
+fn deoptIdForSite(source: *const machine.Function, options: ?DeoptOptions, site_id: u32) Error!?u32 {
     const deopt = options orelse return null;
     var result: ?u32 = null;
-    for (deopt.points) |point| {
-        if (point.safepoint_id != site_id) continue;
+    for (deopt.points, 0..) |point, point_index| {
+        if (try deoptPointSiteId(source, deopt, point_index) != site_id) continue;
         if (result != null) return error.InvalidDeoptMetadata;
         result = point.id;
     }
@@ -1492,6 +2656,11 @@ const RootLiveness = struct {
     fn blockOut(self: *const RootLiveness, block: cfg.BlockId) []const usize {
         const first = @as(usize, block) * self.words_per_block;
         return self.live_out[first .. first + self.words_per_block];
+    }
+
+    fn blockIn(self: *const RootLiveness, block: cfg.BlockId) []const usize {
+        const first = @as(usize, block) * self.words_per_block;
+        return self.live_in[first .. first + self.words_per_block];
     }
 };
 
@@ -1661,15 +2830,72 @@ fn pendingRootMapLess(_: void, a: PendingRootMap, b: PendingRootMap) bool {
     return a.site_id < b.site_id;
 }
 
+fn spillSlotFor(plan: *const regalloc.SpillPlan, reg: machine.RegId) ?regalloc.SpillSlot {
+    for (plan.slots) |slot| if (slot.reg == reg) return slot;
+    return null;
+}
+
+fn validateSpillPlan(
+    source: *const machine.Function,
+    allocation: *const regalloc.Allocation,
+    plan: *const regalloc.SpillPlan,
+) Error!void {
+    try plan.verify();
+    if (plan.source != source or plan.location_count != allocation.locations.len) return error.InvalidMachine;
+    for (allocation.intervals) |interval| {
+        const slot = spillSlotFor(plan, interval.reg);
+        switch (allocation.locations[interval.reg]) {
+            .spill => |index| if (slot == null or slot.?.slot != index) return error.InvalidMachine,
+            .phys => if (slot != null) return error.InvalidMachine,
+            .none => return error.InvalidMachine,
+        }
+    }
+}
+
+fn collectLiveRoots(
+    allocator: std.mem.Allocator,
+    source: *const machine.Function,
+    allocation: *const regalloc.Allocation,
+    spill_plan: *const regalloc.SpillPlan,
+    live: []const usize,
+) Error![]runtime_stack_map.RootLocation {
+    var roots: std.ArrayList(runtime_stack_map.RootLocation) = .empty;
+    errdefer roots.deinit(allocator);
+    var physical_roots = [_]bool{false} ** 16;
+    for (0..source.reg_types.len) |reg_index| {
+        const reg: machine.RegId = @intCast(reg_index);
+        if (!rootIsSet(live, reg)) continue;
+        switch (allocation.locationOf(reg) orelse return error.InvalidMachine) {
+            .phys => |assigned| {
+                const physical = try x64Reg(assigned);
+                if (physical_roots[physical]) return error.InvalidMachine;
+                physical_roots[physical] = true;
+                try roots.append(allocator, runtime_stack_map.RootLocation.nativeRegister(physical));
+            },
+            .spill => {
+                const slot = spillSlotFor(spill_plan, reg) orelse return error.InvalidMachine;
+                try roots.append(allocator, runtime_stack_map.RootLocation.stackSlot(@intCast(slot.byte_offset)));
+            },
+            .none => return error.InvalidMachine,
+        }
+    }
+    std.mem.sort(runtime_stack_map.RootLocation, roots.items, {}, rootLocationLess);
+    return roots.toOwnedSlice(allocator);
+}
+
 fn buildRootMaps(
     allocator: std.mem.Allocator,
     source: *const machine.Function,
     allocation: *const regalloc.Allocation,
+    spill_plan: *const regalloc.SpillPlan,
     stats: *Stats,
     deopt: ?DeoptOptions,
 ) Error!?runtime_stack_map.Table {
+    try validateSpillPlan(source, allocation, spill_plan);
     const resolve_sites = std.math.add(u32, source.stats.resolves, source.stats.loop_epoch_guards) catch return error.InvalidMachine;
-    const expected_sites = std.math.add(u32, resolve_sites, source.stats.bounds_exception_sites) catch return error.InvalidMachine;
+    const monitor_and_bounds = std.math.add(u32, source.stats.monitor_sites, source.stats.bounds_exception_sites) catch return error.InvalidMachine;
+    const machine_sites = std.math.add(u32, resolve_sites, monitor_and_bounds) catch return error.InvalidMachine;
+    const expected_sites = std.math.add(u32, machine_sites, try blockEntryDeoptCount(deopt)) catch return error.InvalidMachine;
     if (expected_sites == 0) return null;
 
     var liveness = try buildLiveness(allocator, source, true);
@@ -1694,31 +2920,11 @@ fn buildRootMaps(
                 if (source.isGcRoot(reg)) unsetRoot(live, reg);
             }
             try addInstructionTrackedUses(source, live, inst, true);
-            if (inst.opcode == .resolve_handle or inst.opcode == .loop_epoch_guard or
-                (inst.opcode == .check_bounds and inst.exception_site_id != null))
-            {
-                const site_id = if (inst.opcode == .resolve_handle)
-                    inst.resolve_id orelse return error.InvalidMachine
-                else if (inst.opcode == .loop_epoch_guard)
-                    inst.guard_site_id orelse return error.InvalidMachine
-                else
-                    inst.exception_site_id orelse return error.InvalidMachine;
+            if (instructionSafepointId(inst)) |site_id| {
                 const canonical = inst.state_handle orelse return error.InvalidMachine;
                 if (canonical >= source.reg_types.len or !source.isGcRoot(canonical) or !rootIsSet(live, canonical)) return error.InvalidMachine;
-                var roots: std.ArrayList(runtime_stack_map.RootLocation) = .empty;
-                errdefer roots.deinit(allocator);
-                var physical_roots = [_]bool{false} ** 16;
-                for (0..source.reg_types.len) |reg_index| {
-                    const reg: machine.RegId = @intCast(reg_index);
-                    if (!rootIsSet(live, reg)) continue;
-                    const physical = try x64Reg(try physOf(allocation, reg));
-                    if (physical_roots[physical]) return error.InvalidMachine;
-                    physical_roots[physical] = true;
-                    try roots.append(allocator, runtime_stack_map.RootLocation.nativeRegister(physical));
-                }
-                std.mem.sort(runtime_stack_map.RootLocation, roots.items, {}, rootLocationLess);
-                const deopt_id = try deoptIdForSite(deopt, site_id);
-                const owned = try roots.toOwnedSlice(allocator);
+                const deopt_id = try deoptIdForSite(source, deopt, site_id);
+                const owned = try collectLiveRoots(allocator, source, allocation, spill_plan, live);
                 pending.append(allocator, .{
                     .site_id = site_id,
                     .deopt_id = deopt_id,
@@ -1730,6 +2936,32 @@ fn buildRootMaps(
                 stats.root_map_sites += 1;
                 stats.root_map_locations += @intCast(owned.len);
             }
+        }
+    }
+
+    if (deopt) |deopt_options| {
+        for (deopt_options.points, 0..) |point, point_index| {
+            const block = point.block_entry orelse continue;
+            if (block >= source.blocks.len) return error.InvalidDeoptMetadata;
+            const owned = try collectLiveRoots(
+                allocator,
+                source,
+                allocation,
+                spill_plan,
+                liveness.blockIn(block),
+            );
+            pending.append(allocator, .{
+                .site_id = try deoptPointSiteId(source, deopt_options, point_index),
+                .deopt_id = point.id,
+                .roots = owned,
+            }) catch |err| {
+                allocator.free(owned);
+                return err;
+            };
+            stats.deopt_block_entries += 1;
+            stats.root_map_sites += 1;
+            stats.root_map_locations = std.math.add(u32, stats.root_map_locations, @intCast(owned.len)) catch
+                return error.InvalidDeoptMetadata;
         }
     }
     if (pending.items.len != expected_sites) return error.InvalidMachine;
@@ -1754,7 +2986,8 @@ fn buildRootMaps(
 
 const SafepointPosition = struct {
     position: u32,
-    inst: *const machine.Inst,
+    site_id: u32,
+    pc: u32,
     block: cfg.BlockId,
     instruction: u32,
 };
@@ -1762,18 +2995,48 @@ const SafepointPosition = struct {
 fn findSafepointPosition(source: *const machine.Function, site_id: u32) Error!SafepointPosition {
     var position: u32 = 2;
     var result: ?SafepointPosition = null;
-    for (source.blocks) |*block| {
-        for (block.insts, 0..) |*inst, instruction| {
-            if (instructionSafepointId(inst.*)) |candidate| {
+    for (source.blocks) |block| {
+        for (block.insts, 0..) |inst, instruction| {
+            if (instructionSafepointId(inst)) |candidate| {
                 if (candidate == site_id) {
                     if (result != null) return error.InvalidDeoptMetadata;
-                    result = .{ .position = position, .inst = inst, .block = block.id, .instruction = @intCast(instruction) };
+                    result = .{
+                        .position = position,
+                        .site_id = site_id,
+                        .pc = inst.pc orelse return error.InvalidDeoptMetadata,
+                        .block = block.id,
+                        .instruction = @intCast(instruction),
+                    };
                 }
             }
             position = std.math.add(u32, position, 2) catch return error.InvalidMachine;
         }
     }
     return result orelse error.MissingDeoptSafepoint;
+}
+
+fn resolveDeoptPosition(
+    source: *const machine.Function,
+    options: DeoptOptions,
+    point_index: usize,
+) Error!SafepointPosition {
+    if (point_index >= options.points.len) return error.InvalidDeoptMetadata;
+    const point = options.points[point_index];
+    if (point.safepoint_id) |site_id| {
+        const position = try findSafepointPosition(source, site_id);
+        if (position.pc != point.dex_pc) return error.InvalidDeoptMetadata;
+        return position;
+    }
+    const block = point.block_entry orelse return error.InvalidDeoptMetadata;
+    const site_id = try deoptPointSiteId(source, options, point_index);
+    if (block >= source.blocks.len or source.blocks[block].insts.len == 0) return error.InvalidDeoptMetadata;
+    return .{
+        .position = 0,
+        .site_id = site_id,
+        .pc = point.dex_pc,
+        .block = block,
+        .instruction = 0,
+    };
 }
 
 fn computeInstructionLiveIn(
@@ -1800,29 +3063,409 @@ fn validateDeoptValueType(source: *const machine.Function, value: DeoptValueSpec
     const ty = source.reg_types[reg];
     switch (value.kind) {
         .reference => if (!source.isGcRoot(reg) or (ty != .object and ty != .unknown)) return error.InvalidDeoptMetadata,
-        .scalar64 => if (source.isGcRoot(reg) or (ty != .long and ty != .unknown)) return error.InvalidDeoptMetadata,
+        .scalar64 => if (source.isGcRoot(reg) or (ty != .long and ty != .double and ty != .unknown)) return error.InvalidDeoptMetadata,
         .scalar32 => if (source.isGcRoot(reg) or isWideType(ty) or ty == .conflict) return error.InvalidDeoptMetadata,
     }
 }
 
-fn rootMapContainsRegister(maps: *const runtime_stack_map.Table, site_id: u32, physical: u4) Error!bool {
+fn rootMapContainsSource(maps: *const runtime_stack_map.Table, site_id: u32, source: runtime_deopt.Source) Error!bool {
     const record = try maps.find(site_id);
     for (maps.rootsFor(record)) |root| {
-        if (root.kind == .native_register and root.payload == physical) return true;
+        switch (source) {
+            .native_register => |physical| if (root.kind == .native_register and root.payload == physical) return true,
+            .stack_slot => |offset| if (root.kind == .stack_slot and root.stackOffset() == offset) return true,
+            else => return false,
+        }
     }
     return false;
+}
+
+fn translateDeoptValues(
+    allocator: std.mem.Allocator,
+    source: *const machine.Function,
+    allocation: *const regalloc.Allocation,
+    spill_plan: *const regalloc.SpillPlan,
+    maps: *const runtime_stack_map.Table,
+    safepoint_id: u32,
+    live_values: []const usize,
+    physical_owners: *[16]?machine.RegId,
+    xmm_owners: *[8]?machine.RegId,
+    specs: []const DeoptValueSpec,
+    stats: *Stats,
+) Error![]runtime_deopt.ValueSpec {
+    const values = try allocator.alloc(runtime_deopt.ValueSpec, specs.len);
+    errdefer allocator.free(values);
+    for (specs, 0..) |value, value_index| {
+        const translated_source: runtime_deopt.Source = switch (value.source) {
+            .constant => |bits| .{ .constant = bits },
+            .machine_register => |reg| blk: {
+                if (reg >= source.reg_types.len or !rootIsSet(live_values, reg)) return error.DeadDeoptValue;
+                try validateDeoptValueType(source, value, reg);
+                const translated: runtime_deopt.Source = switch (allocation.locationOf(reg) orelse return error.InvalidMachine) {
+                    .phys => |assigned| switch (assigned.class()) {
+                        .gp => gp: {
+                            const physical = try x64Reg(assigned);
+                            if (physical_owners[physical]) |owner| {
+                                if (owner != reg) return error.AliasedDeoptValue;
+                            } else {
+                                physical_owners[physical] = reg;
+                            }
+                            break :gp .{ .native_register = physical };
+                        },
+                        .xmm => xmm: {
+                            if (value.kind == .reference) return error.InvalidDeoptMetadata;
+                            const physical = try xmmReg(assigned);
+                            if (xmm_owners[physical]) |owner| {
+                                if (owner != reg) return error.AliasedDeoptValue;
+                            } else {
+                                xmm_owners[physical] = reg;
+                            }
+                            stats.deopt_xmm_values += 1;
+                            break :xmm .{ .xmm_register = physical };
+                        },
+                    },
+                    .spill => spill: {
+                        const slot = spillSlotFor(spill_plan, reg) orelse return error.InvalidDeoptMetadata;
+                        if (slot.byte_offset > std.math.maxInt(i32)) return error.InvalidDeoptMetadata;
+                        stats.deopt_stack_values += 1;
+                        break :spill .{ .stack_slot = @intCast(slot.byte_offset) };
+                    },
+                    .none => return error.InvalidMachine,
+                };
+                if (value.kind == .reference and !try rootMapContainsSource(maps, safepoint_id, translated)) {
+                    return error.InvalidDeoptMetadata;
+                }
+                break :blk translated;
+            },
+        };
+        values[value_index] = .{
+            .vreg = value.vreg,
+            .kind = value.kind,
+            .source = translated_source,
+        };
+    }
+    return values;
+}
+
+fn translateDeoptMonitors(
+    allocator: std.mem.Allocator,
+    source: *const machine.Function,
+    allocation: *const regalloc.Allocation,
+    spill_plan: *const regalloc.SpillPlan,
+    maps: *const runtime_stack_map.Table,
+    safepoint_id: u32,
+    live_values: []const usize,
+    physical_owners: *[16]?machine.RegId,
+    specs: []const DeoptMonitorSpec,
+    stats: *Stats,
+) Error![]runtime_deopt.MonitorSpec {
+    const monitors = try allocator.alloc(runtime_deopt.MonitorSpec, specs.len);
+    errdefer allocator.free(monitors);
+    for (specs, 0..) |monitor, index| {
+        const reg = switch (monitor.source) {
+            .machine_register => |value| value,
+            .constant => return error.InvalidDeoptMetadata,
+        };
+        if (reg >= source.reg_types.len or !rootIsSet(live_values, reg) or !source.isGcRoot(reg)) {
+            return error.DeadDeoptValue;
+        }
+        const translated: runtime_deopt.Source = switch (allocation.locationOf(reg) orelse return error.InvalidMachine) {
+            .phys => |assigned| switch (assigned.class()) {
+                .gp => blk: {
+                    const physical = try x64Reg(assigned);
+                    if (physical_owners[physical]) |owner| {
+                        if (owner != reg) return error.AliasedDeoptValue;
+                    } else {
+                        physical_owners[physical] = reg;
+                    }
+                    break :blk .{ .native_register = physical };
+                },
+                .xmm => return error.InvalidDeoptMetadata,
+            },
+            .spill => blk: {
+                const slot = spillSlotFor(spill_plan, reg) orelse return error.InvalidDeoptMetadata;
+                if (slot.byte_offset > std.math.maxInt(i32)) return error.InvalidDeoptMetadata;
+                stats.deopt_stack_values += 1;
+                break :blk .{ .stack_slot = @intCast(slot.byte_offset) };
+            },
+            .none => return error.InvalidMachine,
+        };
+        if (!try rootMapContainsSource(maps, safepoint_id, translated)) return error.InvalidDeoptMetadata;
+        monitors[index] = .{ .source = translated, .kind = monitor.kind };
+    }
+    stats.deopt_monitors = std.math.add(u32, stats.deopt_monitors, @intCast(specs.len)) catch
+        return error.InvalidDeoptMetadata;
+    return monitors;
+}
+
+const MonitorRegionEntry = struct {
+    reg: machine.RegId,
+    kind: runtime_deopt.MonitorKind,
+};
+
+const MonitorRegionState = struct {
+    initialized: bool = false,
+    depth: u8 = 0,
+    stack: [runtime_jit.max_native_monitors]MonitorRegionEntry = undefined,
+};
+
+fn deoptMonitorEntry(spec: DeoptMonitorSpec) Error!MonitorRegionEntry {
+    return .{
+        .reg = switch (spec.source) {
+            .machine_register => |reg| reg,
+            .constant => return error.InvalidDeoptMetadata,
+        },
+        .kind = spec.kind,
+    };
+}
+
+fn monitorRegionStatesEqual(lhs: MonitorRegionState, rhs: MonitorRegionState) bool {
+    if (lhs.depth != rhs.depth) return false;
+    for (lhs.stack[0..lhs.depth], rhs.stack[0..rhs.depth]) |left, right| {
+        if (left.reg != right.reg or left.kind != right.kind) return false;
+    }
+    return true;
+}
+
+fn pointMonitorCount(point: DeoptPointSpec) Error!usize {
+    var count = point.monitors.len;
+    for (point.inline_frames) |frame| {
+        count = std.math.add(usize, count, frame.monitors.len) catch return error.InvalidDeoptMetadata;
+    }
+    return count;
+}
+
+fn findInlineActivation(activations: []const InlineActivationSpec, id: u32) ?usize {
+    var low: usize = 0;
+    var high = activations.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const candidate = activations[middle].id;
+        if (candidate < id) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low >= activations.len or activations[low].id != id) return null;
+    return low;
+}
+
+/// Cross-checks deoptimization frame maps against the compiler's independent
+/// activation namespace. This proof runs before register allocation metadata is
+/// translated or executable bytes are published.
+fn validateInlineActivations(allocator: std.mem.Allocator, options: DeoptOptions) Error!void {
+    const activations = options.inline_activations;
+    for (activations, 0..) |activation, index| {
+        if (activation.id == 0 or activation.register_count == 0 or activation.parent_dex_pc > options.max_dex_pc) {
+            return error.InvalidDeoptMetadata;
+        }
+        if (index != 0 and activations[index - 1].id >= activation.id) return error.InvalidDeoptMetadata;
+        if (activation.parent_id != 0) {
+            if (activation.parent_id >= activation.id) return error.InvalidDeoptMetadata;
+            const parent_index = findInlineActivation(activations[0..index], activation.parent_id) orelse
+                return error.InvalidDeoptMetadata;
+            if (parent_index >= index) return error.InvalidDeoptMetadata;
+        }
+    }
+
+    const used = try allocator.alloc(bool, activations.len);
+    defer allocator.free(used);
+    @memset(used, false);
+    for (options.points) |point| {
+        if (point.activation_id == 0) {
+            if (point.inline_frames.len != 0) return error.InvalidDeoptMetadata;
+            continue;
+        }
+        if (point.inline_frames.len == 0) return error.InvalidDeoptMetadata;
+        var activation_index = findInlineActivation(activations, point.activation_id) orelse
+            return error.InvalidDeoptMetadata;
+        var activation = activations[activation_index];
+        if (activation.method_id != point.method_id or activation.register_count != options.register_count) {
+            return error.InvalidDeoptMetadata;
+        }
+        used[activation_index] = true;
+
+        var reverse_index = point.inline_frames.len;
+        while (reverse_index != 0) {
+            reverse_index -= 1;
+            const frame = point.inline_frames[reverse_index];
+            if (activation.parent_id == 0 or frame.activation_id != activation.parent_id or
+                frame.dex_pc != activation.parent_dex_pc)
+            {
+                return error.InvalidDeoptMetadata;
+            }
+            activation_index = findInlineActivation(activations, activation.parent_id) orelse
+                return error.InvalidDeoptMetadata;
+            activation = activations[activation_index];
+            if (activation.method_id != frame.method_id or activation.register_count != frame.register_count) {
+                return error.InvalidDeoptMetadata;
+            }
+            used[activation_index] = true;
+        }
+        if (activation.parent_id != 0) return error.InvalidDeoptMetadata;
+    }
+    for (used) |is_used| if (!is_used) return error.InvalidDeoptMetadata;
+}
+
+fn validatePointMonitorState(point: DeoptPointSpec, state: MonitorRegionState) Error!void {
+    if (try pointMonitorCount(point) != state.depth) return error.InvalidDeoptMetadata;
+    var cursor: usize = 0;
+    for (point.inline_frames) |frame| {
+        for (frame.monitors) |monitor| {
+            const expected = try deoptMonitorEntry(monitor);
+            const actual = state.stack[cursor];
+            if (expected.reg != actual.reg or expected.kind != actual.kind) return error.InvalidDeoptMetadata;
+            cursor += 1;
+        }
+    }
+    for (point.monitors) |monitor| {
+        const expected = try deoptMonitorEntry(monitor);
+        const actual = state.stack[cursor];
+        if (expected.reg != actual.reg or expected.kind != actual.kind) return error.InvalidDeoptMetadata;
+        cursor += 1;
+    }
+}
+
+fn synchronizedMonitorEnter(options: DeoptOptions, site_id: u32) bool {
+    var low: usize = 0;
+    var high = options.synchronized_monitor_enter_sites.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const candidate = options.synchronized_monitor_enter_sites[middle];
+        if (candidate < site_id) {
+            low = middle + 1;
+        } else if (candidate > site_id) {
+            high = middle;
+        } else return true;
+    }
+    return false;
+}
+
+/// Proves a single structured monitor stack for every machine-CFG edge. A
+/// synchronized inline frame is therefore accepted only when a designated
+/// monitor-enter dominates the deoptimization point on every path. Joins with
+/// different stacks, non-LIFO exits, forged sites, and stale frame metadata are
+/// rejected before register allocation locations become executable metadata.
+fn validateDeoptMonitorRegions(
+    allocator: std.mem.Allocator,
+    source: *const machine.Function,
+    options: DeoptOptions,
+) Error!void {
+    if (options.entry_monitors.len > runtime_jit.max_native_monitors) return error.InvalidDeoptMetadata;
+    for (options.synchronized_monitor_enter_sites, 0..) |site, index| {
+        if (index != 0 and options.synchronized_monitor_enter_sites[index - 1] >= site) {
+            return error.InvalidDeoptMetadata;
+        }
+        var matches: usize = 0;
+        for (source.blocks) |block| for (block.insts) |inst| {
+            if (inst.opcode == .monitor_enter and inst.monitor_site_id == site) matches += 1;
+        };
+        if (matches != 1) return error.InvalidDeoptMetadata;
+    }
+
+    var entry_state = MonitorRegionState{ .initialized = true };
+    for (options.entry_monitors, 0..) |monitor, index| {
+        const value = try deoptMonitorEntry(monitor);
+        if (value.reg >= source.reg_types.len or !source.isGcRoot(value.reg)) return error.InvalidDeoptMetadata;
+        if (value.kind == .synchronized and index != 0) return error.InvalidDeoptMetadata;
+        entry_state.stack[index] = value;
+        entry_state.depth += 1;
+    }
+
+    const states = try allocator.alloc(MonitorRegionState, source.blocks.len);
+    defer allocator.free(states);
+    for (states) |*state| state.* = .{};
+    const visited_points = try allocator.alloc(bool, options.points.len);
+    defer allocator.free(visited_points);
+    @memset(visited_points, false);
+    const queue = try allocator.alloc(cfg.BlockId, source.blocks.len);
+    defer allocator.free(queue);
+
+    const entry_block = source.source.source.graph.entry;
+    if (entry_block >= source.blocks.len) return error.InvalidMachine;
+    states[entry_block] = entry_state;
+    queue[0] = entry_block;
+    var head: usize = 0;
+    var tail: usize = 1;
+    while (head < tail) : (head += 1) {
+        const block_id = queue[head];
+        const block = source.blocks[block_id];
+        var state = states[block_id];
+
+        for (options.points, 0..) |point, point_index| {
+            if ((point.safepoint_id == null) == (point.block_entry == null)) return error.InvalidDeoptMetadata;
+            if (point.block_entry == block_id) {
+                try validatePointMonitorState(point, state);
+                visited_points[point_index] = true;
+            }
+        }
+
+        for (block.insts) |inst| {
+            if (instructionSafepointId(inst)) |site_id| {
+                for (options.points, 0..) |point, point_index| {
+                    if (point.safepoint_id == site_id) {
+                        try validatePointMonitorState(point, state);
+                        visited_points[point_index] = true;
+                    }
+                }
+            }
+            switch (inst.opcode) {
+                .monitor_enter => {
+                    if (state.depth >= runtime_jit.max_native_monitors) return error.InvalidDeoptMetadata;
+                    const reg = inst.state_handle orelse return error.InvalidMachine;
+                    state.stack[state.depth] = .{
+                        .reg = reg,
+                        .kind = if (synchronizedMonitorEnter(options, inst.monitor_site_id orelse return error.InvalidMachine))
+                            .synchronized
+                        else
+                            .explicit,
+                    };
+                    state.depth += 1;
+                },
+                .monitor_exit => {
+                    if (state.depth <= entry_state.depth) return error.InvalidDeoptMetadata;
+                    const reg = inst.state_handle orelse return error.InvalidMachine;
+                    if (state.stack[state.depth - 1].reg != reg) return error.InvalidDeoptMetadata;
+                    state.depth -= 1;
+                },
+                else => {},
+            }
+        }
+
+        for (source.successors[block_id]) |successor| {
+            if (successor >= states.len) return error.InvalidMachine;
+            if (!states[successor].initialized) {
+                states[successor] = state;
+                states[successor].initialized = true;
+                if (tail >= queue.len) return error.InvalidMachine;
+                queue[tail] = successor;
+                tail += 1;
+            } else if (!monitorRegionStatesEqual(states[successor], state)) {
+                return error.InvalidDeoptMetadata;
+            }
+        }
+    }
+    for (states) |state| if (!state.initialized) return error.InvalidMachine;
+    for (visited_points) |visited| if (!visited) return error.MissingDeoptSafepoint;
 }
 
 fn buildDeoptTable(
     allocator: std.mem.Allocator,
     source: *const machine.Function,
     allocation: *const regalloc.Allocation,
+    spill_plan: *const regalloc.SpillPlan,
     root_maps: ?*const runtime_stack_map.Table,
     options: ?DeoptOptions,
     stats: *Stats,
 ) Error!?runtime_deopt.Table {
+    try validateSpillPlan(source, allocation, spill_plan);
     const deopt = options orelse return null;
     if (deopt.points.len == 0 or deopt.register_count == 0) return error.InvalidDeoptMetadata;
+    try validateInlineActivations(allocator, deopt);
+    if (deopt.inline_activations.len > std.math.maxInt(u32)) return error.InvalidDeoptMetadata;
+    stats.deopt_inline_activations = @intCast(deopt.inline_activations.len);
+    try validateDeoptMonitorRegions(allocator, source, deopt);
     const maps = root_maps orelse return error.MissingDeoptSafepoint;
     var value_liveness = try buildLiveness(allocator, source, false);
     defer value_liveness.deinit();
@@ -1831,57 +3474,127 @@ fn buildDeoptTable(
 
     const translated_points = try allocator.alloc(runtime_deopt.PointSpec, deopt.points.len);
     defer allocator.free(translated_points);
-    const translated_values = try allocator.alloc([]runtime_deopt.ValueSpec, deopt.points.len);
-    var initialized_values: usize = 0;
+    const translated_inline_frames = try allocator.alloc([]runtime_deopt.InlineFrameSpec, deopt.points.len);
+    var initialized_inline_frames: usize = 0;
     defer {
-        for (translated_values[0..initialized_values]) |values| allocator.free(values);
-        allocator.free(translated_values);
+        for (translated_inline_frames[0..initialized_inline_frames]) |frames| allocator.free(frames);
+        allocator.free(translated_inline_frames);
+    }
+    var owned_values: std.ArrayList([]runtime_deopt.ValueSpec) = .empty;
+    defer {
+        for (owned_values.items) |values| allocator.free(values);
+        owned_values.deinit(allocator);
+    }
+    var owned_monitors: std.ArrayList([]runtime_deopt.MonitorSpec) = .empty;
+    defer {
+        for (owned_monitors.items) |monitors| allocator.free(monitors);
+        owned_monitors.deinit(allocator);
     }
 
     for (deopt.points, 0..) |point, point_index| {
-        const safepoint = try findSafepointPosition(source, point.safepoint_id);
+        const safepoint = try resolveDeoptPosition(source, deopt, point_index);
         try computeInstructionLiveIn(source, &value_liveness, safepoint, live_values);
-        const values = try allocator.alloc(runtime_deopt.ValueSpec, point.values.len);
-        translated_values[point_index] = values;
-        initialized_values += 1;
         var physical_owners: [16]?machine.RegId = @splat(null);
-        for (point.values, 0..) |value, value_index| {
-            const translated_source: runtime_deopt.Source = switch (value.source) {
-                .constant => |bits| .{ .constant = bits },
-                .machine_register => |reg| blk: {
-                    if (reg >= source.reg_types.len or !rootIsSet(live_values, reg)) return error.DeadDeoptValue;
-                    try validateDeoptValueType(source, value, reg);
-                    const physical = try x64Reg(try physOf(allocation, reg));
-                    if (physical_owners[physical]) |owner| {
-                        if (owner != reg) return error.AliasedDeoptValue;
-                    } else {
-                        physical_owners[physical] = reg;
-                    }
-                    if (value.kind == .reference and !try rootMapContainsRegister(maps, point.safepoint_id, physical)) {
-                        return error.InvalidDeoptMetadata;
-                    }
-                    break :blk .{ .native_register = physical };
-                },
+        var xmm_owners: [8]?machine.RegId = @splat(null);
+        const inline_frames = try allocator.alloc(runtime_deopt.InlineFrameSpec, point.inline_frames.len);
+        translated_inline_frames[point_index] = inline_frames;
+        initialized_inline_frames += 1;
+        for (point.inline_frames, 0..) |frame, frame_index| {
+            const values = try translateDeoptValues(
+                allocator,
+                source,
+                allocation,
+                spill_plan,
+                maps,
+                safepoint.site_id,
+                live_values,
+                &physical_owners,
+                &xmm_owners,
+                frame.values,
+                stats,
+            );
+            owned_values.append(allocator, values) catch |err| {
+                allocator.free(values);
+                return err;
             };
-            values[value_index] = .{
-                .vreg = value.vreg,
-                .kind = value.kind,
-                .source = translated_source,
+            const monitors = try translateDeoptMonitors(
+                allocator,
+                source,
+                allocation,
+                spill_plan,
+                maps,
+                safepoint.site_id,
+                live_values,
+                &physical_owners,
+                frame.monitors,
+                stats,
+            );
+            owned_monitors.append(allocator, monitors) catch |err| {
+                allocator.free(monitors);
+                return err;
+            };
+            inline_frames[frame_index] = .{
+                .method_id = frame.method_id,
+                .dex_pc = frame.dex_pc,
+                .register_count = frame.register_count,
+                .values = values,
+                .monitors = monitors,
             };
         }
+        const values = try translateDeoptValues(
+            allocator,
+            source,
+            allocation,
+            spill_plan,
+            maps,
+            safepoint.site_id,
+            live_values,
+            &physical_owners,
+            &xmm_owners,
+            point.values,
+            stats,
+        );
+        owned_values.append(allocator, values) catch |err| {
+            allocator.free(values);
+            return err;
+        };
+        const monitors = try translateDeoptMonitors(
+            allocator,
+            source,
+            allocation,
+            spill_plan,
+            maps,
+            safepoint.site_id,
+            live_values,
+            &physical_owners,
+            point.monitors,
+            stats,
+        );
+        owned_monitors.append(allocator, monitors) catch |err| {
+            allocator.free(monitors);
+            return err;
+        };
         translated_points[point_index] = .{
             .id = point.id,
             .method_id = point.method_id,
             .dex_pc = point.dex_pc,
             .values = values,
+            .inline_frames = inline_frames,
+            .monitors = monitors,
         };
         stats.deopt_points += 1;
-        stats.deopt_values += @intCast(values.len);
+        stats.deopt_frames = std.math.add(u32, stats.deopt_frames, @intCast(point.inline_frames.len + 1)) catch
+            return error.InvalidDeoptMetadata;
+        var point_value_count = point.values.len;
+        for (point.inline_frames) |frame| point_value_count += frame.values.len;
+        stats.deopt_values = std.math.add(u32, stats.deopt_values, @intCast(point_value_count)) catch
+            return error.InvalidDeoptMetadata;
     }
 
     var table = try runtime_deopt.Table.init(allocator, translated_points, .{
         .register_count = deopt.register_count,
         .native_register_count = 16,
+        .xmm_register_count = 8,
         .max_dex_pc = deopt.max_dex_pc,
     });
     errdefer table.deinit();
@@ -1890,29 +3603,225 @@ fn buildDeoptTable(
     return table;
 }
 
+const OsrRematOperands = struct {
+    handle: machine.RegId,
+    address: machine.RegId,
+};
+
+fn osrRematOperands(source: *const machine.Function, resolve_id: u32) Error!OsrRematOperands {
+    const barriers = source.source.barriers orelse return error.InvalidDeoptMetadata;
+    if (resolve_id >= barriers.resolves.len or resolve_id >= source.source.resolve_values.len) {
+        return error.InvalidDeoptMetadata;
+    }
+    const resolve = barriers.resolves[resolve_id];
+    const address = source.source.resolve_values[resolve_id];
+    if (resolve.handle >= source.runtime_values.len or address >= source.runtime_values.len) {
+        return error.InvalidDeoptMetadata;
+    }
+    switch (source.runtime_values[resolve.handle]) {
+        .dalvik => |value| if (value.value != resolve.handle or !value.gc_root) return error.InvalidDeoptMetadata,
+        .derived_ptr => return error.InvalidDeoptMetadata,
+    }
+    switch (source.runtime_values[address]) {
+        .derived_ptr => |ptr| if (ptr.handle != resolve.handle or ptr.resolve != resolve_id or ptr.token != resolve.token) {
+            return error.InvalidDeoptMetadata;
+        },
+        .dalvik => return error.InvalidDeoptMetadata,
+    }
+    return .{ .handle = resolve.handle, .address = address };
+}
+
+fn osrBlockNeedsRematerialization(source: *const machine.Function, block: cfg.BlockId) bool {
+    const barriers = source.source.barriers orelse return false;
+    for (barriers.loop_reuses) |reuse| if (reuse.header == block) return true;
+    return false;
+}
+
+fn osrRematerializesRegister(source: *const machine.Function, block: cfg.BlockId, reg: machine.RegId) Error!bool {
+    const barriers = source.source.barriers orelse return error.InvalidDeoptMetadata;
+    for (barriers.loop_reuses) |reuse| {
+        if (reuse.header != block) continue;
+        if ((try osrRematOperands(source, reuse.resolve)).address == reg) return true;
+    }
+    return false;
+}
+
+fn machineSafepointCount(source: *const machine.Function) Error!u32 {
+    const resolves = std.math.add(u32, source.stats.resolves, source.stats.loop_epoch_guards) catch return error.InvalidDeoptMetadata;
+    const monitor_and_bounds = std.math.add(u32, source.stats.monitor_sites, source.stats.bounds_exception_sites) catch return error.InvalidDeoptMetadata;
+    return std.math.add(u32, resolves, monitor_and_bounds) catch return error.InvalidDeoptMetadata;
+}
+
+fn osrLandingSiteId(source: *const machine.Function, deopt: ?DeoptOptions, entry_index: usize) Error!u32 {
+    if (entry_index > std.math.maxInt(u32)) return error.InvalidDeoptMetadata;
+    const first_landing = std.math.add(u32, try machineSafepointCount(source), try blockEntryDeoptCount(deopt)) catch
+        return error.InvalidDeoptMetadata;
+    return std.math.add(u32, first_landing, @intCast(entry_index)) catch return error.InvalidDeoptMetadata;
+}
+
 fn validateOsrLiveRegister(
     source: *const machine.Function,
     allocation: *const regalloc.Allocation,
-    mapped_values: []const runtime_deopt.ValueSpec,
+    table: *const runtime_deopt.Table,
+    frames: []const runtime_deopt.FrameRecord,
+    osr_block: cfg.BlockId,
     reg: machine.RegId,
 ) Error!void {
     if (reg >= source.runtime_values.len) return error.InvalidDeoptMetadata;
     const value_id = switch (source.runtime_values[reg]) {
-        .derived_ptr => return error.InvalidDeoptMetadata,
+        .derived_ptr => {
+            if (!try osrRematerializesRegister(source, osr_block, reg)) return error.InvalidDeoptMetadata;
+            _ = try physOf(allocation, reg);
+            return;
+        },
         .dalvik => |value| value.value,
     };
     if (value_id >= source.source.source.values.len) return error.InvalidDeoptMetadata;
     const vreg = source.source.source.values[value_id].reg;
     const physical = try x64Reg(try physOf(allocation, reg));
-    for (mapped_values) |value| {
-        const width = value.kind.registerWidth();
-        if (vreg < value.vreg or vreg >= value.vreg + width) continue;
-        switch (value.source) {
+    for (frames) |frame| {
+        for (table.monitorsForFrame(frame)) |monitor| switch (monitor.source) {
             .native_register => |mapped| if (mapped == physical) return,
             else => {},
+        };
+        for (table.valuesForFrame(frame)) |value| {
+            const width = value.kind.registerWidth();
+            if (vreg < value.vreg or vreg >= value.vreg + width) continue;
+            switch (value.source) {
+                .native_register => |mapped| if (mapped == physical) return,
+                else => {},
+            }
         }
     }
     return error.InvalidDeoptMetadata;
+}
+
+fn validateOsrMappedSources(values: []const runtime_deopt.ValueSpec) Error!void {
+    for (values) |value| switch (value.source) {
+        .native_register, .constant => {},
+        .stack_slot, .xmm_register => return error.InvalidDeoptMetadata,
+    };
+}
+
+fn validateOsrMonitorSources(monitors: []const runtime_deopt.MonitorSpec) Error!void {
+    for (monitors) |monitor| switch (monitor.source) {
+        .native_register => {},
+        .stack_slot, .xmm_register, .constant => return error.InvalidDeoptMetadata,
+    };
+}
+
+fn appendUniqueRoot(
+    roots: *std.ArrayList(runtime_stack_map.RootLocation),
+    allocator: std.mem.Allocator,
+    root: runtime_stack_map.RootLocation,
+) Error!void {
+    for (roots.items) |existing| if (existing.bits() == root.bits()) return;
+    try roots.append(allocator, root);
+}
+
+/// Extends immutable machine safepoint metadata with one compiler-owned GC
+/// site per OSR landing that may call the relocation helper. The landing image
+/// contains only interpreter-exported GP values, so its roots come directly
+/// from the already translated deoptimization record rather than from body
+/// liveness (whose spill slots have not been initialized yet).
+fn buildOsrAugmentedRootMaps(
+    allocator: std.mem.Allocator,
+    source: *const machine.Function,
+    allocation: *const regalloc.Allocation,
+    existing: *const runtime_stack_map.Table,
+    deopt_table: *const runtime_deopt.Table,
+    deopt: ?DeoptOptions,
+    specs: []const OsrEntrySpec,
+    stats: *Stats,
+) Error!?runtime_stack_map.Table {
+    var remat_count: usize = 0;
+    for (specs) |spec| remat_count += @intFromBool(osrBlockNeedsRematerialization(source, spec.block));
+    if (remat_count == 0) return null;
+
+    var map_specs: std.ArrayList(runtime_stack_map.MapSpec) = .empty;
+    defer map_specs.deinit(allocator);
+    try map_specs.ensureTotalCapacity(allocator, existing.records.len + remat_count);
+    for (existing.records) |record| {
+        try map_specs.append(allocator, .{
+            .pc_offset = record.pc_offset,
+            .roots = existing.rootsFor(&record),
+            .deopt_id = if (record.deopt_id == runtime_stack_map.no_deopt) null else record.deopt_id,
+        });
+    }
+
+    var owned_roots: std.ArrayList([]runtime_stack_map.RootLocation) = .empty;
+    defer {
+        for (owned_roots.items) |roots| allocator.free(roots);
+        owned_roots.deinit(allocator);
+    }
+    const barriers = source.source.barriers orelse return error.InvalidDeoptMetadata;
+    for (specs, 0..) |spec, entry_index| {
+        if (!osrBlockNeedsRematerialization(source, spec.block)) continue;
+        const deopt_record = deopt_table.find(spec.point_id) catch return error.InvalidDeoptMetadata;
+        const mapped_values = deopt_table.valuesFor(deopt_record);
+        const deopt_frames = deopt_table.framesFor(deopt_record);
+        if (deopt_frames.len != 1) return error.InvalidDeoptMetadata;
+        const mapped_monitors = deopt_table.monitorsForFrame(deopt_frames[0]);
+        try validateOsrMappedSources(mapped_values);
+        try validateOsrMonitorSources(mapped_monitors);
+
+        var roots: std.ArrayList(runtime_stack_map.RootLocation) = .empty;
+        errdefer roots.deinit(allocator);
+        for (mapped_values) |value| {
+            if (value.kind != .reference) continue;
+            switch (value.source) {
+                .native_register => |physical| try appendUniqueRoot(
+                    &roots,
+                    allocator,
+                    runtime_stack_map.RootLocation.nativeRegister(physical),
+                ),
+                .constant => {},
+                .stack_slot, .xmm_register => return error.InvalidDeoptMetadata,
+            }
+        }
+        for (mapped_monitors) |monitor| switch (monitor.source) {
+            .native_register => |physical| try appendUniqueRoot(
+                &roots,
+                allocator,
+                runtime_stack_map.RootLocation.nativeRegister(physical),
+            ),
+            .stack_slot, .xmm_register, .constant => return error.InvalidDeoptMetadata,
+        };
+        for (barriers.loop_reuses) |reuse| {
+            if (reuse.header != spec.block) continue;
+            const operands = try osrRematOperands(source, reuse.resolve);
+            const handle = try x64Reg(try physOf(allocation, operands.handle));
+            var found = false;
+            for (roots.items) |root| {
+                if (root.kind == .native_register and root.payload == handle) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.InvalidDeoptMetadata;
+        }
+        std.mem.sort(runtime_stack_map.RootLocation, roots.items, {}, rootLocationLess);
+        const owned = try roots.toOwnedSlice(allocator);
+        owned_roots.append(allocator, owned) catch |err| {
+            allocator.free(owned);
+            return err;
+        };
+        try map_specs.append(allocator, .{
+            .pc_offset = try osrLandingSiteId(source, deopt, entry_index),
+            .roots = owned,
+        });
+        stats.osr_landing_safepoints += 1;
+        stats.root_map_sites += 1;
+        stats.root_map_locations = std.math.add(u32, stats.root_map_locations, @intCast(owned.len)) catch
+            return error.InvalidDeoptMetadata;
+    }
+
+    return try runtime_stack_map.Table.init(allocator, map_specs.items, .{
+        .native_register_count = 16,
+        .interpreter_register_count = 0,
+        .max_frame_depth = 0,
+        .max_shadow_roots = 0,
+    });
 }
 
 const OsrCursor = struct {
@@ -1978,6 +3887,29 @@ pub fn osrRequiredRegistersAtSite(
     site_id: u32,
 ) Error![]machine.RegId {
     const safepoint = try findSafepointPosition(source, site_id);
+    return osrRequiredRegistersAtPosition(allocator, source, safepoint);
+}
+
+pub fn osrRequiredRegistersAtBlockEntry(
+    allocator: std.mem.Allocator,
+    source: *const machine.Function,
+    block: cfg.BlockId,
+) Error![]machine.RegId {
+    if (block >= source.blocks.len or source.blocks[block].insts.len == 0) return error.InvalidDeoptMetadata;
+    return osrRequiredRegistersAtPosition(allocator, source, .{
+        .position = 0,
+        .site_id = 0,
+        .pc = source.blocks[block].insts[0].pc orelse return error.InvalidDeoptMetadata,
+        .block = block,
+        .instruction = 0,
+    });
+}
+
+fn osrRequiredRegistersAtPosition(
+    allocator: std.mem.Allocator,
+    source: *const machine.Function,
+    safepoint: SafepointPosition,
+) Error![]machine.RegId {
     var required: std.ArrayList(machine.RegId) = .empty;
     errdefer required.deinit(allocator);
     for (0..source.reg_types.len) |reg_index| {
@@ -2011,15 +3943,16 @@ fn buildOsrEntries(
     for (specs, 0..) |spec, entry_index| {
         if (entry_index != 0 and specs[entry_index - 1].point_id >= spec.point_id) return error.InvalidDeoptMetadata;
         if (spec.block >= source.blocks.len or entry_index >= osr_labels.len) return error.InvalidDeoptMetadata;
-        var point: ?DeoptPointSpec = null;
-        for (options.points) |candidate| {
+        var point_index: ?usize = null;
+        for (options.points, 0..) |candidate, candidate_index| {
             if (candidate.id != spec.point_id) continue;
-            if (point != null) return error.InvalidDeoptMetadata;
-            point = candidate;
+            if (point_index != null) return error.InvalidDeoptMetadata;
+            point_index = candidate_index;
         }
-        const deopt_point = point orelse return error.InvalidDeoptMetadata;
-        const safepoint = try findSafepointPosition(source, deopt_point.safepoint_id);
-        if (safepoint.block != spec.block or safepoint.inst.pc != deopt_point.dex_pc) {
+        const selected_index = point_index orelse return error.InvalidDeoptMetadata;
+        const deopt_point = options.points[selected_index];
+        const safepoint = try resolveDeoptPosition(source, options, selected_index);
+        if (safepoint.block != spec.block or safepoint.pc != deopt_point.dex_pc) {
             return error.InvalidDeoptMetadata;
         }
 
@@ -2031,18 +3964,17 @@ fn buildOsrEntries(
             }
         }
         if (!natural_loop) return error.InvalidDeoptMetadata;
-        // A header reached through an OSR label bypasses the preheader. Until
-        // landing pads can rematerialize derived addresses, reject any loop
-        // whose header reuses a resolve established before the loop.
-        for (barriers.loop_reuses) |reuse| {
-            if (reuse.header == spec.block) return error.InvalidDeoptMetadata;
-        }
         const record = deopt_table.find(spec.point_id) catch return error.InvalidDeoptMetadata;
-        const mapped_values = deopt_table.valuesFor(record);
+        const deopt_frames = deopt_table.framesFor(record);
+        if (deopt_frames.len != deopt_point.inline_frames.len + 1) return error.InvalidDeoptMetadata;
+        for (deopt_frames) |frame| {
+            try validateOsrMappedSources(deopt_table.valuesForFrame(frame));
+            try validateOsrMonitorSources(deopt_table.monitorsForFrame(frame));
+        }
         for (0..source.reg_types.len) |reg_index| {
             const reg: machine.RegId = @intCast(reg_index);
             if (try osrRegisterReadBeforeDefinition(allocator, source, safepoint, reg)) {
-                try validateOsrLiveRegister(source, allocation, mapped_values, reg);
+                try validateOsrLiveRegister(source, allocation, deopt_table, deopt_frames, spec.block, reg);
             }
         }
         const offset = try buffer.labelOffset(osr_labels[entry_index]);
@@ -2061,17 +3993,66 @@ fn collectOsrRequiredRegisters(
 ) Error![]machine.RegId {
     if (specs.len == 0) return allocator.alloc(machine.RegId, 0);
     const options = deopt orelse return error.InvalidDeoptMetadata;
+    const barriers = source.source.barriers orelse return error.InvalidDeoptMetadata;
+    const loops = barriers.loops orelse return error.InvalidDeoptMetadata;
     var required: std.ArrayList(machine.RegId) = .empty;
     errdefer required.deinit(allocator);
-    for (specs) |spec| {
-        var point: ?DeoptPointSpec = null;
-        for (options.points) |candidate| {
+    for (specs, 0..) |spec, entry_index| {
+        if (entry_index != 0 and specs[entry_index - 1].point_id >= spec.point_id) {
+            return error.InvalidDeoptMetadata;
+        }
+        if (spec.block >= source.blocks.len) return error.InvalidDeoptMetadata;
+        var point_index: ?usize = null;
+        for (options.points, 0..) |candidate, candidate_index| {
             if (candidate.id == spec.point_id) {
-                if (point != null) return error.InvalidDeoptMetadata;
-                point = candidate;
+                if (point_index != null) return error.InvalidDeoptMetadata;
+                point_index = candidate_index;
             }
         }
-        const safepoint = try findSafepointPosition(source, (point orelse return error.InvalidDeoptMetadata).safepoint_id);
+        const selected_index = point_index orelse return error.InvalidDeoptMetadata;
+        const deopt_point = options.points[selected_index];
+        for (deopt_point.inline_frames) |frame| {
+            for (frame.values) |value| switch (value.source) {
+                .machine_register => |reg| {
+                    if (reg >= source.reg_types.len) return error.InvalidDeoptMetadata;
+                    try appendUniqueRegister(&required, allocator, reg);
+                },
+                .constant => {},
+            };
+            for (frame.monitors) |monitor| switch (monitor.source) {
+                .machine_register => |reg| {
+                    if (reg >= source.reg_types.len or !source.isGcRoot(reg)) return error.InvalidDeoptMetadata;
+                    try appendUniqueRegister(&required, allocator, reg);
+                },
+                .constant => return error.InvalidDeoptMetadata,
+            };
+        }
+        for (deopt_point.values) |value| switch (value.source) {
+            .machine_register => |reg| {
+                if (reg >= source.reg_types.len) return error.InvalidDeoptMetadata;
+                try appendUniqueRegister(&required, allocator, reg);
+            },
+            .constant => {},
+        };
+        for (deopt_point.monitors) |monitor| switch (monitor.source) {
+            .machine_register => |reg| {
+                if (reg >= source.reg_types.len or !source.isGcRoot(reg)) return error.InvalidDeoptMetadata;
+                try appendUniqueRegister(&required, allocator, reg);
+            },
+            .constant => return error.InvalidDeoptMetadata,
+        };
+        const safepoint = try resolveDeoptPosition(source, options, selected_index);
+        if (safepoint.block != spec.block or safepoint.pc != deopt_point.dex_pc) {
+            return error.InvalidDeoptMetadata;
+        }
+        var natural_loop = false;
+        for (loops.loops) |loop| {
+            if (loop.header == spec.block) {
+                natural_loop = true;
+                break;
+            }
+        }
+        if (!natural_loop) return error.InvalidDeoptMetadata;
         for (0..source.reg_types.len) |reg_index| {
             const reg: machine.RegId = @intCast(reg_index);
             if (!try osrRegisterReadBeforeDefinition(allocator, source, safepoint, reg)) continue;
@@ -2088,11 +4069,115 @@ fn collectOsrRequiredRegisters(
     return required.toOwnedSlice(allocator);
 }
 
+fn appendUniqueRegister(list: *std.ArrayList(machine.RegId), allocator: std.mem.Allocator, reg: machine.RegId) Error!void {
+    for (list.items) |existing| if (existing == reg) return;
+    try list.append(allocator, reg);
+}
+
+fn collectMustRegisterOperands(
+    allocator: std.mem.Allocator,
+    source: *const machine.Function,
+    additional: []const machine.RegId,
+) Error![]machine.RegId {
+    var required: std.ArrayList(machine.RegId) = .empty;
+    errdefer required.deinit(allocator);
+    for (additional) |reg| try appendUniqueRegister(&required, allocator, reg);
+    for (source.blocks) |block| {
+        for (block.insts) |inst| {
+            const spill_capable = switch (inst.opcode) {
+                .const_i32,
+                .const_i64,
+                .mov,
+                .add_i32,
+                .sub_i32,
+                .mul_i32,
+                .and_i32,
+                .or_i32,
+                .xor_i32,
+                .f32_op,
+                .f64_op,
+                .check_null,
+                .check_bounds,
+                .array_load_ptr,
+                .field_load_ptr,
+                .satb_pre_write,
+                .array_store_ptr,
+                .field_store_ptr,
+                .static_satb_pre_write,
+                .static_store,
+                .static_root_post_write,
+                .card_mark,
+                .jump,
+                .branch,
+                .ret,
+                => true,
+                else => false,
+            };
+            if (!spill_capable) {
+                for (inst.defs) |reg| try appendUniqueRegister(&required, allocator, reg);
+                for (inst.uses) |reg| try appendUniqueRegister(&required, allocator, reg);
+            }
+            if (inst.address) |reg| try appendUniqueRegister(&required, allocator, reg);
+            if (inst.state_handle) |reg| try appendUniqueRegister(&required, allocator, reg);
+        }
+    }
+    return required.toOwnedSlice(allocator);
+}
+
+fn emitOsrRematerializations(
+    allocator: std.mem.Allocator,
+    buffer: *code_buffer.Buffer,
+    source: *const machine.Function,
+    allocation: *const regalloc.Allocation,
+    runtime: RuntimeAbi,
+    block: cfg.BlockId,
+    dex_pc: u32,
+    landing_site_id: u32,
+    restart: code_buffer.LabelId,
+    cold: *std.ArrayList(ColdResolve),
+    stats: *Stats,
+) Error!void {
+    const barriers = source.source.barriers orelse return error.InvalidDeoptMetadata;
+    var emitted: usize = 0;
+    for (barriers.loop_reuses, 0..) |reuse, reuse_index| {
+        if (reuse.header != block) continue;
+        for (barriers.loop_reuses[0..reuse_index]) |previous| {
+            if (previous.header == block and previous.resolve == reuse.resolve) return error.InvalidDeoptMetadata;
+        }
+        const operands = try osrRematOperands(source, reuse.resolve);
+        const before = cold.items.len;
+        const resolve = barriers.resolves[reuse.resolve];
+        var defs = [_]machine.RegId{operands.address};
+        var uses = [_]machine.RegId{operands.handle};
+        try emitResolve(allocator, buffer, allocation, .{
+            .opcode = .resolve_handle,
+            .pc = dex_pc,
+            .defs = &defs,
+            .uses = &uses,
+            .state_handle = operands.handle,
+            .reloc_token = resolve.token,
+            // Every landing resolve uses the same immutable root map. A slow
+            // edge restarts the complete sequence because its poll may have
+            // invalidated addresses rematerialized by earlier fast paths.
+            .resolve_id = landing_site_id,
+        }, runtime, cold, stats);
+        if (cold.items.len != before + 1) return error.InvalidMachine;
+        cold.items[cold.items.len - 1].epoch_restart = restart;
+        cold.items[cold.items.len - 1].epoch_slot_offset = 0;
+        stats.osr_derived_rematerializations += 1;
+        stats.osr_remat_restart_edges += 1;
+        emitted += 1;
+    }
+    if (emitted == 0) return error.InvalidDeoptMetadata;
+}
+
 pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Function, options: Options) Error!Function {
     source.verify() catch return error.InvalidMachine;
     if (options.runtime) |runtime| try runtime.verify();
-    if ((source.stats.resolves != 0 or source.stats.bounds_exception_sites != 0) and options.runtime == null) return error.MissingRuntimeAbi;
+    if ((source.stats.resolves != 0 or source.stats.bounds_exception_sites != 0 or source.stats.monitor_sites != 0) and options.runtime == null) return error.MissingRuntimeAbi;
     if (source.stats.bounds_exception_sites != 0 and options.runtime.?.bounds_exception_helper == 0) return error.MissingExceptionHelper;
+    if (source.stats.monitor_sites != 0 and
+        (options.runtime.?.monitor_enter_helper == 0 or options.runtime.?.monitor_exit_helper == 0)) return error.MissingMonitorHelper;
     if (options.deopt != null and (options.runtime == null or options.runtime.?.deopt_epoch_address == 0 or options.runtime.?.deopt_helper == 0)) {
         return error.InvalidRuntimeAbi;
     }
@@ -2102,12 +4187,31 @@ pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Fu
     // Static-only methods have no resolve op, but must obey the same contract.
     const osr_required = try collectOsrRequiredRegisters(allocator, source, options.deopt, options.osr_entries);
     defer allocator.free(osr_required);
-    var allocation = try regalloc.allocate(allocator, source, .{
-        .gp_registers = &RESOLVER_GP_REGS,
+    const must_register = try collectMustRegisterOperands(allocator, source, osr_required);
+    defer allocator.free(must_register);
+    var preserve_nonvolatile = false;
+    var allocation = regalloc.allocate(allocator, source, .{
+        .gp_registers = allocatableGpRegisters(),
+        .xmm_registers = allocatableXmmRegisters(),
         .distinct_registers = osr_required,
-    });
+        .must_registers = must_register,
+    }) catch |err| switch (err) {
+        error.BadAllocation => blk: {
+            if (builtin.os.tag != .windows) return err;
+            preserve_nonvolatile = true;
+            break :blk try regalloc.allocate(allocator, source, .{
+                .gp_registers = allGpRegisters(),
+                .xmm_registers = allocatableXmmRegisters(),
+                .distinct_registers = osr_required,
+                .must_registers = must_register,
+            });
+        },
+        else => return err,
+    };
     errdefer allocation.deinit();
-    try ensureNoSpills(&allocation);
+    var spill_plan = try regalloc.planSpills(allocator, &allocation);
+    defer spill_plan.deinit();
+    const frame_bytes = spill_plan.stats.stack_bytes;
 
     var buffer = code_buffer.Buffer.init(allocator);
     errdefer buffer.deinit();
@@ -2121,20 +4225,49 @@ pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Fu
     const osr_labels = try allocator.alloc(code_buffer.LabelId, options.osr_entries.len);
     defer allocator.free(osr_labels);
     for (osr_labels) |*label| label.* = try buffer.newLabel();
+    const osr_body_labels = try allocator.alloc(code_buffer.LabelId, options.osr_entries.len);
+    defer allocator.free(osr_body_labels);
+    for (osr_body_labels) |*label| label.* = try buffer.newLabel();
 
-    var stats: Stats = .{ .blocks = @intCast(source.blocks.len) };
-    var root_maps = try buildRootMaps(allocator, source, &allocation, &stats, options.deopt);
+    var stats: Stats = .{
+        .blocks = @intCast(source.blocks.len),
+        .frame_bytes = frame_bytes,
+        .nonvolatile_frame_bytes = frameSavedBytes(preserve_nonvolatile),
+    };
+    var root_maps = try buildRootMaps(allocator, source, &allocation, &spill_plan, &stats, options.deopt);
     errdefer if (root_maps) |*maps| maps.deinit();
     var deopt_table = try buildDeoptTable(
         allocator,
         source,
         &allocation,
+        &spill_plan,
         if (root_maps) |*maps| maps else null,
         options.deopt,
         &stats,
     );
     errdefer if (deopt_table) |*table| table.deinit();
-    try emitParamMoves(&buffer, &allocation, source, &stats);
+    if (options.osr_entries.len != 0) {
+        const existing_maps = if (root_maps) |*maps| maps else return error.MissingDeoptSafepoint;
+        const existing_deopt = if (deopt_table) |*table| table else return error.InvalidDeoptMetadata;
+        if (try buildOsrAugmentedRootMaps(
+            allocator,
+            source,
+            &allocation,
+            existing_maps,
+            existing_deopt,
+            options.deopt,
+            options.osr_entries,
+            &stats,
+        )) |augmented| {
+            existing_maps.deinit();
+            root_maps = augmented;
+            try existing_deopt.validateStackMaps(&root_maps.?, false);
+            try existing_deopt.validateAllLinked(&root_maps.?);
+        }
+    }
+    try emitFrameEnter(&buffer, frame_bytes, preserve_nonvolatile);
+    if (frame_bytes != 0 or preserve_nonvolatile) stats.native_insts += 1;
+    try emitParamMoves(&buffer, &allocation, &spill_plan, source, frame_bytes, preserve_nonvolatile, &stats);
 
     var cold: std.ArrayList(ColdResolve) = .empty;
     defer cold.deinit(allocator);
@@ -2146,23 +4279,37 @@ pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Fu
     for (source.blocks) |block| {
         try buffer.alignTo(16, 0x90);
         try buffer.bindLabel(labels[block.id]);
+        if (options.deopt) |deopt| {
+            for (deopt.points, 0..) |point, point_index| {
+                if (point.block_entry != block.id) continue;
+                const site_id = try deoptPointSiteId(source, deopt, point_index);
+                for (options.osr_entries, 0..) |osr, osr_index| {
+                    if (osr.block != block.id or osr.point_id != point.id) continue;
+                    try buffer.alignTo(16, 0x90);
+                    const out_of_line = frame_bytes != 0 or preserve_nonvolatile or osrBlockNeedsRematerialization(source, osr.block);
+                    try buffer.bindLabel(if (out_of_line) osr_body_labels[osr_index] else osr_labels[osr_index]);
+                }
+                try emitDeoptGuard(allocator, &buffer, options.runtime.?, site_id, &cold_deopts, &stats);
+            }
+        }
         for (block.insts) |inst| {
             if (instructionSafepointId(inst)) |site_id| {
                 if (options.deopt) |deopt| {
                     for (options.osr_entries, 0..) |osr, osr_index| {
                         if (osr.block != block.id) continue;
                         for (deopt.points) |point| {
-                            if (point.id != osr.point_id or point.safepoint_id != site_id) continue;
+                            if (point.id != osr.point_id or (point.safepoint_id orelse continue) != site_id) continue;
                             try buffer.alignTo(16, 0x90);
-                            try buffer.bindLabel(osr_labels[osr_index]);
+                            const out_of_line = frame_bytes != 0 or preserve_nonvolatile or osrBlockNeedsRematerialization(source, osr.block);
+                            try buffer.bindLabel(if (out_of_line) osr_body_labels[osr_index] else osr_labels[osr_index]);
                         }
                     }
                 }
-                if (try deoptIdForSite(options.deopt, site_id) != null) {
+                if (try deoptIdForSite(source, options.deopt, site_id) != null) {
                     try emitDeoptGuard(allocator, &buffer, options.runtime.?, site_id, &cold_deopts, &stats);
                 }
             }
-            try encodeInst(allocator, &buffer, labels, edge_labels, block.id, &allocation, source, inst, options.runtime, &cold, &cold_bounds, &stats);
+            try encodeInst(allocator, &buffer, labels, edge_labels, block.id, &allocation, &spill_plan, frame_bytes, preserve_nonvolatile, source, inst, options.runtime, &cold, &cold_bounds, &stats);
         }
         if (!hasExplicitTransfer(block)) {
             const successors = source.successors[block.id];
@@ -2179,16 +4326,64 @@ pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Fu
     for (source.edges, 0..) |edge, index| {
         if (edge.from >= source.blocks.len or edge.to >= labels.len) return error.InvalidMachine;
         try buffer.bindLabel(edge_labels[index]);
-        try emitEdgeCopies(allocator, &buffer, &allocation, source, edge, &stats);
+        try emitEdgeCopies(allocator, &buffer, &allocation, &spill_plan, source, edge, &stats);
         try emitJump(&buffer, labels[edge.to]);
         stats.edge_copy_sites += 1;
         stats.edge_copy_moves += @intCast(edge.moves.len);
         stats.jumps += 1;
         stats.native_insts += 1;
     }
+    for (osr_labels, 0..) |landing, index| {
+        const spec = options.osr_entries[index];
+        const rematerializes = osrBlockNeedsRematerialization(source, spec.block);
+        if (frame_bytes == 0 and !preserve_nonvolatile and !rematerializes) continue;
+        try buffer.alignTo(16, 0x90);
+        try buffer.bindLabel(landing);
+        try emitFrameEnter(&buffer, frame_bytes, preserve_nonvolatile);
+        if (frame_bytes != 0 or preserve_nonvolatile) {
+            stats.osr_frame_landings += 1;
+            stats.native_insts += 1;
+        }
+        if (rematerializes) {
+            // A private, non-root landing scratch word remembers the epoch
+            // across preserve-all helper calls. It is removed before entering
+            // the body, so normal spill offsets and the common epilogue remain
+            // unchanged.
+            try emitAdjustStack(&buffer, true, 16);
+            const restart = try buffer.newLabel();
+            try buffer.bindLabel(restart);
+            try emitMovMemoryFromRaw(&buffer, 4, 0, acknowledged_epoch, true);
+            stats.native_insts += 2;
+            const deopt = options.deopt orelse return error.InvalidDeoptMetadata;
+            var dex_pc: ?u32 = null;
+            for (deopt.points) |point| {
+                if (point.id != spec.point_id) continue;
+                if (dex_pc != null) return error.InvalidDeoptMetadata;
+                dex_pc = point.dex_pc;
+            }
+            try emitOsrRematerializations(
+                allocator,
+                &buffer,
+                source,
+                &allocation,
+                options.runtime orelse return error.MissingRuntimeAbi,
+                spec.block,
+                dex_pc orelse return error.InvalidDeoptMetadata,
+                try osrLandingSiteId(source, options.deopt, index),
+                restart,
+                &cold,
+                &stats,
+            );
+            try emitAdjustStack(&buffer, false, 16);
+            stats.native_insts += 1;
+        }
+        try emitJump(&buffer, osr_body_labels[index]);
+        stats.jumps += 1;
+        stats.native_insts += 1;
+    }
     if (options.runtime) |runtime| try emitColdResolves(&buffer, cold.items, runtime, &stats);
-    if (options.runtime) |runtime| try emitColdBoundsExceptions(&buffer, cold_bounds.items, runtime, &stats);
-    if (options.runtime) |runtime| try emitColdDeopts(&buffer, cold_deopts.items, runtime, &stats);
+    if (options.runtime) |runtime| try emitColdBoundsExceptions(&buffer, cold_bounds.items, runtime, frame_bytes, preserve_nonvolatile, &stats);
+    if (options.runtime) |runtime| try emitColdDeopts(&buffer, cold_deopts.items, runtime, frame_bytes, preserve_nonvolatile, &stats);
     try buffer.verify();
     const osr_entries = try buildOsrEntries(
         allocator,
@@ -2225,6 +4420,19 @@ fn optimizedMachine(allocator: std.mem.Allocator, insts: []const Instruction) !*
     return try optimizer.optimize(allocator, insts, &.{}, .{});
 }
 
+fn encodedTestInstructions(allocator: std.mem.Allocator, insts: []const Instruction) ![]u8 {
+    var optimized = try optimizedMachine(allocator, insts);
+    defer optimized.deinit();
+    var native = try encode(allocator, &optimized.machine);
+    defer native.deinit();
+    return try native.finalize();
+}
+
+fn addOwnedTestBytes(cache: *jit_memory.Cache, bytes: []u8) !*jit_memory.Allocation {
+    defer std.testing.allocator.free(bytes);
+    return try cache.addBytes(bytes);
+}
+
 fn expectBinaryI32(insts: []const Instruction, a: i32, b: i32, expected: i32) !void {
     if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
 
@@ -2241,6 +4449,48 @@ fn expectBinaryI32(insts: []const Instruction, a: i32, b: i32, expected: i32) !v
     const allocation = try cache.addBytes(bytes);
     const Fn = fn (i32, i32) callconv(.c) i32;
     try std.testing.expectEqual(expected, allocation.typedEntry(Fn)(a, b));
+}
+
+test "inline activation provenance distinguishes recursive frames and rejects orphans" {
+    const callers = [_]DeoptInlineFrameSpec{.{
+        .activation_id = 1,
+        .method_id = 7,
+        .dex_pc = 3,
+        .register_count = 1,
+        .values = &.{},
+    }};
+    const points = [_]DeoptPointSpec{.{
+        .id = 1,
+        .method_id = 7,
+        .dex_pc = 4,
+        .values = &.{},
+        .activation_id = 2,
+        .inline_frames = &callers,
+    }};
+    const recursive = [_]InlineActivationSpec{
+        .{ .id = 1, .parent_id = 0, .method_id = 7, .register_count = 1, .parent_dex_pc = 0 },
+        .{ .id = 2, .parent_id = 1, .method_id = 7, .register_count = 1, .parent_dex_pc = 3 },
+    };
+    try validateInlineActivations(std.testing.allocator, .{
+        .points = &points,
+        .register_count = 1,
+        .max_dex_pc = 4,
+        .inline_activations = &recursive,
+    });
+
+    const orphaned = recursive ++ [_]InlineActivationSpec{.{
+        .id = 3,
+        .parent_id = 1,
+        .method_id = 8,
+        .register_count = 1,
+        .parent_dex_pc = 2,
+    }};
+    try std.testing.expectError(error.InvalidDeoptMetadata, validateInlineActivations(std.testing.allocator, .{
+        .points = &points,
+        .register_count = 1,
+        .max_dex_pc = 4,
+        .inline_activations = &orphaned,
+    }));
 }
 
 test "x64_register_encoder executes parameter arithmetic without frame prologue" {
@@ -2302,11 +4552,11 @@ test "x64 edge parallel copy breaks physical register cycles" {
     try emitMovRawImm64(&buffer, 0, 11);
     try emitMovRawImm64(&buffer, 1, 22);
     var copies = [_]EdgeCopy{
-        .{ .dst = .rax, .src = .rcx, .wide = true },
-        .{ .dst = .rcx, .src = .rax, .wide = true },
+        .{ .dst = .{ .phys = .rax }, .src = .{ .phys = .rcx }, .dst_reg = 0, .src_reg = 1, .wide = true, .class = .gp },
+        .{ .dst = .{ .phys = .rcx }, .src = .{ .phys = .rax }, .dst_reg = 1, .src_reg = 0, .wide = true, .class = .gp },
     };
     var stats: Stats = .{};
-    try emitParallelEdgeCopies(&buffer, &copies, &stats);
+    try emitParallelEdgeCopies(&buffer, null, &copies, &stats);
     try emitRet(&buffer);
     try std.testing.expectEqual(@as(u32, 1), stats.edge_copy_cycles);
     try std.testing.expectEqual(@as(u32, 3), stats.register_moves);
@@ -2320,16 +4570,513 @@ test "x64 edge parallel copy breaks physical register cycles" {
     try std.testing.expectEqual(@as(u64, 22), allocation.typedEntry(Fn)());
 }
 
-test "x64_register_encoder rejects spills explicitly" {
+test "x64 edge parallel copy breaks XMM register cycles" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const first_bits: u32 = @bitCast(@as(f32, 11.25));
+    const second_bits: u32 = @bitCast(@as(f32, -7.5));
+    var buffer = code_buffer.Buffer.init(std.testing.allocator);
+    defer buffer.deinit();
+    try emitMovRegImm32(&buffer, .rax, @bitCast(first_bits));
+    try emitGpToXmm(&buffer, .xmm0, .rax, false);
+    try emitMovRegImm32(&buffer, .rcx, @bitCast(second_bits));
+    try emitGpToXmm(&buffer, .xmm1, .rcx, false);
+    var copies = [_]EdgeCopy{
+        .{ .dst = .{ .phys = .xmm0 }, .src = .{ .phys = .xmm1 }, .dst_reg = 0, .src_reg = 1, .wide = false, .class = .xmm },
+        .{ .dst = .{ .phys = .xmm1 }, .src = .{ .phys = .xmm0 }, .dst_reg = 1, .src_reg = 0, .wide = false, .class = .xmm },
+    };
+    var stats: Stats = .{};
+    try emitParallelEdgeCopies(&buffer, null, &copies, &stats);
+    try emitXmmToGp(&buffer, .rax, .xmm0, false);
+    try emitRet(&buffer);
+    try std.testing.expectEqual(@as(u32, 1), stats.edge_copy_cycles);
+    try std.testing.expectEqual(@as(u32, 3), stats.register_moves);
+    try std.testing.expectEqual(@as(u32, 3), stats.xmm_insts);
+
+    const bytes = try buffer.finalize();
+    defer std.testing.allocator.free(bytes);
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const allocation = try cache.addBytes(bytes);
+    const Fn = fn () callconv(.c) u32;
+    try std.testing.expectEqual(second_bits, allocation.typedEntry(Fn)());
+}
+
+test "x64_register_encoder executes spill-heavy scalar XMM arithmetic" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     const insts = [_]Instruction{
-        .{ .add_int = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
+        .{ .add_float = .{ .dest = 7, .src1 = 0, .src2 = 1 } },
+        .{ .add_float = .{ .dest = 8, .src1 = 2, .src2 = 3 } },
+        .{ .add_float = .{ .dest = 9, .src1 = 4, .src2 = 5 } },
+        .{ .add_float = .{ .dest = 10, .src1 = 7, .src2 = 6 } },
+        .{ .add_float = .{ .dest = 11, .src1 = 10, .src2 = 8 } },
+        .{ .add_float = .{ .dest = 12, .src1 = 11, .src2 = 9 } },
+        .{ .return_ = .{ .src = 12 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    for (optimized.machine.blocks) |block| for (block.insts) |inst| {
+        if (inst.opcode == .f32_op) try std.testing.expectEqual(machine.FloatOperation.add, inst.float_op.?);
+    };
+
+    var native = try encode(std.testing.allocator, &optimized.machine);
+    defer native.deinit();
+    try std.testing.expect(native.allocation.stats.spills > 0);
+    try std.testing.expect(native.stats.frame_bytes > 0);
+    try std.testing.expect(std.mem.isAligned(native.stats.frame_bytes, 16));
+    try std.testing.expect(native.stats.xmm_insts > 0);
+    try std.testing.expect(native.stats.xmm_spill_loads > 0);
+    try std.testing.expect(native.stats.xmm_spill_stores > 0);
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const allocation = try cache.addBytes(bytes);
+    const Fn = fn (u32, u32, u32, u32, u32, u32, u32) callconv(.c) u32;
+    const result_bits = allocation.typedEntry(Fn)(
+        @bitCast(@as(f32, 1)),
+        @bitCast(@as(f32, 2)),
+        @bitCast(@as(f32, 3)),
+        @bitCast(@as(f32, 4)),
+        @bitCast(@as(f32, 5)),
+        @bitCast(@as(f32, 6)),
+        @bitCast(@as(f32, 7)),
+    );
+    try std.testing.expectEqual(@as(f32, 28), @as(f32, @bitCast(result_bits)));
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, edgeEncodingFailureProbe, .{&optimized.machine});
+}
+
+test "x64_register_encoder preserves scalar XMM rhs across two-address aliases" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .sub_float = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
+        .{ .mul_float = .{ .dest = 3, .src1 = 2, .src2 = 1 } },
+        .{ .div_float = .{ .dest = 4, .src1 = 3, .src2 = 0 } },
+        .{ .return_ = .{ .src = 4 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    const expected_operations = [_]machine.FloatOperation{ .sub, .mul, .div };
+    var operation_index: usize = 0;
+    for (optimized.machine.blocks) |block| for (block.insts) |inst| {
+        if (inst.opcode != .f32_op) continue;
+        try std.testing.expect(operation_index < expected_operations.len);
+        try std.testing.expectEqual(expected_operations[operation_index], inst.float_op.?);
+        operation_index += 1;
+    };
+    try std.testing.expectEqual(expected_operations.len, operation_index);
+
+    var native = try encode(std.testing.allocator, &optimized.machine);
+    defer native.deinit();
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const allocation = try cache.addBytes(bytes);
+    const Fn = fn (u32, u32) callconv(.c) u32;
+    const result_bits = allocation.typedEntry(Fn)(@bitCast(@as(f32, 10)), @bitCast(@as(f32, 3)));
+    const result: f32 = @bitCast(result_bits);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.1), result, 0.000001);
+}
+
+test "x64_register_encoder executes bit-exact scalar XMM negation" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const float_insts = [_]Instruction{
+        .{ .neg_float = .{ .dest = 1, .src = 0 } },
+        .{ .return_ = .{ .src = 1 } },
+    };
+    var float_optimized = try optimizedMachine(std.testing.allocator, &float_insts);
+    defer float_optimized.deinit();
+    try std.testing.expectEqual(machine.FloatOperation.neg, float_optimized.machine.blocks[0].insts[0].float_op.?);
+    var float_native = try encode(std.testing.allocator, &float_optimized.machine);
+    defer float_native.deinit();
+    try std.testing.expectEqual(@as(u32, 1), float_native.stats.xmm_negations);
+    const float_bytes = try float_native.finalize();
+    defer std.testing.allocator.free(float_bytes);
+    var float_cache = jit_memory.Cache.init(std.testing.allocator);
+    defer float_cache.deinit();
+    const float_allocation = try float_cache.addBytes(float_bytes);
+    const FloatFn = fn (u32) callconv(.c) u32;
+    const negate_float = float_allocation.typedEntry(FloatFn);
+    try std.testing.expectEqual(@as(u32, 0x80000000), negate_float(0x00000000));
+    try std.testing.expectEqual(@as(u32, 0x00000000), negate_float(0x80000000));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -1.5))), negate_float(@bitCast(@as(f32, 1.5))));
+    try std.testing.expectEqual(@as(u32, 0xffc12345), negate_float(0x7fc12345));
+
+    const double_insts = [_]Instruction{
+        .{ .neg_double = .{ .dest = 2, .src = 0 } },
+        .{ .return_wide = .{ .src = 2 } },
+    };
+    var double_optimized = try optimizedMachine(std.testing.allocator, &double_insts);
+    defer double_optimized.deinit();
+    var double_native = try encode(std.testing.allocator, &double_optimized.machine);
+    defer double_native.deinit();
+    try std.testing.expectEqual(@as(u32, 1), double_native.stats.xmm_negations);
+    const double_bytes = try double_native.finalize();
+    defer std.testing.allocator.free(double_bytes);
+    var double_cache = jit_memory.Cache.init(std.testing.allocator);
+    defer double_cache.deinit();
+    const double_allocation = try double_cache.addBytes(double_bytes);
+    const DoubleFn = fn (u64, u64) callconv(.c) u64;
+    const negate_double = double_allocation.typedEntry(DoubleFn);
+    try std.testing.expectEqual(@as(u64, 0x8000000000000000), negate_double(0, 0));
+    try std.testing.expectEqual(@as(u64, 0), negate_double(0x8000000000000000, 0));
+    try std.testing.expectEqual(@as(u64, 0xfff8123456789abc), negate_double(0x7ff8123456789abc, 0));
+}
+
+const F32CompareCase = struct {
+    lhs: f32,
+    rhs: f32,
+    expected: i32,
+};
+
+fn expectF32Compare(insts: []const Instruction, operation: machine.FloatOperation, cases: []const F32CompareCase) !void {
+    var optimized = try optimizedMachine(std.testing.allocator, insts);
+    defer optimized.deinit();
+    try std.testing.expectEqual(operation, optimized.machine.blocks[0].insts[0].float_op.?);
+    var native = try encode(std.testing.allocator, &optimized.machine);
+    defer native.deinit();
+    try std.testing.expectEqual(@as(u32, 1), native.stats.xmm_comparisons);
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const allocation = try cache.addBytes(bytes);
+    const Fn = fn (u32, u32) callconv(.c) i32;
+    const compare = allocation.typedEntry(Fn);
+    for (cases) |case| try std.testing.expectEqual(case.expected, compare(@bitCast(case.lhs), @bitCast(case.rhs)));
+}
+
+test "x64_register_encoder executes Dalvik float compare NaN policy" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const nan = std.math.nan(f32);
+    const common_cases = [_]F32CompareCase{
+        .{ .lhs = -3, .rhs = 2, .expected = -1 },
+        .{ .lhs = 2, .rhs = 2, .expected = 0 },
+        .{ .lhs = 9, .rhs = 2, .expected = 1 },
+        .{ .lhs = -0.0, .rhs = 0.0, .expected = 0 },
+        .{ .lhs = -std.math.inf(f32), .rhs = std.math.inf(f32), .expected = -1 },
+    };
+    try expectF32Compare(&.{
+        .{ .cmpl_float = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
+        .{ .return_ = .{ .src = 2 } },
+    }, .compare_l, &common_cases);
+    try expectF32Compare(&.{
+        .{ .cmpg_float = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
+        .{ .return_ = .{ .src = 2 } },
+    }, .compare_g, &common_cases);
+    try expectF32Compare(&.{
+        .{ .cmpl_float = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
+        .{ .return_ = .{ .src = 2 } },
+    }, .compare_l, &.{
+        .{ .lhs = nan, .rhs = 1, .expected = -1 },
+        .{ .lhs = 1, .rhs = nan, .expected = -1 },
+    });
+    try expectF32Compare(&.{
+        .{ .cmpg_float = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
+        .{ .return_ = .{ .src = 2 } },
+    }, .compare_g, &.{
+        .{ .lhs = nan, .rhs = 1, .expected = 1 },
+        .{ .lhs = 1, .rhs = nan, .expected = 1 },
+    });
+}
+
+test "x64_register_encoder executes Dalvik double compare NaN policy" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .cmpg_double = .{ .dest = 4, .src1 = 0, .src2 = 2 } },
+        .{ .return_ = .{ .src = 4 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    try std.testing.expectEqual(machine.FloatOperation.compare_g, optimized.machine.blocks[0].insts[0].float_op.?);
+    var native = try encode(std.testing.allocator, &optimized.machine);
+    defer native.deinit();
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const allocation = try cache.addBytes(bytes);
+    const Fn = fn (u64, u64, u64, u64) callconv(.c) i32;
+    const compare = allocation.typedEntry(Fn);
+    try std.testing.expectEqual(@as(i32, -1), compare(@bitCast(@as(f64, -4.0)), 0, @bitCast(@as(f64, 7.0)), 0));
+    try std.testing.expectEqual(@as(i32, 0), compare(@bitCast(@as(f64, -0.0)), 0, @bitCast(@as(f64, 0.0)), 0));
+    try std.testing.expectEqual(@as(i32, 1), compare(@bitCast(std.math.nan(f64)), 0, @bitCast(@as(f64, 1.0)), 0));
+}
+
+test "x64_register_encoder compares through scalar XMM pressure and spills" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .add_float = .{ .dest = 7, .src1 = 0, .src2 = 1 } },
+        .{ .add_float = .{ .dest = 8, .src1 = 2, .src2 = 3 } },
+        .{ .add_float = .{ .dest = 9, .src1 = 4, .src2 = 5 } },
+        .{ .add_float = .{ .dest = 10, .src1 = 7, .src2 = 6 } },
+        .{ .cmpl_float = .{ .dest = 11, .src1 = 10, .src2 = 8 } },
+        .{ .return_ = .{ .src = 11 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    var native = try encode(std.testing.allocator, &optimized.machine);
+    defer native.deinit();
+    try std.testing.expect(native.allocation.stats.spills > 0);
+    try std.testing.expect(native.stats.xmm_spill_loads > 0);
+    try std.testing.expect(native.stats.xmm_spill_stores > 0);
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const allocation = try cache.addBytes(bytes);
+    const Fn = fn (u32, u32, u32, u32, u32, u32, u32) callconv(.c) i32;
+    const result = allocation.typedEntry(Fn)(
+        @bitCast(@as(f32, 1)),
+        @bitCast(@as(f32, 2)),
+        @bitCast(@as(f32, 3)),
+        @bitCast(@as(f32, 4)),
+        @bitCast(@as(f32, 5)),
+        @bitCast(@as(f32, 6)),
+        @bitCast(@as(f32, 7)),
+    );
+    try std.testing.expectEqual(@as(i32, 1), result);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, edgeEncodingFailureProbe, .{&optimized.machine});
+}
+
+test "x64_register_encoder converts signed integers to float and double" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const int_float_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .int_to_float = .{ .dest = 1, .src = 0 } },
+        .{ .return_ = .{ .src = 1 } },
+    });
+    const IntFloatFn = fn (i32) callconv(.c) u32;
+    const int_to_float = (try addOwnedTestBytes(&cache, int_float_bytes)).typedEntry(IntFloatFn);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatFromInt(std.math.minInt(i32))))), int_to_float(std.math.minInt(i32)));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatFromInt(std.math.maxInt(i32))))), int_to_float(std.math.maxInt(i32)));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatFromInt(@as(i32, 123456789))))), int_to_float(123456789));
+
+    const int_double_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .int_to_double = .{ .dest = 1, .src = 0 } },
+        .{ .return_wide = .{ .src = 1 } },
+    });
+    const IntDoubleFn = fn (i32) callconv(.c) u64;
+    const int_to_double = (try addOwnedTestBytes(&cache, int_double_bytes)).typedEntry(IntDoubleFn);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, @floatFromInt(std.math.minInt(i32))))), int_to_double(std.math.minInt(i32)));
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, @floatFromInt(std.math.maxInt(i32))))), int_to_double(std.math.maxInt(i32)));
+
+    const long_float_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .long_to_float = .{ .dest = 2, .src = 0 } },
+        .{ .return_ = .{ .src = 2 } },
+    });
+    const LongFloatFn = fn (i64, i64) callconv(.c) u32;
+    const long_to_float = (try addOwnedTestBytes(&cache, long_float_bytes)).typedEntry(LongFloatFn);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatFromInt(std.math.minInt(i64))))), long_to_float(std.math.minInt(i64), 0));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatFromInt(std.math.maxInt(i64))))), long_to_float(std.math.maxInt(i64), 0));
+
+    const long_double_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .long_to_double = .{ .dest = 2, .src = 0 } },
+        .{ .return_wide = .{ .src = 2 } },
+    });
+    const LongDoubleFn = fn (i64, i64) callconv(.c) u64;
+    const long_to_double = (try addOwnedTestBytes(&cache, long_double_bytes)).typedEntry(LongDoubleFn);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, @floatFromInt(std.math.maxInt(i64))))), long_to_double(std.math.maxInt(i64), 0));
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, @floatFromInt(std.math.minInt(i64))))), long_to_double(std.math.minInt(i64), 0));
+}
+
+test "x64_register_encoder changes scalar XMM precision" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const widen_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .float_to_double = .{ .dest = 1, .src = 0 } },
+        .{ .return_wide = .{ .src = 1 } },
+    });
+    const WidenFn = fn (u32) callconv(.c) u64;
+    const widen = (try addOwnedTestBytes(&cache, widen_bytes)).typedEntry(WidenFn);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, @floatCast(@as(f32, 1.25))))), widen(@bitCast(@as(f32, 1.25))));
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, -0.0))), widen(@bitCast(@as(f32, -0.0))));
+    try std.testing.expectEqual(@as(u64, @bitCast(std.math.inf(f64))), widen(@bitCast(std.math.inf(f32))));
+
+    const narrow_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .double_to_float = .{ .dest = 2, .src = 0 } },
+        .{ .return_ = .{ .src = 2 } },
+    });
+    const NarrowFn = fn (u64, u64) callconv(.c) u32;
+    const narrow = (try addOwnedTestBytes(&cache, narrow_bytes)).typedEntry(NarrowFn);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, @floatCast(@as(f64, 1.25))))), narrow(@bitCast(@as(f64, 1.25)), 0));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -0.0))), narrow(@bitCast(@as(f64, -0.0)), 0));
+    try std.testing.expectEqual(@as(u32, @bitCast(std.math.inf(f32))), narrow(@bitCast(std.math.inf(f64)), 0));
+}
+
+test "x64_register_encoder saturates float and double integer conversions" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    const float_int_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .float_to_int = .{ .dest = 1, .src = 0 } },
+        .{ .return_ = .{ .src = 1 } },
+    });
+    const FloatIntFn = fn (u32) callconv(.c) i32;
+    const float_to_int = (try addOwnedTestBytes(&cache, float_int_bytes)).typedEntry(FloatIntFn);
+    try std.testing.expectEqual(@as(i32, 0), float_to_int(@bitCast(std.math.nan(f32))));
+    try std.testing.expectEqual(std.math.maxInt(i32), float_to_int(@bitCast(std.math.inf(f32))));
+    try std.testing.expectEqual(std.math.minInt(i32), float_to_int(@bitCast(-std.math.inf(f32))));
+    try std.testing.expectEqual(std.math.maxInt(i32), float_to_int(@bitCast(@as(f32, @floatFromInt(std.math.maxInt(i32))))));
+    try std.testing.expectEqual(std.math.minInt(i32), float_to_int(@bitCast(@as(f32, @floatFromInt(std.math.minInt(i32))))));
+    try std.testing.expectEqual(@as(i32, 42), float_to_int(@bitCast(@as(f32, 42.875))));
+    try std.testing.expectEqual(@as(i32, -42), float_to_int(@bitCast(@as(f32, -42.875))));
+
+    const float_long_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .float_to_long = .{ .dest = 1, .src = 0 } },
+        .{ .return_wide = .{ .src = 1 } },
+    });
+    const FloatLongFn = fn (u32) callconv(.c) i64;
+    const float_to_long = (try addOwnedTestBytes(&cache, float_long_bytes)).typedEntry(FloatLongFn);
+    try std.testing.expectEqual(@as(i64, 0), float_to_long(@bitCast(std.math.nan(f32))));
+    try std.testing.expectEqual(std.math.maxInt(i64), float_to_long(@bitCast(std.math.inf(f32))));
+    try std.testing.expectEqual(std.math.minInt(i64), float_to_long(@bitCast(-std.math.inf(f32))));
+    try std.testing.expectEqual(std.math.maxInt(i64), float_to_long(@bitCast(@as(f32, @floatFromInt(std.math.maxInt(i64))))));
+    try std.testing.expectEqual(std.math.minInt(i64), float_to_long(@bitCast(@as(f32, @floatFromInt(std.math.minInt(i64))))));
+    try std.testing.expectEqual(@as(i64, 12345), float_to_long(@bitCast(@as(f32, 12345.75))));
+
+    const double_int_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .double_to_int = .{ .dest = 2, .src = 0 } },
+        .{ .return_ = .{ .src = 2 } },
+    });
+    const DoubleIntFn = fn (u64, u64) callconv(.c) i32;
+    const double_to_int = (try addOwnedTestBytes(&cache, double_int_bytes)).typedEntry(DoubleIntFn);
+    try std.testing.expectEqual(@as(i32, 0), double_to_int(@bitCast(std.math.nan(f64)), 0));
+    try std.testing.expectEqual(std.math.maxInt(i32), double_to_int(@bitCast(@as(f64, @floatFromInt(std.math.maxInt(i32))) + 1024.0), 0));
+    try std.testing.expectEqual(std.math.minInt(i32), double_to_int(@bitCast(@as(f64, @floatFromInt(std.math.minInt(i32))) - 1024.0), 0));
+    try std.testing.expectEqual(std.math.maxInt(i32), double_to_int(@bitCast(@as(f64, @floatFromInt(std.math.maxInt(i32)))), 0));
+    try std.testing.expectEqual(std.math.minInt(i32), double_to_int(@bitCast(@as(f64, @floatFromInt(std.math.minInt(i32)))), 0));
+    try std.testing.expectEqual(@as(i32, -42), double_to_int(@bitCast(@as(f64, -42.875)), 0));
+
+    const double_long_bytes = try encodedTestInstructions(std.testing.allocator, &.{
+        .{ .double_to_long = .{ .dest = 2, .src = 0 } },
+        .{ .return_wide = .{ .src = 2 } },
+    });
+    const DoubleLongFn = fn (u64, u64) callconv(.c) i64;
+    const double_to_long = (try addOwnedTestBytes(&cache, double_long_bytes)).typedEntry(DoubleLongFn);
+    try std.testing.expectEqual(@as(i64, 0), double_to_long(@bitCast(std.math.nan(f64)), 0));
+    try std.testing.expectEqual(std.math.maxInt(i64), double_to_long(@bitCast(std.math.inf(f64)), 0));
+    try std.testing.expectEqual(std.math.minInt(i64), double_to_long(@bitCast(-std.math.inf(f64)), 0));
+    try std.testing.expectEqual(std.math.maxInt(i64), double_to_long(@bitCast(@as(f64, @floatFromInt(std.math.maxInt(i64)))), 0));
+    try std.testing.expectEqual(std.math.minInt(i64), double_to_long(@bitCast(@as(f64, @floatFromInt(std.math.minInt(i64)))), 0));
+    try std.testing.expectEqual(@as(i64, 1234567890123), double_to_long(@bitCast(@as(f64, 1234567890123.75)), 0));
+}
+
+test "x64_register_encoder converts through scalar XMM pressure and spills" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .add_float = .{ .dest = 7, .src1 = 0, .src2 = 1 } },
+        .{ .add_float = .{ .dest = 8, .src1 = 2, .src2 = 3 } },
+        .{ .add_float = .{ .dest = 9, .src1 = 4, .src2 = 5 } },
+        .{ .add_float = .{ .dest = 10, .src1 = 7, .src2 = 6 } },
+        .{ .float_to_int = .{ .dest = 11, .src = 10 } },
+        .{ .return_ = .{ .src = 11 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    var native = try encode(std.testing.allocator, &optimized.machine);
+    defer native.deinit();
+    try std.testing.expect(native.allocation.stats.spills > 0);
+    try std.testing.expect(native.stats.xmm_spill_loads > 0);
+    try std.testing.expect(native.stats.xmm_spill_stores > 0);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.xmm_saturating_conversions);
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const allocation = try cache.addBytes(bytes);
+    const Fn = fn (u32, u32, u32, u32, u32, u32, u32) callconv(.c) i32;
+    const result = allocation.typedEntry(Fn)(
+        @bitCast(@as(f32, 1)),
+        @bitCast(@as(f32, 2)),
+        @bitCast(@as(f32, 3)),
+        @bitCast(@as(f32, 4)),
+        @bitCast(@as(f32, 5)),
+        @bitCast(@as(f32, 6)),
+        @bitCast(@as(f32, 7)),
+    );
+    try std.testing.expectEqual(@as(i32, 10), result);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, edgeEncodingFailureProbe, .{&optimized.machine});
+}
+
+test "x64_register_encoder executes scalar double constants and arithmetic" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .const_wide = .{ .dest = 0, .value = @bitCast(@as(f64, 1.5)) } },
+        .{ .const_wide = .{ .dest = 2, .value = @bitCast(@as(f64, 2.25)) } },
+        .{ .add_double = .{ .dest = 4, .src1 = 0, .src2 = 2 } },
+        .{ .return_wide = .{ .src = 4 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    var native = try encode(std.testing.allocator, &optimized.machine);
+    defer native.deinit();
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const allocation = try cache.addBytes(bytes);
+    const Fn = fn () callconv(.c) u64;
+    const result: f64 = @bitCast(allocation.typedEntry(Fn)());
+    try std.testing.expectEqual(@as(f64, 3.75), result);
+}
+
+test "x64_register_encoder requires scalar remainder helper metadata" {
+    const insts = [_]Instruction{
+        .{ .rem_float = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
         .{ .return_ = .{ .src = 2 } },
     };
     var optimized = try optimizedMachine(std.testing.allocator, &insts);
     defer optimized.deinit();
-    var allocation = try regalloc.allocate(std.testing.allocator, &optimized.machine, .{ .gp_registers = &[_]regalloc.PhysReg{} });
-    defer allocation.deinit();
-    try std.testing.expect(allocation.stats.spills > 0);
+    try std.testing.expectError(error.MissingRuntimeAbi, encode(std.testing.allocator, &optimized.machine));
+    var abi = testRuntimeAbi();
+    abi.f32_remainder_helper = 0;
+    try std.testing.expectError(error.MissingNumericHelper, encodeWithOptions(std.testing.allocator, &optimized.machine, .{ .runtime = abi }));
+
+    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{ .runtime = testRuntimeAbi() });
+    defer native.deinit();
+    try native.verify();
+    try std.testing.expectEqual(@as(u32, 1), native.stats.xmm_remainders);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.numeric_helper_calls);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, numericEncodingFailureProbe, .{&optimized.machine});
+}
+
+test "x64_register_encoder executes a spill-heavy aligned frame" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .add_int = .{ .dest = 8, .src1 = 0, .src2 = 1 } },
+        .{ .add_int = .{ .dest = 9, .src1 = 2, .src2 = 3 } },
+        .{ .add_int = .{ .dest = 10, .src1 = 4, .src2 = 5 } },
+        .{ .add_int = .{ .dest = 11, .src1 = 6, .src2 = 7 } },
+        .{ .add_int = .{ .dest = 12, .src1 = 8, .src2 = 9 } },
+        .{ .add_int = .{ .dest = 13, .src1 = 10, .src2 = 11 } },
+        .{ .add_int = .{ .dest = 14, .src1 = 12, .src2 = 13 } },
+        .{ .return_ = .{ .src = 14 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    var native = try encode(std.testing.allocator, &optimized.machine);
+    defer native.deinit();
+    try std.testing.expect(native.allocation.stats.spills > 0);
+    try std.testing.expect(native.stats.frame_bytes > 0);
+    try std.testing.expect(std.mem.isAligned(native.stats.frame_bytes, 16));
+    try std.testing.expect(native.stats.spill_loads > 0);
+    try std.testing.expect(native.stats.spill_stores > 0);
+
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const allocation = try cache.addBytes(bytes);
+    const Fn = fn (i32, i32, i32, i32, i32, i32, i32, i32) callconv(.c) i32;
+    try std.testing.expectEqual(@as(i32, 36), allocation.typedEntry(Fn)(1, 2, 3, 4, 5, 6, 7, 8));
 }
 
 test "x64_register_encoder print helper emits stable summary" {
@@ -2366,6 +5113,8 @@ fn testRuntimeAbi() RuntimeAbi {
         .satb_pre_write_helper = 0x2345_6789,
         .card_mark_helper = 0x3456_789a,
         .card_mark_repeat_helper = 0x4567_89ab,
+        .f32_remainder_helper = 0x5678_9abc,
+        .f64_remainder_helper = 0x6789_abcd,
         .field_layouts = &test_field_layouts,
     };
 }
@@ -2381,6 +5130,13 @@ fn boundsEncodingFailureProbe(allocator: std.mem.Allocator, source: *const machi
     var abi = testRuntimeAbi();
     abi.reference_array_layout = .{ .length_offset = 0, .data_offset = 8 };
     var native = try encodeWithOptions(allocator, source, .{ .runtime = abi });
+    defer native.deinit();
+    const bytes = try native.finalize();
+    defer allocator.free(bytes);
+}
+
+fn numericEncodingFailureProbe(allocator: std.mem.Allocator, source: *const machine.Function) !void {
+    var native = try encodeWithOptions(allocator, source, .{ .runtime = testRuntimeAbi() });
     defer native.deinit();
     const bytes = try native.finalize();
     defer allocator.free(bytes);
@@ -2516,6 +5272,137 @@ test "x64_register_encoder publishes precise roots across sibling branches" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, resolverEncodingFailureProbe, .{&optimized.machine});
 }
 
+test "x64_register_encoder maps a live spilled Handle in its real frame" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 8, .obj = 0 } },
+        .{ .add_int = .{ .dest = 9, .src1 = 2, .src2 = 3 } },
+        .{ .add_int = .{ .dest = 10, .src1 = 4, .src2 = 5 } },
+        .{ .add_int = .{ .dest = 11, .src1 = 6, .src2 = 7 } },
+        .{ .add_int = .{ .dest = 12, .src1 = 9, .src2 = 10 } },
+        .{ .add_int = .{ .dest = 13, .src1 = 12, .src2 = 11 } },
+        .{ .return_ = .{ .src = 1 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    // This backend-level test makes the second incoming value a Handle after
+    // front-end construction so it can isolate frame/root-map behavior from
+    // object-bytecode lowering. The machine verifier remains authoritative.
+    optimized.machine.reg_types[1] = .object;
+    switch (optimized.machine.runtime_values[1]) {
+        .dalvik => |*value| {
+            value.ty = .object;
+            value.gc_root = true;
+        },
+        .derived_ptr => return error.TestUnexpectedResult,
+    }
+    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{ .runtime = testRuntimeAbi() });
+    defer native.deinit();
+    try native.verify();
+    try std.testing.expect(native.stats.frame_bytes > 0);
+
+    const maps = &(native.root_maps orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqual(@as(usize, 1), maps.records.len);
+    var found_stack_handle = false;
+    for (maps.rootsFor(&maps.records[0])) |root| {
+        if (root.kind != .stack_slot) continue;
+        found_stack_handle = true;
+        try std.testing.expect(root.stackOffset() >= 0);
+        try std.testing.expect(@as(u32, @intCast(root.stackOffset())) < native.stats.frame_bytes);
+    }
+    try std.testing.expect(found_stack_handle);
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(bytes.len != 0);
+}
+
+test "x64_register_encoder reloads pointer-access operands under pressure" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 8, .obj = 0 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 9, .obj = 1 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 10, .obj = 2 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 11, .obj = 3 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 12, .obj = 4 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 13, .obj = 5 } },
+        .{ .return_ = .{ .src = 8 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{ .runtime = testRuntimeAbi() });
+    defer native.deinit();
+    try native.verify();
+    try std.testing.expect(native.stats.frame_bytes > 0);
+    try std.testing.expect(native.stats.spill_loads > 0);
+    try std.testing.expect(native.stats.spill_stores > 0);
+
+    var pointer_result_spilled = false;
+    for (optimized.machine.blocks) |block| {
+        for (block.insts) |inst| {
+            if (inst.opcode != .field_load_ptr or inst.defs.len != 1) continue;
+            switch (native.allocation.locationOf(inst.defs[0]).?) {
+                .spill => pointer_result_spilled = true,
+                else => {},
+            }
+        }
+    }
+    try std.testing.expect(pointer_result_spilled);
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(bytes.len != 0);
+}
+
+test "x64_register_encoder reloads spilled array barrier operands" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .aput_object = .{ .dest_or_src = 1, .array = 0, .index = 2 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 8, .obj = 3 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 9, .obj = 4 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 10, .obj = 5 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 11, .obj = 6 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 12, .obj = 7 } },
+        .return_void,
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    var abi = testRuntimeAbi();
+    abi.reference_array_layout = .{ .length_offset = 0, .data_offset = 8 };
+    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{ .runtime = abi });
+    defer native.deinit();
+    try native.verify();
+    try std.testing.expect(native.stats.frame_bytes > 0);
+    try std.testing.expect(native.stats.spill_loads > 0);
+
+    var found_spilled_store_operand = false;
+    var found_spilled_handle = false;
+    var found_spilled_index = false;
+    for (optimized.machine.blocks) |block| {
+        for (block.insts) |inst| {
+            if (inst.opcode != .array_store_ptr or inst.uses.len != 2) continue;
+            for (inst.uses) |use| switch (native.allocation.locationOf(use).?) {
+                .spill => {
+                    found_spilled_store_operand = true;
+                    if (optimized.machine.isGcRoot(use)) found_spilled_handle = true;
+                    if (!optimized.machine.isGcRoot(use)) found_spilled_index = true;
+                },
+                else => {},
+            };
+        }
+    }
+    try std.testing.expect(found_spilled_store_operand);
+    try std.testing.expect(found_spilled_handle);
+    try std.testing.expect(found_spilled_index);
+    const maps = &(native.root_maps orelse return error.TestUnexpectedResult);
+    var found_stack_root = false;
+    for (maps.locations) |root| {
+        if (root.kind == .stack_slot) found_stack_root = true;
+    }
+    try std.testing.expect(found_stack_root);
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(bytes.len != 0);
+}
+
 fn deoptEncodingFailureProbe(
     allocator: std.mem.Allocator,
     source: *const machine.Function,
@@ -2528,6 +5415,21 @@ fn deoptEncodingFailureProbe(
     var native = try encodeWithOptions(allocator, source, .{
         .runtime = runtime,
         .deopt = deopt,
+    });
+    defer native.deinit();
+}
+
+fn osrEncodingFailureProbe(
+    allocator: std.mem.Allocator,
+    source: *const machine.Function,
+    deopt: DeoptOptions,
+    osr: []const OsrEntrySpec,
+    runtime: RuntimeAbi,
+) !void {
+    var native = try encodeWithOptions(allocator, source, .{
+        .runtime = runtime,
+        .deopt = deopt,
+        .osr_entries = osr,
     });
     defer native.deinit();
 }
@@ -2571,30 +5473,54 @@ test "x64 compiler translates deoptimization values after register allocation" {
         .{ .vreg = 1, .kind = .scalar32, .source = .{ .machine_register = live_scalar } },
         .{ .vreg = 2, .kind = .scalar32, .source = .{ .constant = 99 } },
     };
+    const held_monitors = [_]DeoptMonitorSpec{.{ .source = .{ .machine_register = handle_reg } }};
     const points = [_]DeoptPointSpec{.{
         .id = 17,
         .safepoint_id = safepoint,
         .method_id = 23,
         .dex_pc = 0,
         .values = &values,
+        .monitors = &held_monitors,
     }};
     var deopt_epoch = std.atomic.Value(u64).init(0);
     var deopt_runtime = testRuntimeAbi();
     deopt_runtime.deopt_epoch_address = @intFromPtr(&deopt_epoch);
     deopt_runtime.deopt_helper = 1;
-    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+    try std.testing.expectError(error.InvalidDeoptMetadata, encodeWithOptions(std.testing.allocator, &optimized.machine, .{
         .runtime = deopt_runtime,
         .deopt = .{ .points = &points, .register_count = 3, .max_dex_pc = 2 },
+    }));
+    try std.testing.expectError(error.InvalidDeoptMetadata, encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = deopt_runtime,
+        .deopt = .{
+            .points = &points,
+            .register_count = 3,
+            .max_dex_pc = 2,
+            .entry_monitors = &held_monitors,
+            .synchronized_monitor_enter_sites = &.{999},
+        },
+    }));
+    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = deopt_runtime,
+        .deopt = .{
+            .points = &points,
+            .register_count = 3,
+            .max_dex_pc = 2,
+            .entry_monitors = &held_monitors,
+        },
     });
     defer native.deinit();
     try native.verify();
     try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_points);
     try std.testing.expectEqual(@as(u32, 3), native.stats.deopt_values);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_monitors);
     const table = if (native.deopt_table) |*value| value else return error.TestUnexpectedResult;
     const record = try table.find(17);
     const translated = table.valuesFor(record);
+    const translated_monitors = table.monitorsForFrame(table.framesFor(record)[0]);
     try std.testing.expectEqual(runtime_deopt.Source.native_register, std.meta.activeTag(translated[0].source));
     try std.testing.expectEqual(runtime_deopt.Source.native_register, std.meta.activeTag(translated[1].source));
+    try std.testing.expectEqual(translated[0].source.native_register, translated_monitors[0].source.native_register);
     const maps = if (native.root_maps) |*value| value else return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u32, 17), (try maps.find(safepoint)).deopt_id);
 
@@ -2612,19 +5538,22 @@ test "x64 compiler translates deoptimization values after register allocation" {
         .register_is_ref = &reference_kinds,
         .reference_registers = &references,
     } };
-    var scratch: [3]u64 = undefined;
+    var scratch: [4]u64 = undefined;
     var anchor: u64 = 0;
     _ = try table.reconstruct(17, .{
         .native_registers = &captured,
         .stack_base = @ptrCast(&anchor),
         .stack_min_offset = 0,
         .stack_max_offset = @sizeOf(@TypeOf(anchor)),
+        .held_monitors = &.{@bitCast(handle)},
     }, .{ .frame = &frame, .scratch = &scratch }, .invalidation, .{});
     try std.testing.expectEqual(@as(u64, @bitCast(handle)), frame.execution.reference_registers[0]);
     try std.testing.expectEqual(@as(u32, 1234), frame.execution.registers[1]);
     try std.testing.expectEqual(@as(u32, 99), frame.execution.registers[2]);
+    try std.testing.expectEqual(@as(u8, 1), frame.execution.managed_frame_state.held_monitor_count);
+    try std.testing.expectEqual(@as(u64, @bitCast(handle)), frame.execution.managed_frame_state.held_monitors[0]);
     var osr_image: [16]u64 = @splat(0);
-    var osr_scratch: [19]u64 = undefined;
+    var osr_scratch: [20]u64 = undefined;
     try table.exportOsr(17, &frame, .{ .native_registers = &osr_image, .scratch = &osr_scratch });
     try std.testing.expectEqual(@as(u64, @bitCast(handle)), osr_image[translated[0].source.native_register]);
     try std.testing.expectEqual(@as(u64, 1234), osr_image[translated[1].source.native_register]);
@@ -2667,15 +5596,23 @@ test "x64 compiler translates deoptimization values after register allocation" {
         .deopt = .{ .points = &duplicate_points, .register_count = 3, .max_dex_pc = 2 },
     }));
 
-    var allocation = try regalloc.allocate(std.testing.allocator, &optimized.machine, .{ .gp_registers = &RESOLVER_GP_REGS });
+    var allocation = try regalloc.allocate(std.testing.allocator, &optimized.machine, .{ .gp_registers = allGpRegisters() });
     defer allocation.deinit();
     try ensureNoSpills(&allocation);
+    var spill_plan = try regalloc.planSpills(std.testing.allocator, &allocation);
+    defer spill_plan.deinit();
     var linked_stats: Stats = .{};
-    const deopt_options = DeoptOptions{ .points = &points, .register_count = 3, .max_dex_pc = 2 };
+    const deopt_options = DeoptOptions{
+        .points = &points,
+        .register_count = 3,
+        .max_dex_pc = 2,
+        .entry_monitors = &held_monitors,
+    };
     var linked_maps = (try buildRootMaps(
         std.testing.allocator,
         &optimized.machine,
         &allocation,
+        &spill_plan,
         &linked_stats,
         deopt_options,
     )) orelse return error.TestUnexpectedResult;
@@ -2688,16 +5625,191 @@ test "x64 compiler translates deoptimization values after register allocation" {
         std.testing.allocator,
         &optimized.machine,
         &allocation,
+        &spill_plan,
         &linked_maps,
         deopt_options,
         &alias_stats,
     ));
+    allocation.locations[live_scalar] = saved_scalar_location;
+
+    {
+        allocation.locations[live_scalar] = .{ .spill = 0 };
+        defer allocation.locations[live_scalar] = saved_scalar_location;
+        var slots = [_]regalloc.SpillSlot{.{
+            .reg = live_scalar,
+            .slot = 0,
+            .ty = optimized.machine.reg_types[live_scalar],
+            .size = 4,
+            .byte_offset = 0,
+        }};
+        var translated_spill_plan = regalloc.SpillPlan{
+            .allocator = std.testing.allocator,
+            .source = &optimized.machine,
+            .location_count = allocation.locations.len,
+            .slots = &slots,
+            .stats = .{ .slots = 1, .stack_bytes = 16 },
+        };
+        try translated_spill_plan.verify();
+        var spill_stats: Stats = .{};
+        var spill_table = (try buildDeoptTable(
+            std.testing.allocator,
+            &optimized.machine,
+            &allocation,
+            &translated_spill_plan,
+            &linked_maps,
+            deopt_options,
+            &spill_stats,
+        )).?;
+        defer spill_table.deinit();
+        const spill_values = spill_table.valuesFor(try spill_table.find(17));
+        try std.testing.expectEqual(runtime_deopt.Source.stack_slot, std.meta.activeTag(spill_values[1].source));
+        try std.testing.expectEqual(@as(i32, 0), spill_values[1].source.stack_slot);
+        try std.testing.expectEqual(@as(u32, 1), spill_stats.deopt_stack_values);
+    }
+
+    {
+        allocation.locations[live_scalar] = .{ .phys = .xmm3 };
+        defer allocation.locations[live_scalar] = saved_scalar_location;
+        var xmm_stats: Stats = .{};
+        var xmm_table = (try buildDeoptTable(
+            std.testing.allocator,
+            &optimized.machine,
+            &allocation,
+            &spill_plan,
+            &linked_maps,
+            deopt_options,
+            &xmm_stats,
+        )).?;
+        defer xmm_table.deinit();
+        const xmm_values = xmm_table.valuesFor(try xmm_table.find(17));
+        try std.testing.expectEqual(runtime_deopt.Source.xmm_register, std.meta.activeTag(xmm_values[1].source));
+        try std.testing.expectEqual(@as(u8, 3), xmm_values[1].source.xmm_register);
+        try std.testing.expectEqual(@as(u32, 1), xmm_stats.deopt_xmm_values);
+    }
 
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         deoptEncodingFailureProbe,
-        .{ &optimized.machine, DeoptOptions{ .points = &points, .register_count = 3, .max_dex_pc = 2 } },
+        .{ &optimized.machine, DeoptOptions{
+            .points = &points,
+            .register_count = 3,
+            .max_dex_pc = 2,
+            .entry_monitors = &held_monitors,
+        } },
     );
+
+    const allocation_failure_callers = [_]DeoptInlineFrameSpec{.{
+        .activation_id = 1,
+        .method_id = 22,
+        .dex_pc = 0,
+        .register_count = 3,
+        .values = &values,
+    }};
+    const allocation_failure_activations = [_]InlineActivationSpec{
+        .{ .id = 1, .parent_id = 0, .method_id = 22, .register_count = 3, .parent_dex_pc = 0 },
+        .{ .id = 2, .parent_id = 1, .method_id = 23, .register_count = 3, .parent_dex_pc = 0 },
+    };
+    const allocation_failure_points = [_]DeoptPointSpec{.{
+        .id = 17,
+        .safepoint_id = safepoint,
+        .method_id = 23,
+        .dex_pc = 0,
+        .values = &values,
+        .activation_id = 2,
+        .inline_frames = &allocation_failure_callers,
+    }};
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        deoptEncodingFailureProbe,
+        .{ &optimized.machine, DeoptOptions{
+            .points = &allocation_failure_points,
+            .register_count = 3,
+            .max_dex_pc = 2,
+            .inline_activations = &allocation_failure_activations,
+        } },
+    );
+}
+
+test "x64 deoptimization rejects non-LIFO monitor regions" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .monitor_enter = .{ .src = 0 } },
+        .{ .monitor_enter = .{ .src = 1 } },
+        .{ .monitor_exit = .{ .src = 0 } },
+        .{ .iget = .{ .field_idx = 0, .dest_or_src = 2, .obj = 0 } },
+        .{ .return_ = .{ .src = 2 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    var safepoint: ?u32 = null;
+    for (optimized.machine.blocks) |block| for (block.insts) |inst| {
+        if (inst.opcode == .resolve_handle and inst.pc == 3) safepoint = inst.resolve_id;
+    };
+    const values = [_]DeoptValueSpec{.{
+        .vreg = 0,
+        .kind = .scalar32,
+        .source = .{ .constant = 0 },
+    }};
+    const points = [_]DeoptPointSpec{.{
+        .id = 1,
+        .safepoint_id = safepoint orelse return error.TestUnexpectedResult,
+        .method_id = 0,
+        .dex_pc = 3,
+        .values = &values,
+    }};
+    var epoch = std.atomic.Value(u64).init(0);
+    var abi = testRuntimeAbi();
+    abi.deopt_epoch_address = @intFromPtr(&epoch);
+    abi.deopt_helper = 1;
+    abi.monitor_enter_helper = 1;
+    abi.monitor_exit_helper = 1;
+    try std.testing.expectError(error.InvalidDeoptMetadata, encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = abi,
+        .deopt = .{ .points = &points, .register_count = 1, .max_dex_pc = 4 },
+    }));
+}
+
+test "x64 deoptimization rejects monitor-stack disagreement at CFG joins" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .if_eqz = .{ .src = 2, .offset = 3 } },
+        .{ .monitor_enter = .{ .src = 0 } },
+        .{ .goto_ = .{ .offset = 2 } },
+        .{ .monitor_enter = .{ .src = 0 } },
+        .{ .iget = .{ .field_idx = 0, .dest_or_src = 1, .obj = 0 } },
+        .{ .return_ = .{ .src = 1 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    var safepoint: ?u32 = null;
+    var removed_enter = false;
+    for (optimized.machine.blocks) |*block| for (block.insts) |*inst| {
+        if (inst.opcode == .resolve_handle and inst.pc == 4) safepoint = inst.resolve_id;
+        if (!removed_enter and inst.opcode == .monitor_enter and inst.pc == 3) {
+            // The optimizer produced a valid equal-stack join. Removing one
+            // path's abstract acquisition isolates the backend merge proof.
+            inst.opcode = .memory_barrier;
+            removed_enter = true;
+        }
+    };
+    try std.testing.expect(removed_enter);
+    const values = [_]DeoptValueSpec{.{
+        .vreg = 0,
+        .kind = .scalar32,
+        .source = .{ .constant = 0 },
+    }};
+    const points = [_]DeoptPointSpec{.{
+        .id = 1,
+        .safepoint_id = safepoint orelse return error.TestUnexpectedResult,
+        .method_id = 0,
+        .dex_pc = 4,
+        .values = &values,
+    }};
+    try std.testing.expectError(error.InvalidDeoptMetadata, validateDeoptMonitorRegions(
+        std.testing.allocator,
+        &optimized.machine,
+        .{ .points = &points, .register_count = 1, .max_dex_pc = 5 },
+    ));
 }
 
 test "x64 compiler publishes a verified no-prologue OSR safepoint label" {
@@ -2791,6 +5903,411 @@ test "x64 compiler publishes a verified no-prologue OSR safepoint label" {
     }));
 }
 
+test "x64 compiler publishes a frameful OSR landing stub" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .const_ = .{ .dest = 9, .value = 123 } },
+        .{ .const_ = .{ .dest = 1, .value = 2 } },
+        .{ .goto_ = .{ .offset = 1 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 2, .obj = 0 } },
+        .{ .if_eqz = .{ .src = 1, .offset = 3 } },
+        .{ .add_int_lit8 = .{ .dest = 1, .src = 1, .lit = -1 } },
+        .{ .goto_ = .{ .offset = -3 } },
+        .{ .return_ = .{ .src = 2 } },
+    };
+    var optimized = try optimizer.optimize(std.testing.allocator, &insts, &.{}, .{
+        .enable_loop_resolve_hoisting = false,
+    });
+    defer optimized.deinit();
+
+    var object: ?machine.RegId = null;
+    var loop_value: ?machine.RegId = null;
+    var site: ?u32 = null;
+    var dex_pc: ?u32 = null;
+    var header: ?cfg.BlockId = null;
+    for (optimized.machine.blocks) |block| {
+        for (block.insts) |inst| {
+            if (inst.opcode != .resolve_handle) continue;
+            object = inst.state_handle;
+            site = inst.resolve_id;
+            dex_pc = inst.pc;
+            header = block.id;
+        }
+    }
+    const safepoint = site orelse return error.TestUnexpectedResult;
+    const probe = try findSafepointPosition(&optimized.machine, safepoint);
+    for (0..optimized.machine.reg_types.len) |reg_index| {
+        const reg: machine.RegId = @intCast(reg_index);
+        if (!try osrRegisterReadBeforeDefinition(std.testing.allocator, &optimized.machine, probe, reg)) continue;
+        switch (optimized.machine.runtime_values[reg]) {
+            .dalvik => |value| {
+                if (optimized.function.values[value.value].reg == 1) loop_value = reg;
+            },
+            .derived_ptr => {},
+        }
+    }
+
+    var values: [10]DeoptValueSpec = undefined;
+    for (&values, 0..) |*value, vreg| value.* = .{
+        .vreg = @intCast(vreg),
+        .kind = .scalar32,
+        .source = .{ .constant = if (vreg == 9) 123 else 0 },
+    };
+    values[0] = .{ .vreg = 0, .kind = .reference, .source = .{ .machine_register = object orelse return error.TestUnexpectedResult } };
+    values[1] = .{ .vreg = 1, .kind = .scalar32, .source = .{ .machine_register = loop_value orelse return error.TestUnexpectedResult } };
+    const caller_values = [_]DeoptValueSpec{
+        .{ .vreg = 0, .kind = .reference, .source = .{ .machine_register = object orelse return error.TestUnexpectedResult } },
+        .{ .vreg = 1, .kind = .scalar32, .source = .{ .machine_register = loop_value orelse return error.TestUnexpectedResult } },
+    };
+    const callers = [_]DeoptInlineFrameSpec{.{
+        .activation_id = 1,
+        .method_id = 8,
+        .dex_pc = 1,
+        .register_count = 2,
+        .values = &caller_values,
+    }};
+    const activations = [_]InlineActivationSpec{
+        .{ .id = 1, .parent_id = 0, .method_id = 8, .register_count = 2, .parent_dex_pc = 0 },
+        .{ .id = 2, .parent_id = 1, .method_id = 9, .register_count = 10, .parent_dex_pc = 1 },
+    };
+    const points = [_]DeoptPointSpec{.{
+        .id = 61,
+        .safepoint_id = safepoint,
+        .method_id = 9,
+        .dex_pc = dex_pc orelse return error.TestUnexpectedResult,
+        .values = &values,
+        .activation_id = 2,
+        .inline_frames = &callers,
+    }};
+    const osr = [_]OsrEntrySpec{.{ .point_id = 61, .block = header orelse return error.TestUnexpectedResult }};
+    var epoch = std.atomic.Value(u64).init(0);
+    var abi = testRuntimeAbi();
+    abi.deopt_epoch_address = @intFromPtr(&epoch);
+    abi.deopt_helper = 1;
+    try std.testing.expectError(error.InvalidDeoptMetadata, encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = abi,
+        .deopt = .{ .points = &points, .register_count = 10, .max_dex_pc = 7 },
+        .osr_entries = &osr,
+    }));
+    const forged_activations = [_]InlineActivationSpec{
+        activations[0],
+        .{ .id = 2, .parent_id = 1, .method_id = 9, .register_count = 10, .parent_dex_pc = 2 },
+    };
+    try std.testing.expectError(error.InvalidDeoptMetadata, encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = abi,
+        .deopt = .{
+            .points = &points,
+            .register_count = 10,
+            .max_dex_pc = 7,
+            .inline_activations = &forged_activations,
+        },
+        .osr_entries = &osr,
+    }));
+    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = abi,
+        .deopt = .{
+            .points = &points,
+            .register_count = 10,
+            .max_dex_pc = 7,
+            .inline_activations = &activations,
+        },
+        .osr_entries = &osr,
+    });
+    defer native.deinit();
+    try native.verify();
+    try std.testing.expect(native.stats.frame_bytes > 0);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.osr_frame_landings);
+    try std.testing.expectEqual(@as(u32, 2), native.stats.deopt_frames);
+    try std.testing.expectEqual(@as(u32, 2), native.stats.deopt_inline_activations);
+    const maps = &(native.root_maps orelse return error.TestUnexpectedResult);
+    for (maps.rootsFor(try maps.find(safepoint))) |root| {
+        try std.testing.expectEqual(runtime_stack_map.LocationKind.native_register, root.kind);
+    }
+    const entry = try native.osrEntry(61);
+    try std.testing.expect(std.mem.isAligned(entry.code_offset, 16));
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(entry.code_offset < bytes.len);
+    if (builtin.os.tag == .windows and native.stats.nonvolatile_frame_bytes != 0) {
+        try std.testing.expectEqual(@as(u8, 0x56), bytes[entry.code_offset]); // push rsi
+        try std.testing.expectEqual(@as(u8, 0x57), bytes[entry.code_offset + 1]); // push rdi
+    } else {
+        try std.testing.expectEqual(@as(u8, 0x48), bytes[entry.code_offset]);
+        try std.testing.expect(bytes[entry.code_offset + 1] == 0x83 or bytes[entry.code_offset + 1] == 0x81);
+    }
+}
+
+test "x64 OSR landing rematerializes a hoisted derived address from mapped Handles" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .const_ = .{ .dest = 9, .value = 123 } },
+        .{ .const_ = .{ .dest = 1, .value = 2 } },
+        .{ .const_ = .{ .dest = 2, .value = 0 } },
+        .{ .goto_ = .{ .offset = 1 } },
+        .{ .aget_object = .{ .dest_or_src = 3, .array = 0, .index = 2 } },
+        .{ .if_eqz = .{ .src = 1, .offset = 3 } },
+        .{ .add_int_lit8 = .{ .dest = 1, .src = 1, .lit = -1 } },
+        .{ .goto_ = .{ .offset = -3 } },
+        .{ .return_object = .{ .src = 3 } },
+    };
+    var optimized = try optimizer.optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+    try std.testing.expectEqual(@as(u32, 1), optimized.stats.loop_resolves_hoisted);
+    try std.testing.expectEqual(@as(usize, 1), optimized.barriers.loop_reuses.len);
+    const reuse = optimized.barriers.loop_reuses[0];
+    const remat = try osrRematOperands(&optimized.machine, reuse.resolve);
+
+    var safepoint: ?u32 = null;
+    var dex_pc: ?u32 = null;
+    for (optimized.machine.blocks[reuse.header].insts) |inst| {
+        if (inst.opcode != .check_bounds or inst.exception_site_id == null) continue;
+        safepoint = inst.exception_site_id;
+        dex_pc = inst.pc;
+        break;
+    }
+    const site = safepoint orelse return error.TestUnexpectedResult;
+    const probe = try findSafepointPosition(&optimized.machine, site);
+    var loop_value: ?machine.RegId = null;
+    var index_value: ?machine.RegId = null;
+    for (0..optimized.machine.reg_types.len) |reg_index| {
+        const reg: machine.RegId = @intCast(reg_index);
+        if (!try osrRegisterReadBeforeDefinition(std.testing.allocator, &optimized.machine, probe, reg)) continue;
+        switch (optimized.machine.runtime_values[reg]) {
+            .dalvik => |value| switch (optimized.function.values[value.value].reg) {
+                1 => loop_value = reg,
+                2 => index_value = reg,
+                else => {},
+            },
+            .derived_ptr => try std.testing.expectEqual(remat.address, reg),
+        }
+    }
+
+    var values: [10]DeoptValueSpec = undefined;
+    for (&values, 0..) |*value, vreg| value.* = .{
+        .vreg = @intCast(vreg),
+        .kind = .scalar32,
+        .source = .{ .constant = if (vreg == 9) 123 else 0 },
+    };
+    values[0] = .{ .vreg = 0, .kind = .reference, .source = .{ .machine_register = remat.handle } };
+    values[1] = .{ .vreg = 1, .kind = .scalar32, .source = .{ .machine_register = loop_value orelse return error.TestUnexpectedResult } };
+    values[2] = .{ .vreg = 2, .kind = .scalar32, .source = .{ .machine_register = index_value orelse return error.TestUnexpectedResult } };
+    values[3] = .{ .vreg = 3, .kind = .reference, .source = .{ .constant = @bitCast(runtime_value.Handle.none) } };
+    const points = [_]DeoptPointSpec{.{
+        .id = 71,
+        .safepoint_id = site,
+        .method_id = 10,
+        .dex_pc = dex_pc orelse return error.TestUnexpectedResult,
+        .values = &values,
+    }};
+    const osr = [_]OsrEntrySpec{.{ .point_id = 71, .block = reuse.header }};
+    var epoch = std.atomic.Value(u64).init(0);
+    var abi = testRuntimeAbi();
+    abi.reference_array_layout = .{ .length_offset = 0, .data_offset = 8 };
+    abi.deopt_epoch_address = @intFromPtr(&epoch);
+    abi.deopt_helper = 1;
+    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = abi,
+        .deopt = .{ .points = &points, .register_count = 10, .max_dex_pc = 8 },
+        .osr_entries = &osr,
+    });
+    defer native.deinit();
+    try native.verify();
+    try std.testing.expect(native.stats.frame_bytes > 0);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.osr_frame_landings);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.osr_landing_safepoints);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.osr_derived_rematerializations);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.osr_remat_restart_edges);
+    const maps = &(native.root_maps orelse return error.TestUnexpectedResult);
+    const landing_map = try maps.find(try osrLandingSiteId(
+        &optimized.machine,
+        DeoptOptions{ .points = &points, .register_count = 10, .max_dex_pc = 8 },
+        0,
+    ));
+    try std.testing.expectEqual(runtime_stack_map.no_deopt, landing_map.deopt_id);
+    const handle_physical = try x64Reg(try physOf(&native.allocation, remat.handle));
+    try std.testing.expectEqualSlices(
+        runtime_stack_map.RootLocation,
+        &.{runtime_stack_map.RootLocation.nativeRegister(handle_physical)},
+        maps.rootsFor(landing_map),
+    );
+    const entry = try native.osrEntry(71);
+    try std.testing.expect(std.mem.isAligned(entry.code_offset, 16));
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    // Landing epoch snapshot, cold-edge reload, and r12 comparison. The slow
+    // edge restarts only when the helper actually acknowledged a new epoch.
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, &.{ 0x4c, 0x89, 0x24, 0x24 }));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, &.{ 0x4c, 0x8b, 0x1c, 0x24 }));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, bytes, &.{ 0x4d, 0x3b, 0xe3 }));
+
+    const saved = values[0];
+    values[0] = .{ .vreg = 0, .kind = .reference, .source = .{ .constant = @bitCast(runtime_value.Handle.none) } };
+    defer values[0] = saved;
+    try std.testing.expectError(error.InvalidDeoptMetadata, encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = abi,
+        .deopt = .{ .points = &points, .register_count = 10, .max_dex_pc = 8 },
+        .osr_entries = &osr,
+    }));
+
+    values[0] = saved;
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        osrEncodingFailureProbe,
+        .{
+            &optimized.machine,
+            DeoptOptions{ .points = &points, .register_count = 10, .max_dex_pc = 8 },
+            osr[0..],
+            abi,
+        },
+    );
+}
+
+test "x64 compiler creates a collision-free block-entry deoptimization OSR position" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .const_ = .{ .dest = 9, .value = 123 } },
+        .{ .const_ = .{ .dest = 1, .value = 2 } },
+        .{ .goto_ = .{ .offset = 1 } },
+        .{ .iget = .{ .field_idx = 1, .dest_or_src = 2, .obj = 0 } },
+        .{ .if_eqz = .{ .src = 1, .offset = 3 } },
+        .{ .add_int_lit8 = .{ .dest = 1, .src = 1, .lit = -1 } },
+        .{ .goto_ = .{ .offset = -3 } },
+        .{ .return_ = .{ .src = 2 } },
+    };
+    var optimized = try optimizer.optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+    try std.testing.expectEqual(@as(u32, 1), optimized.stats.loop_resolves_hoisted);
+    try std.testing.expectEqual(@as(usize, 1), optimized.barriers.loop_reuses.len);
+    const reuse = optimized.barriers.loop_reuses[0];
+    const remat = try osrRematOperands(&optimized.machine, reuse.resolve);
+    for (optimized.machine.blocks[reuse.header].insts) |inst| {
+        try std.testing.expect(instructionSafepointId(inst) == null);
+    }
+
+    const required = try osrRequiredRegistersAtBlockEntry(std.testing.allocator, &optimized.machine, reuse.header);
+    defer std.testing.allocator.free(required);
+    var loop_value: ?machine.RegId = null;
+    var found_address = false;
+    for (required) |reg| switch (optimized.machine.runtime_values[reg]) {
+        .dalvik => |value| if (optimized.function.values[value.value].reg == 1) {
+            loop_value = reg;
+        },
+        .derived_ptr => found_address = reg == remat.address,
+    };
+    try std.testing.expect(found_address);
+
+    var values: [10]DeoptValueSpec = undefined;
+    for (&values, 0..) |*value, vreg| value.* = .{
+        .vreg = @intCast(vreg),
+        .kind = .scalar32,
+        .source = .{ .constant = if (vreg == 9) 123 else 0 },
+    };
+    values[0] = .{ .vreg = 0, .kind = .reference, .source = .{ .machine_register = remat.handle } };
+    values[1] = .{ .vreg = 1, .kind = .scalar32, .source = .{ .machine_register = loop_value orelse return error.TestUnexpectedResult } };
+    var points = [_]DeoptPointSpec{.{
+        .id = 81,
+        .block_entry = reuse.header,
+        .method_id = 11,
+        .dex_pc = optimized.machine.blocks[reuse.header].insts[0].pc orelse return error.TestUnexpectedResult,
+        .values = &values,
+    }};
+    const deopt = DeoptOptions{ .points = &points, .register_count = 10, .max_dex_pc = 7 };
+    const osr = [_]OsrEntrySpec{.{ .point_id = 81, .block = reuse.header }};
+    var epoch = std.atomic.Value(u64).init(0);
+    var abi = testRuntimeAbi();
+    abi.deopt_epoch_address = @intFromPtr(&epoch);
+    abi.deopt_helper = 1;
+    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = abi,
+        .deopt = deopt,
+        .osr_entries = &osr,
+    });
+    defer native.deinit();
+    try native.verify();
+    try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_block_entries);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_guards);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.osr_landing_safepoints);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.osr_derived_rematerializations);
+
+    const maps = &(native.root_maps orelse return error.TestUnexpectedResult);
+    const block_site = try deoptPointSiteId(&optimized.machine, deopt, 0);
+    const block_map = try maps.find(block_site);
+    try std.testing.expectEqual(@as(u32, 81), block_map.deopt_id);
+    const landing_site = try osrLandingSiteId(&optimized.machine, deopt, 0);
+    try std.testing.expect(landing_site > block_site);
+    const landing_map = try maps.find(landing_site);
+    try std.testing.expectEqual(runtime_stack_map.no_deopt, landing_map.deopt_id);
+    const handle_physical = try x64Reg(try physOf(&native.allocation, remat.handle));
+    var block_has_handle = false;
+    for (maps.rootsFor(block_map)) |root| {
+        try std.testing.expectEqual(runtime_stack_map.LocationKind.native_register, root.kind);
+        if (root.payload == handle_physical) block_has_handle = true;
+    }
+    try std.testing.expect(block_has_handle);
+    try std.testing.expectEqualSlices(
+        runtime_stack_map.RootLocation,
+        &.{runtime_stack_map.RootLocation.nativeRegister(handle_physical)},
+        maps.rootsFor(landing_map),
+    );
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expect(bytes.len != 0);
+
+    points[0].safepoint_id = 0;
+    try std.testing.expectError(error.InvalidDeoptMetadata, encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = abi,
+        .deopt = deopt,
+        .osr_entries = &osr,
+    }));
+    points[0].safepoint_id = null;
+    points[0].dex_pc += 1;
+    try std.testing.expectError(error.InvalidDeoptMetadata, encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = abi,
+        .deopt = deopt,
+        .osr_entries = &osr,
+    }));
+    points[0].dex_pc -= 1;
+    const duplicate_points = [_]DeoptPointSpec{
+        points[0],
+        .{
+            .id = 82,
+            .block_entry = reuse.header,
+            .method_id = 11,
+            .dex_pc = points[0].dex_pc,
+            .values = &values,
+        },
+    };
+    try std.testing.expectError(
+        error.InvalidDeoptMetadata,
+        deoptPointSiteId(
+            &optimized.machine,
+            .{ .points = &duplicate_points, .register_count = 10, .max_dex_pc = 7 },
+            1,
+        ),
+    );
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        osrEncodingFailureProbe,
+        .{ &optimized.machine, deopt, osr[0..], abi },
+    );
+}
+
+test "x64 frameful OSR rejects stack and XMM image sources" {
+    const valid = [_]runtime_deopt.ValueSpec{
+        .{ .vreg = 0, .kind = .scalar32, .source = .{ .native_register = 1 } },
+        .{ .vreg = 1, .kind = .scalar32, .source = .{ .constant = 7 } },
+    };
+    try validateOsrMappedSources(&valid);
+    const stack = [_]runtime_deopt.ValueSpec{
+        .{ .vreg = 0, .kind = .scalar32, .source = .{ .stack_slot = 0 } },
+    };
+    try std.testing.expectError(error.InvalidDeoptMetadata, validateOsrMappedSources(&stack));
+    const xmm = [_]runtime_deopt.ValueSpec{
+        .{ .vreg = 0, .kind = .scalar64, .source = .{ .xmm_register = 3 } },
+    };
+    try std.testing.expectError(error.InvalidDeoptMetadata, validateOsrMappedSources(&xmm));
+}
+
 test "x64 root liveness translates live phi destinations on predecessor edges" {
     if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     const insts = [_]Instruction{
@@ -2808,11 +6325,13 @@ test "x64 root liveness translates live phi destinations on predecessor edges" {
     try std.testing.expectEqual(@as(usize, 2), optimized.machine.edges.len);
     try std.testing.expectEqual(@as(u32, 4), optimized.machine.stats.resolves);
 
-    var allocation = try regalloc.allocate(std.testing.allocator, &optimized.machine, .{ .gp_registers = &RESOLVER_GP_REGS });
+    var allocation = try regalloc.allocate(std.testing.allocator, &optimized.machine, .{ .gp_registers = allGpRegisters() });
     defer allocation.deinit();
     try ensureNoSpills(&allocation);
+    var spill_plan = try regalloc.planSpills(std.testing.allocator, &allocation);
+    defer spill_plan.deinit();
     var stats: Stats = .{};
-    var maps = (try buildRootMaps(std.testing.allocator, &optimized.machine, &allocation, &stats, null)) orelse return error.TestUnexpectedResult;
+    var maps = (try buildRootMaps(std.testing.allocator, &optimized.machine, &allocation, &spill_plan, &stats, null)) orelse return error.TestUnexpectedResult;
     defer maps.deinit();
 
     var before_branch_id: ?u32 = null;
@@ -2850,18 +6369,53 @@ test "x64 root liveness translates live phi destinations on predecessor edges" {
     try std.testing.expect(optimized.machine.isGcRoot(0));
     try std.testing.expect(optimized.machine.isGcRoot(1));
     {
+        const saved_location = allocation.locations[0];
+        allocation.locations[0] = .{ .spill = 0 };
+        defer allocation.locations[0] = saved_location;
+        var root_slots = [_]regalloc.SpillSlot{.{
+            .reg = 0,
+            .slot = 0,
+            .ty = optimized.machine.reg_types[0],
+            .size = 8,
+            .byte_offset = 0,
+        }};
+        const root_spill_plan = regalloc.SpillPlan{
+            .allocator = std.testing.allocator,
+            .source = &optimized.machine,
+            .location_count = allocation.locations.len,
+            .slots = &root_slots,
+            .stats = .{ .slots = 1, .stack_bytes = 16 },
+        };
+        try root_spill_plan.verify();
+        var spill_root_stats: Stats = .{};
+        var spill_maps = (try buildRootMaps(
+            std.testing.allocator,
+            &optimized.machine,
+            &allocation,
+            &root_spill_plan,
+            &spill_root_stats,
+            null,
+        )) orelse return error.TestUnexpectedResult;
+        defer spill_maps.deinit();
+        var found_stack_root = false;
+        for (spill_maps.locations) |location| {
+            if (location.kind == .stack_slot and location.stackOffset() == 0) found_stack_root = true;
+        }
+        try std.testing.expect(found_stack_root);
+    }
+    {
         const saved_location = allocation.locations[1];
         allocation.locations[1] = allocation.locations[0];
         defer allocation.locations[1] = saved_location;
         var bad_stats: Stats = .{};
-        try std.testing.expectError(error.InvalidMachine, buildRootMaps(std.testing.allocator, &optimized.machine, &allocation, &bad_stats, null));
+        try std.testing.expectError(error.InvalidMachine, buildRootMaps(std.testing.allocator, &optimized.machine, &allocation, &spill_plan, &bad_stats, null));
     }
     {
         const saved_edges = optimized.machine.edges;
         optimized.machine.edges = saved_edges[0..1];
         defer optimized.machine.edges = saved_edges;
         var bad_stats: Stats = .{};
-        try std.testing.expectError(error.InvalidMachine, buildRootMaps(std.testing.allocator, &optimized.machine, &allocation, &bad_stats, null));
+        try std.testing.expectError(error.InvalidMachine, buildRootMaps(std.testing.allocator, &optimized.machine, &allocation, &spill_plan, &bad_stats, null));
     }
 }
 

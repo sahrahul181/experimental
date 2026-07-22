@@ -40,6 +40,7 @@ pub const ValueKind = enum(u8) {
 
 pub const Source = union(enum) {
     native_register: u8,
+    xmm_register: u8,
     stack_slot: i32,
     constant: u64,
 };
@@ -50,18 +51,45 @@ pub const ValueSpec = struct {
     source: Source,
 };
 
+/// One held object monitor in acquisition order. A monitor is always sourced
+/// from a canonical Handle location; immutable metadata never embeds object
+/// identity as a constant.
+pub const MonitorKind = enum(u8) {
+    explicit,
+    synchronized,
+};
+
+pub const MonitorSpec = struct {
+    source: Source,
+    kind: MonitorKind = .explicit,
+};
+
+/// One materialized caller in an inlined activation. Specs are ordered from
+/// the oldest outer caller to the immediate caller of the leaf frame.
+pub const InlineFrameSpec = struct {
+    method_id: u32,
+    dex_pc: u32,
+    register_count: u16,
+    values: []const ValueSpec,
+    monitors: []const MonitorSpec = &.{},
+};
+
 pub const PointSpec = struct {
     id: u32,
     method_id: u32,
     dex_pc: u32,
     values: []const ValueSpec,
+    inline_frames: []const InlineFrameSpec = &.{},
+    monitors: []const MonitorSpec = &.{},
 };
 
 pub const ValidationOptions = struct {
     register_count: u16,
     native_register_count: u8,
+    xmm_register_count: u8 = 0,
     max_dex_pc: u32,
     stack_alignment: u8 = 4,
+    max_monitor_depth: u16 = interpreter.ManagedFrameState.max_held_monitors,
 };
 
 pub const Record = struct {
@@ -70,7 +98,18 @@ pub const Record = struct {
     dex_pc: u32,
     first_value: u32,
     value_count: u16,
-    reserved: u16 = 0,
+    frame_count: u16,
+    first_frame: u32,
+};
+
+pub const FrameRecord = struct {
+    method_id: u32,
+    dex_pc: u32,
+    first_value: u32,
+    value_count: u16,
+    register_count: u16,
+    first_monitor: u32,
+    monitor_count: u16,
 };
 
 pub const ExceptionState = extern struct {
@@ -96,22 +135,32 @@ pub const Frame = struct {
 };
 
 pub const Destination = struct {
+    /// Leaf frame resumed by the interpreter.
     frame: *Frame,
+    /// Outer-to-inner caller buffers. Their length must exactly match the
+    /// point's immutable inline depth.
+    inline_frames: []Frame = &.{},
+    /// One word per value across every reconstructed frame.
     scratch: []u64,
     previous: ?*Frame = null,
 };
 
 pub const Capture = struct {
     native_registers: []const u64,
+    xmm_registers: []const [16]u8 = &.{},
     stack_base: [*]const u8,
     stack_min_offset: i32,
     /// Exclusive upper bound.
     stack_max_offset: i32,
+    /// Native acquisition order. Reconstruction requires an exact match with
+    /// the immutable point metadata before committing interpreter state.
+    held_monitors: []const u64 = &.{},
 };
 
 pub const OsrImage = struct {
     native_registers: []u64,
-    /// Requires `value_count + native_register_count` words.
+    /// Requires every frame's value and monitor count plus
+    /// `native_register_count` words.
     scratch: []u64,
 };
 
@@ -127,6 +176,7 @@ pub const Request = struct {
     exception: ExceptionState = .{},
     destination: Destination,
     stack_base: [*]const u8,
+    xmm_registers: []const [16]u8 = &.{},
     stack_min_offset: i32 = 0,
     stack_max_offset: i32 = 0,
     resume_context: *anyopaque,
@@ -142,23 +192,32 @@ pub const Error = error{
     InvalidConstant,
     InvalidDexPc,
     InvalidDestination,
+    InvalidFrameChain,
     InvalidNativeRegister,
     InvalidReference,
+    InvalidReferenceLocation,
+    InvalidMonitorSource,
     InvalidStackAlignment,
+    InvalidXmmRegister,
     MissingPoint,
     MissingDeoptMap,
     MissingStackMap,
     OutOfBounds,
     OsrStateMismatch,
+    MonitorStateMismatch,
+    TooManyMonitors,
     TooManyValues,
     UnsortedPoints,
     UnsupportedOsrSource,
+    UnsupportedOsrFrameChain,
 };
 
 pub const Table = struct {
     allocator: std.mem.Allocator,
     records: []Record,
+    frames: []FrameRecord,
     values: []ValueSpec,
+    monitors: []MonitorSpec,
     register_count: u16,
     native_register_count: u8,
 
@@ -171,8 +230,11 @@ pub const Table = struct {
         if (options.stack_alignment == 0 or !std.math.isPowerOfTwo(options.stack_alignment)) {
             return error.InvalidStackAlignment;
         }
+        if (options.max_monitor_depth > interpreter.ManagedFrameState.max_held_monitors) return error.TooManyMonitors;
 
         var total_values: usize = 0;
+        var total_frames: usize = 0;
+        var total_monitors: usize = 0;
         for (specs, 0..) |spec, point_index| {
             if (spec.dex_pc > options.max_dex_pc) return error.InvalidDexPc;
             if (point_index > 0) {
@@ -180,40 +242,96 @@ pub const Table = struct {
                 if (previous == spec.id) return error.DuplicatePoint;
                 if (previous > spec.id) return error.UnsortedPoints;
             }
-            if (spec.values.len > std.math.maxInt(u16) or
-                spec.values.len > std.math.maxInt(u32) - total_values) return error.TooManyValues;
-            total_values += spec.values.len;
-            try validatePoint(spec, options);
+            if (spec.inline_frames.len >= std.math.maxInt(u16) or
+                spec.inline_frames.len + 1 > std.math.maxInt(u32) - total_frames) return error.TooManyValues;
+            total_frames += spec.inline_frames.len + 1;
+            var point_monitors: usize = 0;
+            for (spec.inline_frames) |frame| {
+                if (frame.dex_pc > options.max_dex_pc) return error.InvalidDexPc;
+                try addValueCount(&total_values, frame.values.len);
+                try validateFrame(frame.register_count, frame.values, options);
+                try addMonitorCount(&total_monitors, frame.monitors.len);
+                point_monitors += frame.monitors.len;
+                try validateMonitors(frame.monitors, options);
+            }
+            try addValueCount(&total_values, spec.values.len);
+            try validateFrame(options.register_count, spec.values, options);
+            try addMonitorCount(&total_monitors, spec.monitors.len);
+            point_monitors += spec.monitors.len;
+            try validateMonitors(spec.monitors, options);
+            if (point_monitors > options.max_monitor_depth) return error.TooManyMonitors;
         }
 
         const records = try allocator.alloc(Record, specs.len);
         errdefer allocator.free(records);
+        const frames = try allocator.alloc(FrameRecord, total_frames);
+        errdefer allocator.free(frames);
         const values = try allocator.alloc(ValueSpec, total_values);
         errdefer allocator.free(values);
+        const monitors = try allocator.alloc(MonitorSpec, total_monitors);
+        errdefer allocator.free(monitors);
 
-        var cursor: usize = 0;
+        var value_cursor: usize = 0;
+        var frame_cursor: usize = 0;
+        var monitor_cursor: usize = 0;
         for (specs, 0..) |spec, index| {
+            const first_frame = frame_cursor;
+            for (spec.inline_frames) |frame| {
+                frames[frame_cursor] = .{
+                    .method_id = frame.method_id,
+                    .dex_pc = frame.dex_pc,
+                    .first_value = @intCast(value_cursor),
+                    .value_count = @intCast(frame.values.len),
+                    .register_count = frame.register_count,
+                    .first_monitor = @intCast(monitor_cursor),
+                    .monitor_count = @intCast(frame.monitors.len),
+                };
+                @memcpy(values[value_cursor..][0..frame.values.len], frame.values);
+                value_cursor += frame.values.len;
+                @memcpy(monitors[monitor_cursor..][0..frame.monitors.len], frame.monitors);
+                monitor_cursor += frame.monitors.len;
+                frame_cursor += 1;
+            }
+            const leaf_first_value = value_cursor;
+            frames[frame_cursor] = .{
+                .method_id = spec.method_id,
+                .dex_pc = spec.dex_pc,
+                .first_value = @intCast(value_cursor),
+                .value_count = @intCast(spec.values.len),
+                .register_count = options.register_count,
+                .first_monitor = @intCast(monitor_cursor),
+                .monitor_count = @intCast(spec.monitors.len),
+            };
+            @memcpy(values[value_cursor..][0..spec.values.len], spec.values);
+            value_cursor += spec.values.len;
+            @memcpy(monitors[monitor_cursor..][0..spec.monitors.len], spec.monitors);
+            monitor_cursor += spec.monitors.len;
+            frame_cursor += 1;
             records[index] = .{
                 .id = spec.id,
                 .method_id = spec.method_id,
                 .dex_pc = spec.dex_pc,
-                .first_value = @intCast(cursor),
+                .first_value = @intCast(leaf_first_value),
                 .value_count = @intCast(spec.values.len),
+                .frame_count = @intCast(spec.inline_frames.len + 1),
+                .first_frame = @intCast(first_frame),
             };
-            @memcpy(values[cursor..][0..spec.values.len], spec.values);
-            cursor += spec.values.len;
         }
         return .{
             .allocator = allocator,
             .records = records,
+            .frames = frames,
             .values = values,
+            .monitors = monitors,
             .register_count = options.register_count,
             .native_register_count = options.native_register_count,
         };
     }
 
     pub fn deinit(self: *Table) void {
+        self.allocator.free(self.monitors);
         self.allocator.free(self.values);
+        self.allocator.free(self.frames);
         self.allocator.free(self.records);
         self.* = undefined;
     }
@@ -240,6 +358,56 @@ pub const Table = struct {
         return self.values[first .. first + record.value_count];
     }
 
+    pub fn framesFor(self: *const Table, record: *const Record) []const FrameRecord {
+        const first: usize = record.first_frame;
+        return self.frames[first .. first + record.frame_count];
+    }
+
+    pub fn valuesForFrame(self: *const Table, frame: FrameRecord) []const ValueSpec {
+        const first: usize = frame.first_value;
+        return self.values[first .. first + frame.value_count];
+    }
+
+    pub fn monitorsForFrame(self: *const Table, frame: FrameRecord) []const MonitorSpec {
+        const first: usize = frame.first_monitor;
+        return self.monitors[first .. first + frame.monitor_count];
+    }
+
+    pub fn monitorCount(self: *const Table, point_id: u32) Error!usize {
+        const record = try self.find(point_id);
+        var count: usize = 0;
+        for (self.framesFor(record)) |frame| count += frame.monitor_count;
+        return count;
+    }
+
+    pub fn requiredScratchWords(self: *const Table, point_id: u32) Error!usize {
+        const record = try self.find(point_id);
+        var count: usize = 0;
+        for (self.framesFor(record)) |frame| count += frame.value_count + frame.monitor_count;
+        return count;
+    }
+
+    pub const StackBounds = struct {
+        min_offset: i32,
+        max_offset: i32,
+    };
+
+    pub fn stackBounds(self: *const Table, point_id: u32) Error!StackBounds {
+        const record = try self.find(point_id);
+        var minimum: i32 = 0;
+        var maximum: i32 = 0;
+        for (self.framesFor(record)) |frame| {
+            for (self.valuesForFrame(frame)) |value| switch (value.source) {
+                .stack_slot => |offset| {
+                    minimum = @min(minimum, offset);
+                    maximum = @max(maximum, offset + @as(i32, value.kind.byteWidth()));
+                },
+                else => {},
+            };
+        }
+        return .{ .min_offset = minimum, .max_offset = maximum };
+    }
+
     pub fn reconstruct(
         self: *const Table,
         point_id: u32,
@@ -249,50 +417,99 @@ pub const Table = struct {
         exception: ExceptionState,
     ) Error!*Frame {
         const record = try self.find(point_id);
-        const values = self.valuesFor(record);
-        const frame = destination.frame;
+        const frames = self.framesFor(record);
         if (capture.native_registers.len < self.native_register_count or
-            destination.scratch.len < values.len or
-            frame.execution.registers.len != self.register_count or
-            frame.execution.reference_registers.len != self.register_count or
-            frame.execution.register_is_ref.len != self.register_count)
-        {
-            return error.InvalidDestination;
+            destination.inline_frames.len + 1 != frames.len or
+            destination.scratch.len < try self.requiredScratchWords(point_id)) return error.InvalidDestination;
+        if (slicesOverlap(destination.scratch, capture.native_registers) or
+            slicesOverlap(destination.scratch, capture.xmm_registers) or
+            slicesOverlap(destination.scratch, capture.held_monitors)) return error.InvalidDestination;
+
+        for (frames, 0..) |frame_record, frame_index| {
+            const frame = destinationFrame(destination, frame_index, frames.len);
+            if (frame.execution.registers.len != frame_record.register_count or
+                frame.execution.reference_registers.len != frame_record.register_count or
+                frame.execution.register_is_ref.len != frame_record.register_count or
+                frame.execution.managed_frame_state.active or
+                frame.execution.managed_frame_state.held_monitor_count != 0) return error.InvalidDestination;
+            if (!validFrameStorage(frame, destination.scratch)) return error.InvalidDestination;
+            for (0..frame_index) |prior_index| {
+                const prior = destinationFrame(destination, prior_index, frames.len);
+                if (prior == frame) return error.InvalidFrameChain;
+                if (frameStorageOverlaps(frame, prior)) return error.InvalidDestination;
+            }
+        }
+        try validatePreviousChain(destination, frames.len);
+        if (capture.held_monitors.len != try self.monitorCount(point_id)) return error.MonitorStateMismatch;
+
+        for (frames) |frame_record| {
+            for (self.valuesForFrame(frame_record)) |value| switch (value.source) {
+                .stack_slot => |offset| {
+                    const address = try stackAddress(capture, offset, value.kind.byteWidth());
+                    if (byteRangesOverlap(
+                        address,
+                        value.kind.byteWidth(),
+                        @intFromPtr(destination.scratch.ptr),
+                        destination.scratch.len * @sizeOf(u64),
+                    )) return error.InvalidDestination;
+                },
+                else => {},
+            };
+            for (self.monitorsForFrame(frame_record)) |monitor| switch (monitor.source) {
+                .stack_slot => |offset| {
+                    const address = try stackAddress(capture, offset, @sizeOf(Handle));
+                    if (byteRangesOverlap(
+                        address,
+                        @sizeOf(Handle),
+                        @intFromPtr(destination.scratch.ptr),
+                        destination.scratch.len * @sizeOf(u64),
+                    )) return error.InvalidDestination;
+                },
+                else => {},
+            };
         }
 
         // Stage first. No interpreter-visible state changes before every
         // native/stack source has passed bounds and reference validation.
-        for (values, 0..) |value, index| {
-            const bits = try readSource(value, capture);
-            if (value.kind == .reference and !validHandleBits(bits)) return error.InvalidReference;
-            destination.scratch[index] = bits;
-        }
-
-        @memset(frame.execution.registers, 0);
-        @memset(frame.execution.reference_registers, @as(u64, @bitCast(Handle.none)));
-        @memset(frame.execution.register_is_ref, false);
-        for (values, 0..) |value, index| {
-            const bits = destination.scratch[index];
-            switch (value.kind) {
-                .scalar32 => frame.execution.registers[value.vreg] = @truncate(bits),
-                .scalar64 => {
-                    frame.execution.registers[value.vreg] = @truncate(bits);
-                    frame.execution.registers[value.vreg + 1] = @truncate(bits >> 32);
-                },
-                .reference => {
-                    frame.execution.registers[value.vreg] = @truncate(bits);
-                    frame.execution.reference_registers[value.vreg] = bits;
-                    frame.execution.register_is_ref[value.vreg] = true;
-                },
+        var scratch_cursor: usize = 0;
+        var monitor_cursor: usize = 0;
+        for (frames) |frame_record| {
+            for (self.valuesForFrame(frame_record)) |value| {
+                const bits = try readSource(value, capture);
+                if (value.kind == .reference and !validHandleBits(bits)) return error.InvalidReference;
+                destination.scratch[scratch_cursor] = bits;
+                scratch_cursor += 1;
+            }
+            for (self.monitorsForFrame(frame_record)) |monitor| {
+                const bits = try readMonitorSource(monitor, capture);
+                if (!validHeldMonitorBits(bits) or bits != capture.held_monitors[monitor_cursor]) {
+                    return error.MonitorStateMismatch;
+                }
+                destination.scratch[scratch_cursor] = bits;
+                scratch_cursor += 1;
+                monitor_cursor += 1;
             }
         }
-        frame.execution.pc = record.dex_pc;
-        frame.method_id = record.method_id;
-        frame.previous = destination.previous;
-        frame.exception = exception;
-        frame.reason = reason;
-        frame.active = true;
-        return frame;
+
+        // Commit cannot fail. Link from the existing caller through each
+        // materialized inline activation and return the innermost leaf.
+        scratch_cursor = 0;
+        var previous = destination.previous;
+        for (frames, 0..) |frame_record, frame_index| {
+            const frame = destinationFrame(destination, frame_index, frames.len);
+            const values = self.valuesForFrame(frame_record);
+            commitFrame(frame, frame_record, values, destination.scratch[scratch_cursor..][0..values.len]);
+            scratch_cursor += values.len;
+            const monitors_for_frame = self.monitorsForFrame(frame_record);
+            commitFrameMonitors(frame, monitors_for_frame, destination.scratch[scratch_cursor..][0..monitors_for_frame.len]);
+            scratch_cursor += monitors_for_frame.len;
+            frame.previous = previous;
+            frame.exception = if (frame_index + 1 == frames.len) exception else .{};
+            frame.reason = reason;
+            frame.active = true;
+            previous = frame;
+        }
+        return destination.frame;
     }
 
     /// Visits only canonical reference slots named by a deoptimization point.
@@ -306,20 +523,120 @@ pub const Table = struct {
         visitor: anytype,
     ) !void {
         const record = try self.find(point_id);
-        for (self.valuesFor(record)) |value| {
-            if (value.kind != .reference) continue;
-            switch (value.source) {
-                .native_register => |register| {
-                    if (register >= capture.native_registers.len) return error.OutOfBounds;
-                    try visitor(context, @as(*const Handle, @ptrCast(&capture.native_registers[register])));
-                },
-                .stack_slot => |offset| {
-                    const address = try stackAddress(capture, offset, @sizeOf(Handle));
-                    try visitor(context, @as(*const Handle, @ptrFromInt(address)));
-                },
-                .constant => |bits| if (bits != @as(u64, @bitCast(Handle.none))) return error.InvalidConstant,
+        const frames = self.framesFor(record);
+        for (frames, 0..) |frame_record, frame_index| {
+            for (self.valuesForFrame(frame_record), 0..) |value, value_index| {
+                if (value.kind != .reference) continue;
+                if (self.captureLocationSeen(frames, frame_index, value_index, value.source)) continue;
+                switch (value.source) {
+                    .native_register => |register| {
+                        if (register >= capture.native_registers.len) return error.OutOfBounds;
+                        try visitor(context, @as(*const Handle, @ptrCast(&capture.native_registers[register])));
+                    },
+                    .stack_slot => |offset| {
+                        const address = try stackAddress(capture, offset, @sizeOf(Handle));
+                        try visitor(context, @as(*const Handle, @ptrFromInt(address)));
+                    },
+                    .xmm_register => return error.InvalidReferenceLocation,
+                    .constant => |bits| if (bits != @as(u64, @bitCast(Handle.none))) return error.InvalidConstant,
+                }
+            }
+            for (self.monitorsForFrame(frame_record), 0..) |monitor, monitor_index| {
+                if (self.captureLocationSeenBeforeMonitor(frames, frame_index, monitor_index, monitor.source)) continue;
+                switch (monitor.source) {
+                    .native_register => |register| {
+                        if (register >= capture.native_registers.len) return error.OutOfBounds;
+                        try visitor(context, @as(*const Handle, @ptrCast(&capture.native_registers[register])));
+                    },
+                    .stack_slot => |offset| {
+                        const address = try stackAddress(capture, offset, @sizeOf(Handle));
+                        try visitor(context, @as(*const Handle, @ptrFromInt(address)));
+                    },
+                    .xmm_register, .constant => return error.InvalidMonitorSource,
+                }
             }
         }
+    }
+
+    /// Publishes references from exactly the newly reconstructed activation,
+    /// stopping before the pre-existing caller chain.
+    pub fn visitFrameReferenceSlots(
+        self: *const Table,
+        point_id: u32,
+        leaf: *const Frame,
+        context: anytype,
+        visitor: anytype,
+    ) !void {
+        const record = try self.find(point_id);
+        const frames = self.framesFor(record);
+        var current: ?*const Frame = leaf;
+        var reverse_index = frames.len;
+        while (reverse_index > 0) {
+            reverse_index -= 1;
+            const frame = current orelse return error.InvalidFrameChain;
+            const expected = frames[reverse_index];
+            if (!frame.active or frame.method_id != expected.method_id or frame.execution.pc != expected.dex_pc or
+                frame.execution.registers.len != expected.register_count or
+                frame.execution.reference_registers.len != expected.register_count or
+                frame.execution.register_is_ref.len != expected.register_count) return error.InvalidFrameChain;
+            for (frame.execution.register_is_ref, 0..) |is_reference, register| {
+                if (!is_reference) continue;
+                const bits = frame.execution.reference_registers[register];
+                if (!validHandleBits(bits)) return error.InvalidReference;
+                try visitor(context, @as(*const Handle, @ptrCast(&frame.execution.reference_registers[register])));
+            }
+            const monitor_count: usize = frame.execution.managed_frame_state.held_monitor_count;
+            if (monitor_count != expected.monitor_count) return error.MonitorStateMismatch;
+            for (frame.execution.managed_frame_state.held_monitors[0..monitor_count]) |*bits| {
+                if (!validHeldMonitorBits(bits.*)) return error.MonitorStateMismatch;
+                try visitor(context, @as(*const Handle, @ptrCast(bits)));
+            }
+            current = frame.previous;
+        }
+    }
+
+    fn captureLocationSeen(
+        self: *const Table,
+        frames: []const FrameRecord,
+        frame_index: usize,
+        value_index: usize,
+        source: Source,
+    ) bool {
+        for (frames[0..frame_index]) |prior_frame| {
+            for (self.valuesForFrame(prior_frame)) |prior| {
+                if (prior.kind == .reference and sameCaptureLocation(prior.source, source)) return true;
+            }
+        }
+        const current_values = self.valuesForFrame(frames[frame_index]);
+        for (current_values[0..value_index]) |prior| {
+            if (prior.kind == .reference and sameCaptureLocation(prior.source, source)) return true;
+        }
+        return false;
+    }
+
+    fn captureLocationSeenBeforeMonitor(
+        self: *const Table,
+        frames: []const FrameRecord,
+        frame_index: usize,
+        monitor_index: usize,
+        source: Source,
+    ) bool {
+        for (frames[0..frame_index]) |prior_frame| {
+            for (self.valuesForFrame(prior_frame)) |value| {
+                if (value.kind == .reference and sameCaptureLocation(value.source, source)) return true;
+            }
+            for (self.monitorsForFrame(prior_frame)) |monitor| {
+                if (sameCaptureLocation(monitor.source, source)) return true;
+            }
+        }
+        for (self.valuesForFrame(frames[frame_index])) |value| {
+            if (value.kind == .reference and sameCaptureLocation(value.source, source)) return true;
+        }
+        const current_monitors = self.monitorsForFrame(frames[frame_index]);
+        for (current_monitors[0..monitor_index]) |monitor| {
+            if (sameCaptureLocation(monitor.source, source)) return true;
+        }
+        return false;
     }
 
     /// Validates the immutable cross-link used by a compiled safepoint. When
@@ -355,47 +672,152 @@ pub const Table = struct {
         }
     }
 
-    /// Transactionally exports an interpreter frame into the physical image
-    /// expected at an OSR entry. The same table drives deoptimization in the
-    /// reverse direction, preventing format drift between the two paths.
+    /// Transactionally exports an interpreter activation chain into the
+    /// physical image expected at an OSR entry. The leaf's `previous` links
+    /// must match this point's inner-to-outer frame records. The same table
+    /// drives deoptimization in the reverse direction, preventing format drift
+    /// between the two paths.
     pub fn exportOsr(
         self: *const Table,
         point_id: u32,
-        frame: *const Frame,
+        leaf: *const Frame,
         image: OsrImage,
     ) Error!void {
         const record = try self.find(point_id);
-        const values = self.valuesFor(record);
+        const frames = self.framesFor(record);
         const native_count: usize = self.native_register_count;
-        if (!frame.active or frame.method_id != record.method_id or frame.execution.pc != record.dex_pc or
-            frame.execution.registers.len != self.register_count or
-            frame.execution.reference_registers.len != self.register_count or
-            frame.execution.register_is_ref.len != self.register_count or
-            image.native_registers.len < native_count or
-            image.scratch.len < values.len + native_count)
+        if (image.native_registers.len < native_count or
+            image.scratch.len < try self.requiredScratchWords(point_id) + native_count)
         {
             return error.OsrStateMismatch;
         }
+        try self.validateOsrFrameChain(frames, leaf);
 
-        const staged_values = image.scratch[0..values.len];
-        const staged_registers = image.scratch[values.len..][0..native_count];
+        const staged_word_count = try self.requiredScratchWords(point_id);
+        const staged_registers = image.scratch[staged_word_count..][0..native_count];
         @memset(staged_registers, 0);
         var assigned: [std.math.maxInt(u8) + 1]bool = @splat(false);
-        for (values, 0..) |value, index| {
-            const bits = try readFrameValue(frame, value);
-            staged_values[index] = bits;
-            switch (value.source) {
-                .constant => |expected| if (bits != expected) return error.OsrStateMismatch,
-                .stack_slot => return error.UnsupportedOsrSource,
-                .native_register => |register| {
-                    if (register >= native_count) return error.OutOfBounds;
-                    if (assigned[register] and staged_registers[register] != bits) return error.AliasedOsrRegister;
-                    assigned[register] = true;
-                    staged_registers[register] = bits;
-                },
+        var scratch_cursor = staged_word_count;
+        var current: ?*const Frame = leaf;
+        var reverse_index = frames.len;
+        while (reverse_index != 0) {
+            reverse_index -= 1;
+            const frame_record = frames[reverse_index];
+            const frame = current orelse unreachable;
+            const frame_word_count: usize = frame_record.value_count + frame_record.monitor_count;
+            scratch_cursor -= frame_word_count;
+            var frame_cursor = scratch_cursor;
+            for (self.valuesForFrame(frame_record)) |value| {
+                const bits = try readFrameValue(frame, value);
+                image.scratch[frame_cursor] = bits;
+                frame_cursor += 1;
+                switch (value.source) {
+                    .constant => |expected| if (bits != expected) return error.OsrStateMismatch,
+                    .stack_slot, .xmm_register => return error.UnsupportedOsrSource,
+                    .native_register => |register| {
+                        if (register >= native_count) return error.OutOfBounds;
+                        if (assigned[register] and staged_registers[register] != bits) return error.AliasedOsrRegister;
+                        assigned[register] = true;
+                        staged_registers[register] = bits;
+                    },
+                }
             }
+            for (self.monitorsForFrame(frame_record), 0..) |monitor, monitor_index| {
+                const bits = frame.execution.managed_frame_state.held_monitors[monitor_index];
+                image.scratch[frame_cursor] = bits;
+                frame_cursor += 1;
+                switch (monitor.source) {
+                    .native_register => |register| {
+                        if (register >= native_count) return error.OutOfBounds;
+                        if (assigned[register] and staged_registers[register] != bits) return error.AliasedOsrRegister;
+                        assigned[register] = true;
+                        staged_registers[register] = bits;
+                    },
+                    .stack_slot, .xmm_register => return error.UnsupportedOsrSource,
+                    .constant => return error.InvalidMonitorSource,
+                }
+            }
+            std.debug.assert(frame_cursor == scratch_cursor + frame_word_count);
+            current = frame.previous;
         }
+        std.debug.assert(scratch_cursor == 0);
         @memcpy(image.native_registers[0..native_count], staged_registers);
+    }
+
+    /// Validates and stages the interpreter-owned acquisition stack without
+    /// mutating it. Runtime OSR commits the bookkeeping transfer only after
+    /// code-version and entry-label validation have succeeded.
+    pub fn copyOsrMonitors(
+        self: *const Table,
+        point_id: u32,
+        leaf: *const Frame,
+        destination: []u64,
+    ) Error!usize {
+        const record = try self.find(point_id);
+        const frames = self.framesFor(record);
+        const count = try self.monitorCount(point_id);
+        if (destination.len < count) return error.MonitorStateMismatch;
+        try self.validateOsrFrameChain(frames, leaf);
+
+        var cursor = count;
+        var current: ?*const Frame = leaf;
+        var reverse_index = frames.len;
+        while (reverse_index != 0) {
+            reverse_index -= 1;
+            const frame_record = frames[reverse_index];
+            const frame = current orelse unreachable;
+            const monitor_count: usize = frame_record.monitor_count;
+            cursor -= monitor_count;
+            @memcpy(destination[cursor..][0..monitor_count], frame.execution.managed_frame_state.held_monitors[0..monitor_count]);
+            current = frame.previous;
+        }
+        std.debug.assert(cursor == 0);
+        return count;
+    }
+
+    fn validateOsrFrameChain(self: *const Table, frames: []const FrameRecord, leaf: *const Frame) Error!void {
+        var current: ?*const Frame = leaf;
+        var reverse_index = frames.len;
+        var inner_count: usize = 0;
+        while (reverse_index != 0) {
+            reverse_index -= 1;
+            const expected = frames[reverse_index];
+            const frame = current orelse return error.InvalidFrameChain;
+            if (!frame.active or frame.method_id != expected.method_id or frame.execution.pc != expected.dex_pc or
+                frame.execution.registers.len != expected.register_count or
+                frame.execution.reference_registers.len != expected.register_count or
+                frame.execution.register_is_ref.len != expected.register_count)
+            {
+                return error.InvalidFrameChain;
+            }
+            var inner = leaf;
+            for (0..inner_count) |_| {
+                if (frame == inner) return error.InvalidFrameChain;
+                inner = inner.previous orelse return error.InvalidFrameChain;
+            }
+
+            const monitors = self.monitorsForFrame(expected);
+            const monitor_count: usize = frame.execution.managed_frame_state.held_monitor_count;
+            if (monitor_count != monitors.len) return error.MonitorStateMismatch;
+            const synchronized = monitors.len != 0 and monitors[0].kind == .synchronized;
+            if (frame.execution.managed_frame_state.synchronized_monitor_owned != synchronized) {
+                return error.MonitorStateMismatch;
+            }
+            if (synchronized) {
+                if (frame.execution.synchronized_monitor == null or
+                    frame.execution.synchronized_monitor.? != frame.execution.managed_frame_state.held_monitors[0])
+                {
+                    return error.MonitorStateMismatch;
+                }
+            } else if (frame.execution.synchronized_monitor != null) {
+                return error.MonitorStateMismatch;
+            }
+            for (frame.execution.managed_frame_state.held_monitors[0..monitor_count]) |bits| {
+                if (!validHeldMonitorBits(bits)) return error.MonitorStateMismatch;
+            }
+            current = frame.previous;
+            inner_count += 1;
+        }
     }
 
     pub fn importOsr(
@@ -404,6 +826,8 @@ pub const Table = struct {
         image: []const u64,
         destination: Destination,
     ) Error!*Frame {
+        const record = try self.find(point_id);
+        if (record.frame_count != 1) return error.UnsupportedOsrFrameChain;
         var stack_anchor: u64 = 0;
         return self.reconstruct(point_id, .{
             .native_registers = image,
@@ -414,23 +838,62 @@ pub const Table = struct {
     }
 };
 
-fn validatePoint(spec: PointSpec, options: ValidationOptions) Error!void {
-    for (spec.values) |value| {
+fn addValueCount(total: *usize, count: usize) Error!void {
+    if (count > std.math.maxInt(u16) or count > std.math.maxInt(u32) - total.*) return error.TooManyValues;
+    total.* += count;
+}
+
+fn addMonitorCount(total: *usize, count: usize) Error!void {
+    if (count > std.math.maxInt(u16) or count > std.math.maxInt(u32) - total.*) return error.TooManyMonitors;
+    total.* += count;
+}
+
+fn validateMonitors(monitors: []const MonitorSpec, options: ValidationOptions) Error!void {
+    if (monitors.len > interpreter.ManagedFrameState.max_held_monitors or monitors.len > options.max_monitor_depth) {
+        return error.TooManyMonitors;
+    }
+    var synchronized_seen = false;
+    for (monitors, 0..) |monitor, index| {
+        if (monitor.kind == .synchronized) {
+            if (synchronized_seen or index != 0) return error.InvalidMonitorSource;
+            synchronized_seen = true;
+        }
+        switch (monitor.source) {
+            .native_register => |register| if (register >= options.native_register_count) return error.InvalidNativeRegister,
+            .stack_slot => |offset| {
+                if (@mod(offset, @as(i32, options.stack_alignment)) != 0) return error.InvalidStackAlignment;
+                if (offset > std.math.maxInt(i32) - @as(i32, @sizeOf(Handle))) return error.OutOfBounds;
+            },
+            .xmm_register, .constant => return error.InvalidMonitorSource,
+        }
+    }
+}
+
+fn validateFrame(register_count: u16, values: []const ValueSpec, options: ValidationOptions) Error!void {
+    if (register_count == 0) return error.IncompleteFrame;
+    for (values) |value| {
         const width = value.kind.registerWidth();
-        if (value.vreg >= options.register_count or width > options.register_count - value.vreg) {
+        if (value.vreg >= register_count or width > register_count - value.vreg) {
             return error.OutOfBounds;
         }
         switch (value.source) {
             .native_register => |register| if (register >= options.native_register_count) return error.InvalidNativeRegister,
-            .stack_slot => |offset| if (@mod(offset, @as(i32, options.stack_alignment)) != 0) return error.InvalidStackAlignment,
+            .xmm_register => |register| {
+                if (register >= options.xmm_register_count) return error.InvalidXmmRegister;
+                if (value.kind == .reference) return error.InvalidReferenceLocation;
+            },
+            .stack_slot => |offset| {
+                if (@mod(offset, @as(i32, options.stack_alignment)) != 0) return error.InvalidStackAlignment;
+                if (offset > std.math.maxInt(i32) - @as(i32, value.kind.byteWidth())) return error.OutOfBounds;
+            },
             .constant => |bits| if (value.kind == .reference and bits != @as(u64, @bitCast(Handle.none))) return error.InvalidConstant,
         }
     }
 
     var register: u16 = 0;
-    while (register < options.register_count) : (register += 1) {
+    while (register < register_count) : (register += 1) {
         var coverage: u8 = 0;
-        for (spec.values) |value| {
+        for (values) |value| {
             const end = value.vreg + value.kind.registerWidth();
             if (register >= value.vreg and register < end) coverage += 1;
         }
@@ -439,14 +902,152 @@ fn validatePoint(spec: PointSpec, options: ValidationOptions) Error!void {
     }
 }
 
+fn destinationFrame(destination: Destination, index: usize, frame_count: usize) *Frame {
+    std.debug.assert(index < frame_count);
+    if (index + 1 == frame_count) return destination.frame;
+    return &destination.inline_frames[index];
+}
+
+fn validatePreviousChain(destination: Destination, frame_count: usize) Error!void {
+    var cursor = destination.previous;
+    var tortoise = destination.previous;
+    var hare = destination.previous;
+    while (cursor) |frame| {
+        for (0..frame_count) |index| {
+            if (frame == destinationFrame(destination, index, frame_count)) return error.InvalidFrameChain;
+        }
+        cursor = frame.previous;
+        tortoise = if (tortoise) |value| value.previous else null;
+        hare = if (hare) |value| if (value.previous) |next| next.previous else null else null;
+        if (tortoise != null and hare != null and tortoise == hare) return error.InvalidFrameChain;
+    }
+}
+
+fn validFrameStorage(frame: *const Frame, scratch: []const u64) bool {
+    if (slicesOverlap(frame.execution.registers, frame.execution.reference_registers) or
+        slicesOverlap(frame.execution.registers, frame.execution.register_is_ref) or
+        slicesOverlap(frame.execution.reference_registers, frame.execution.register_is_ref) or
+        slicesOverlap(frame.execution.registers, scratch) or
+        slicesOverlap(frame.execution.reference_registers, scratch) or
+        slicesOverlap(frame.execution.register_is_ref, scratch)) return false;
+    return !byteRangesOverlap(
+        @intFromPtr(frame),
+        @sizeOf(Frame),
+        @intFromPtr(scratch.ptr),
+        scratch.len * @sizeOf(u64),
+    );
+}
+
+fn frameStorageOverlaps(a: *const Frame, b: *const Frame) bool {
+    return slicesOverlap(a.execution.registers, b.execution.registers) or
+        slicesOverlap(a.execution.registers, b.execution.reference_registers) or
+        slicesOverlap(a.execution.registers, b.execution.register_is_ref) or
+        slicesOverlap(a.execution.reference_registers, b.execution.registers) or
+        slicesOverlap(a.execution.reference_registers, b.execution.reference_registers) or
+        slicesOverlap(a.execution.reference_registers, b.execution.register_is_ref) or
+        slicesOverlap(a.execution.register_is_ref, b.execution.registers) or
+        slicesOverlap(a.execution.register_is_ref, b.execution.reference_registers) or
+        slicesOverlap(a.execution.register_is_ref, b.execution.register_is_ref);
+}
+
+fn slicesOverlap(a: anytype, b: anytype) bool {
+    return byteRangesOverlap(
+        @intFromPtr(a.ptr),
+        a.len * @sizeOf(@TypeOf(a[0])),
+        @intFromPtr(b.ptr),
+        b.len * @sizeOf(@TypeOf(b[0])),
+    );
+}
+
+fn byteRangesOverlap(a_start: usize, a_len: usize, b_start: usize, b_len: usize) bool {
+    if (a_len == 0 or b_len == 0) return false;
+    const a_end = std.math.add(usize, a_start, a_len) catch return true;
+    const b_end = std.math.add(usize, b_start, b_len) catch return true;
+    return a_start < b_end and b_start < a_end;
+}
+
+fn commitFrame(frame: *Frame, record: FrameRecord, values: []const ValueSpec, staged: []const u64) void {
+    @memset(frame.execution.registers, 0);
+    @memset(frame.execution.reference_registers, @as(u64, @bitCast(Handle.none)));
+    @memset(frame.execution.register_is_ref, false);
+    for (values, staged) |value, bits| {
+        switch (value.kind) {
+            .scalar32 => frame.execution.registers[value.vreg] = @truncate(bits),
+            .scalar64 => {
+                frame.execution.registers[value.vreg] = @truncate(bits);
+                frame.execution.registers[value.vreg + 1] = @truncate(bits >> 32);
+            },
+            .reference => {
+                frame.execution.registers[value.vreg] = @truncate(bits);
+                frame.execution.reference_registers[value.vreg] = bits;
+                frame.execution.register_is_ref[value.vreg] = true;
+            },
+        }
+    }
+    frame.execution.pc = record.dex_pc;
+    frame.method_id = record.method_id;
+}
+
+fn commitFrameMonitors(frame: *Frame, monitors: []const MonitorSpec, staged: []const u64) void {
+    std.debug.assert(monitors.len == staged.len);
+    std.debug.assert(staged.len <= interpreter.ManagedFrameState.max_held_monitors);
+    @memset(frame.execution.managed_frame_state.held_monitors[0..], interpreter.null_reference_bits);
+    @memcpy(frame.execution.managed_frame_state.held_monitors[0..staged.len], staged);
+    frame.execution.managed_frame_state.held_monitor_count = @intCast(staged.len);
+    const synchronized = monitors.len != 0 and monitors[0].kind == .synchronized;
+    frame.execution.managed_frame_state.synchronized_monitor_owned = synchronized;
+    frame.execution.synchronized_monitor = if (synchronized) staged[0] else null;
+}
+
+fn sameCaptureLocation(a: Source, b: Source) bool {
+    return switch (a) {
+        .native_register => |left| switch (b) {
+            .native_register => |right| left == right,
+            else => false,
+        },
+        .xmm_register => |left| switch (b) {
+            .xmm_register => |right| left == right,
+            else => false,
+        },
+        .stack_slot => |left| switch (b) {
+            .stack_slot => |right| left == right,
+            else => false,
+        },
+        .constant => false,
+    };
+}
+
 fn readSource(value: ValueSpec, capture: Capture) Error!u64 {
     return switch (value.source) {
         .native_register => |register| if (register < capture.native_registers.len)
             capture.native_registers[register]
         else
             error.OutOfBounds,
+        .xmm_register => |register| if (register < capture.xmm_registers.len)
+            readXmm(capture.xmm_registers[register], value.kind.byteWidth())
+        else
+            error.OutOfBounds,
         .constant => |bits| bits,
         .stack_slot => |offset| readStack(capture, offset, value.kind.byteWidth()),
+    };
+}
+
+fn readMonitorSource(monitor: MonitorSpec, capture: Capture) Error!u64 {
+    return switch (monitor.source) {
+        .native_register => |register| if (register < capture.native_registers.len)
+            capture.native_registers[register]
+        else
+            error.OutOfBounds,
+        .stack_slot => |offset| readStack(capture, offset, @sizeOf(Handle)),
+        .xmm_register, .constant => error.InvalidMonitorSource,
+    };
+}
+
+fn readXmm(bytes: [16]u8, width: u8) u64 {
+    return switch (width) {
+        4 => std.mem.readInt(u32, bytes[0..4], .little),
+        8 => std.mem.readInt(u64, bytes[0..8], .little),
+        else => unreachable,
     };
 }
 
@@ -482,6 +1083,11 @@ fn validHandleBits(bits: u64) bool {
     return bits == @as(u64, @bitCast(Handle.none)) or (!handle.isNull() and handle.generation != 0);
 }
 
+fn validHeldMonitorBits(bits: u64) bool {
+    const handle: Handle = @bitCast(bits);
+    return !handle.isNull() and handle.generation != 0;
+}
+
 fn readFrameValue(frame: *const Frame, value: ValueSpec) Error!u64 {
     return switch (value.kind) {
         .scalar32 => blk: {
@@ -508,6 +1114,102 @@ const test_options = ValidationOptions{
     .native_register_count = 16,
     .max_dex_pc = 32,
 };
+
+test "deoptimization monitor ownership is transactional and OSR-exportable" {
+    const handle = Handle{ .index = 7, .generation = 3 };
+    const other = Handle{ .index = 8, .generation = 4 };
+    const values = [_]ValueSpec{.{ .vreg = 0, .kind = .reference, .source = .{ .native_register = 0 } }};
+    const monitors = [_]MonitorSpec{.{ .source = .{ .native_register = 0 } }};
+    const callers = [_]InlineFrameSpec{.{
+        .method_id = 40,
+        .dex_pc = 1,
+        .register_count = 1,
+        .values = &values,
+        .monitors = &monitors,
+    }};
+    var table = try Table.init(std.testing.allocator, &.{.{
+        .id = 9,
+        .method_id = 41,
+        .dex_pc = 2,
+        .values = &values,
+        .inline_frames = &callers,
+        .monitors = &monitors,
+    }}, .{ .register_count = 1, .native_register_count = 16, .max_dex_pc = 4 });
+    defer table.deinit();
+
+    var leaf_registers: [1]u32 = .{0};
+    var leaf_references: [1]u64 = .{@bitCast(Handle.none)};
+    var leaf_kinds: [1]bool = .{false};
+    var leaf = Frame{ .execution = .{
+        .pc = 0,
+        .registers = &leaf_registers,
+        .instructions = &.{},
+        .reference_registers = &leaf_references,
+        .register_is_ref = &leaf_kinds,
+    } };
+    var caller_registers: [1]u32 = .{0};
+    var caller_references: [1]u64 = .{@bitCast(Handle.none)};
+    var caller_kinds: [1]bool = .{false};
+    var caller_frames = [_]Frame{.{ .execution = .{
+        .pc = 0,
+        .registers = &caller_registers,
+        .instructions = &.{},
+        .reference_registers = &caller_references,
+        .register_is_ref = &caller_kinds,
+    } }};
+    var scratch: [4]u64 = undefined;
+    var native: [16]u64 = @splat(0);
+    native[0] = @bitCast(handle);
+    var stack_anchor: u64 = 0;
+    const bad_held = [_]u64{ @bitCast(handle), @bitCast(other) };
+    try std.testing.expectError(error.MonitorStateMismatch, table.reconstruct(9, .{
+        .native_registers = &native,
+        .stack_base = @ptrCast(&stack_anchor),
+        .stack_min_offset = 0,
+        .stack_max_offset = @sizeOf(@TypeOf(stack_anchor)),
+        .held_monitors = &bad_held,
+    }, .{ .frame = &leaf, .inline_frames = &caller_frames, .scratch = &scratch }, .invalidation, .{}));
+    try std.testing.expect(!leaf.active);
+    try std.testing.expectEqual(@as(u8, 0), leaf.execution.managed_frame_state.held_monitor_count);
+    try std.testing.expectEqual(@as(u8, 0), caller_frames[0].execution.managed_frame_state.held_monitor_count);
+
+    const held = [_]u64{ @bitCast(handle), @bitCast(handle) };
+    _ = try table.reconstruct(9, .{
+        .native_registers = &native,
+        .stack_base = @ptrCast(&stack_anchor),
+        .stack_min_offset = 0,
+        .stack_max_offset = @sizeOf(@TypeOf(stack_anchor)),
+        .held_monitors = &held,
+    }, .{ .frame = &leaf, .inline_frames = &caller_frames, .scratch = &scratch }, .invalidation, .{});
+    try std.testing.expectEqual(@as(u8, 1), caller_frames[0].execution.managed_frame_state.held_monitor_count);
+    try std.testing.expectEqual(@as(u8, 1), leaf.execution.managed_frame_state.held_monitor_count);
+    try std.testing.expectEqual(@as(u64, @bitCast(handle)), leaf.execution.managed_frame_state.held_monitors[0]);
+
+    var osr_table = try Table.init(std.testing.allocator, &.{.{
+        .id = 10,
+        .method_id = 41,
+        .dex_pc = 2,
+        .values = &values,
+        .monitors = &monitors,
+    }}, .{ .register_count = 1, .native_register_count = 16, .max_dex_pc = 4 });
+    defer osr_table.deinit();
+    var osr_image: [16]u64 = @splat(0);
+    var osr_scratch: [18]u64 = undefined;
+    try osr_table.exportOsr(10, &leaf, .{ .native_registers = &osr_image, .scratch = &osr_scratch });
+    try std.testing.expectEqual(@as(u64, @bitCast(handle)), osr_image[0]);
+    var copied: [interpreter.ManagedFrameState.max_held_monitors]u64 = @splat(interpreter.null_reference_bits);
+    try std.testing.expectEqual(@as(usize, 1), try osr_table.copyOsrMonitors(10, &leaf, &copied));
+    try std.testing.expectEqual(@as(u64, @bitCast(handle)), copied[0]);
+
+    const invalid_monitor = [_]MonitorSpec{.{ .source = .{ .constant = @bitCast(handle) } }};
+    try std.testing.expectError(error.InvalidMonitorSource, Table.init(std.testing.allocator, &.{.{
+        .id = 11,
+        .method_id = 41,
+        .dex_pc = 2,
+        .values = &values,
+        .monitors = &invalid_monitor,
+    }}, .{ .register_count = 1, .native_register_count = 16, .max_dex_pc = 4 }));
+}
 
 test "deoptimization reconstructs exact values references exception and frame chain" {
     const handle = Handle{ .index = 7, .generation = 3 };
@@ -554,6 +1256,248 @@ test "deoptimization reconstructs exact values references exception and frame ch
     try std.testing.expectEqualSlices(bool, &.{ false, false, false, true }, &reference_kinds);
     try std.testing.expect(rebuilt.previous == &previous);
     try std.testing.expectEqual(exception, rebuilt.exception);
+}
+
+test "deoptimization reconstructs exact low XMM lanes and managed spill slots" {
+    const values = [_]ValueSpec{
+        .{ .vreg = 0, .kind = .scalar32, .source = .{ .xmm_register = 1 } },
+        .{ .vreg = 1, .kind = .scalar64, .source = .{ .xmm_register = 2 } },
+        .{ .vreg = 3, .kind = .scalar64, .source = .{ .stack_slot = 8 } },
+    };
+    var table = try Table.init(std.testing.allocator, &.{.{
+        .id = 15,
+        .method_id = 8,
+        .dex_pc = 4,
+        .values = &values,
+    }}, .{
+        .register_count = 5,
+        .native_register_count = 16,
+        .xmm_register_count = 8,
+        .max_dex_pc = 4,
+    });
+    defer table.deinit();
+    try std.testing.expectEqual(Table.StackBounds{ .min_offset = 0, .max_offset = 16 }, try table.stackBounds(15));
+
+    var xmm: [8][16]u8 = @splat(@splat(0));
+    std.mem.writeInt(u32, xmm[1][0..4], 0xa1b2c3d4, .little);
+    std.mem.writeInt(u64, xmm[2][0..8], 0x1122334455667788, .little);
+    var stack: [2]u64 = .{ 0, 0x8877665544332211 };
+    var native: [16]u64 = @splat(0);
+    var registers: [5]u32 = @splat(0);
+    var references: [5]u64 = @splat(@as(u64, @bitCast(Handle.none)));
+    var kinds: [5]bool = @splat(false);
+    var frame = Frame{ .execution = .{
+        .pc = 0,
+        .registers = &registers,
+        .instructions = &.{},
+        .register_is_ref = &kinds,
+        .reference_registers = &references,
+    } };
+    var scratch: [3]u64 = undefined;
+    _ = try table.reconstruct(15, .{
+        .native_registers = &native,
+        .xmm_registers = &xmm,
+        .stack_base = @ptrCast(&stack[0]),
+        .stack_min_offset = 0,
+        .stack_max_offset = @sizeOf(@TypeOf(stack)),
+    }, .{ .frame = &frame, .scratch = &scratch }, .invalidation, .{});
+    try std.testing.expectEqual(@as(u32, 0xa1b2c3d4), frame.execution.registers[0]);
+    try std.testing.expectEqual(@as(u64, 0x1122334455667788), frame.execution.getWide(1));
+    try std.testing.expectEqual(@as(u64, 0x8877665544332211), frame.execution.getWide(3));
+
+    var osr_scratch: [19]u64 = undefined;
+    try std.testing.expectError(error.UnsupportedOsrSource, table.exportOsr(15, &frame, .{
+        .native_registers = &native,
+        .scratch = &osr_scratch,
+    }));
+    const bad_reference = [_]ValueSpec{
+        .{ .vreg = 0, .kind = .reference, .source = .{ .xmm_register = 0 } },
+        .{ .vreg = 1, .kind = .scalar64, .source = .{ .constant = 0 } },
+        .{ .vreg = 3, .kind = .scalar64, .source = .{ .constant = 0 } },
+    };
+    try std.testing.expectError(error.InvalidReferenceLocation, Table.init(std.testing.allocator, &.{.{
+        .id = 16,
+        .method_id = 8,
+        .dex_pc = 4,
+        .values = &bad_reference,
+    }}, .{
+        .register_count = 5,
+        .native_register_count = 16,
+        .xmm_register_count = 8,
+        .max_dex_pc = 4,
+    }));
+}
+
+test "deoptimization transactionally reconstructs an exact inlined activation chain" {
+    const shared = Handle{ .index = 17, .generation = 5 };
+    const leaf_only = Handle{ .index = 19, .generation = 6 };
+    const outer_values = [_]ValueSpec{
+        .{ .vreg = 0, .kind = .reference, .source = .{ .native_register = 2 } },
+        .{ .vreg = 1, .kind = .scalar64, .source = .{ .stack_slot = 0 } },
+    };
+    const inner_values = [_]ValueSpec{
+        .{ .vreg = 0, .kind = .scalar32, .source = .{ .native_register = 3 } },
+        .{ .vreg = 1, .kind = .scalar32, .source = .{ .constant = 44 } },
+    };
+    const leaf_values = [_]ValueSpec{
+        .{ .vreg = 0, .kind = .reference, .source = .{ .native_register = 2 } },
+        .{ .vreg = 1, .kind = .reference, .source = .{ .native_register = 4 } },
+        .{ .vreg = 2, .kind = .scalar64, .source = .{ .constant = 0x8877665544332211 } },
+    };
+    const callers = [_]InlineFrameSpec{
+        .{ .method_id = 10, .dex_pc = 1, .register_count = 3, .values = &outer_values },
+        .{ .method_id = 20, .dex_pc = 2, .register_count = 2, .values = &inner_values },
+    };
+    var table = try Table.init(std.testing.allocator, &.{.{
+        .id = 31,
+        .method_id = 30,
+        .dex_pc = 3,
+        .values = &leaf_values,
+        .inline_frames = &callers,
+    }}, .{ .register_count = 4, .native_register_count = 8, .max_dex_pc = 4 });
+    defer table.deinit();
+    try std.testing.expectEqual(@as(usize, 3), table.frames.len);
+    try std.testing.expectEqual(@as(usize, 7), try table.requiredScratchWords(31));
+
+    var native: [8]u64 = @splat(0);
+    native[2] = @bitCast(shared);
+    native[3] = 33;
+    native[4] = @bitCast(leaf_only);
+    var stack = [_]u64{0x1122334455667788};
+
+    var outer_registers: [3]u32 = @splat(0);
+    var outer_references: [3]u64 = @splat(@as(u64, @bitCast(Handle.none)));
+    var outer_kinds: [3]bool = @splat(false);
+    var inner_registers: [2]u32 = @splat(0);
+    var inner_references: [2]u64 = @splat(@as(u64, @bitCast(Handle.none)));
+    var inner_kinds: [2]bool = @splat(false);
+    var leaf_registers: [4]u32 = @splat(0);
+    var leaf_references: [4]u64 = @splat(@as(u64, @bitCast(Handle.none)));
+    var leaf_kinds: [4]bool = @splat(false);
+    var callers_out = [_]Frame{
+        .{ .execution = .{ .pc = 90, .registers = &outer_registers, .instructions = &.{}, .register_is_ref = &outer_kinds, .reference_registers = &outer_references } },
+        .{ .execution = .{ .pc = 91, .registers = &inner_registers, .instructions = &.{}, .register_is_ref = &inner_kinds, .reference_registers = &inner_references } },
+    };
+    var leaf = Frame{ .execution = .{
+        .pc = 92,
+        .registers = &leaf_registers,
+        .instructions = &.{},
+        .register_is_ref = &leaf_kinds,
+        .reference_registers = &leaf_references,
+    } };
+    var preexisting = Frame{ .execution = .{
+        .pc = 99,
+        .registers = &.{},
+        .instructions = &.{},
+        .register_is_ref = &.{},
+        .reference_registers = &.{},
+    }, .active = true };
+    var scratch: [7]u64 = undefined;
+    const exception = ExceptionState{ .kind = 2, .dex_pc = 3, .payload0 = 7 };
+    const rebuilt = try table.reconstruct(31, .{
+        .native_registers = &native,
+        .stack_base = @ptrCast(&stack[0]),
+        .stack_min_offset = 0,
+        .stack_max_offset = @sizeOf(@TypeOf(stack)),
+    }, .{
+        .frame = &leaf,
+        .inline_frames = &callers_out,
+        .scratch = &scratch,
+        .previous = &preexisting,
+    }, .exception, exception);
+
+    try std.testing.expect(rebuilt == &leaf);
+    try std.testing.expect(callers_out[0].previous == &preexisting);
+    try std.testing.expect(callers_out[1].previous == &callers_out[0]);
+    try std.testing.expect(leaf.previous == &callers_out[1]);
+    try std.testing.expectEqual(@as(u32, 10), callers_out[0].method_id);
+    try std.testing.expectEqual(@as(u64, 0x1122334455667788), callers_out[0].execution.getWide(1));
+    try std.testing.expectEqual(@as(u32, 33), callers_out[1].execution.registers[0]);
+    try std.testing.expectEqual(@as(u32, 44), callers_out[1].execution.registers[1]);
+    try std.testing.expectEqual(@as(u64, @bitCast(shared)), leaf.execution.reference_registers[0]);
+    try std.testing.expectEqual(@as(u64, @bitCast(leaf_only)), leaf.execution.reference_registers[1]);
+    try std.testing.expectEqual(exception, leaf.exception);
+    try std.testing.expect(!callers_out[0].exception.isPending());
+
+    var frame_roots: std.ArrayList(u64) = .empty;
+    defer frame_roots.deinit(std.testing.allocator);
+    const FrameVisitor = struct {
+        fn add(list: *std.ArrayList(u64), slot: *const Handle) !void {
+            try list.append(std.testing.allocator, @bitCast(slot.*));
+        }
+    };
+    try table.visitFrameReferenceSlots(31, &leaf, &frame_roots, FrameVisitor.add);
+    try std.testing.expectEqualSlices(u64, &.{
+        @as(u64, @bitCast(shared)),
+        @as(u64, @bitCast(leaf_only)),
+        @as(u64, @bitCast(shared)),
+    }, frame_roots.items);
+
+    var capture_roots: std.ArrayList(u64) = .empty;
+    defer capture_roots.deinit(std.testing.allocator);
+    const Visitor = struct {
+        fn add(list: *std.ArrayList(u64), slot: *const Handle) !void {
+            try list.append(std.testing.allocator, @bitCast(slot.*));
+        }
+    };
+    try table.visitReferenceSlots(31, .{
+        .native_registers = &native,
+        .stack_base = @ptrCast(&stack[0]),
+        .stack_min_offset = 0,
+        .stack_max_offset = @sizeOf(@TypeOf(stack)),
+    }, &capture_roots, Visitor.add);
+    try std.testing.expectEqualSlices(u64, &.{ @as(u64, @bitCast(shared)), @as(u64, @bitCast(leaf_only)) }, capture_roots.items);
+
+    const before_outer_pc = callers_out[0].execution.pc;
+    const before_leaf_pc = leaf.execution.pc;
+    try std.testing.expectError(error.InvalidDestination, table.reconstruct(31, .{
+        .native_registers = &native,
+        .stack_base = @ptrCast(&stack[0]),
+        .stack_min_offset = 0,
+        .stack_max_offset = @sizeOf(@TypeOf(stack)),
+    }, .{ .frame = &leaf, .inline_frames = callers_out[0..1], .scratch = &scratch }, .invalidation, .{}));
+    try std.testing.expectEqual(before_outer_pc, callers_out[0].execution.pc);
+    try std.testing.expectEqual(before_leaf_pc, leaf.execution.pc);
+
+    callers_out[0].execution.pc = 71;
+    callers_out[1].execution.pc = 72;
+    leaf.execution.pc = 73;
+    native[4] = 1;
+    try std.testing.expectError(error.InvalidReference, table.reconstruct(31, .{
+        .native_registers = &native,
+        .stack_base = @ptrCast(&stack[0]),
+        .stack_min_offset = 0,
+        .stack_max_offset = @sizeOf(@TypeOf(stack)),
+    }, .{ .frame = &leaf, .inline_frames = &callers_out, .scratch = &scratch }, .invalidation, .{}));
+    try std.testing.expectEqual(@as(u32, 71), callers_out[0].execution.pc);
+    try std.testing.expectEqual(@as(u32, 72), callers_out[1].execution.pc);
+    try std.testing.expectEqual(@as(u32, 73), leaf.execution.pc);
+
+    native[4] = @bitCast(leaf_only);
+    const saved_leaf_references = leaf.execution.reference_registers;
+    leaf.execution.reference_registers = scratch[0..4];
+    defer leaf.execution.reference_registers = saved_leaf_references;
+    try std.testing.expectError(error.InvalidDestination, table.reconstruct(31, .{
+        .native_registers = &native,
+        .stack_base = @ptrCast(&stack[0]),
+        .stack_min_offset = 0,
+        .stack_max_offset = @sizeOf(@TypeOf(stack)),
+    }, .{ .frame = &leaf, .inline_frames = &callers_out, .scratch = &scratch }, .invalidation, .{}));
+    leaf.execution.reference_registers = saved_leaf_references;
+
+    preexisting.previous = &leaf;
+    defer preexisting.previous = null;
+    try std.testing.expectError(error.InvalidFrameChain, table.reconstruct(31, .{
+        .native_registers = &native,
+        .stack_base = @ptrCast(&stack[0]),
+        .stack_min_offset = 0,
+        .stack_max_offset = @sizeOf(@TypeOf(stack)),
+    }, .{
+        .frame = &leaf,
+        .inline_frames = &callers_out,
+        .scratch = &scratch,
+        .previous = &preexisting,
+    }, .invalidation, .{}));
 }
 
 test "deoptimization metadata rejects incomplete overlapping and unsafe frames" {
@@ -737,12 +1681,133 @@ test "OSR export and import round trip through the deoptimization format" {
     try std.testing.expectEqualSlices(u64, &before, &native_image);
 }
 
+test "OSR transactionally exports a nested synchronized activation chain" {
+    const outer_handle = Handle{ .index = 31, .generation = 4 };
+    const leaf_handle = Handle{ .index = 32, .generation = 5 };
+    const outer_values = [_]ValueSpec{
+        .{ .vreg = 0, .kind = .reference, .source = .{ .native_register = 0 } },
+        .{ .vreg = 1, .kind = .scalar32, .source = .{ .native_register = 1 } },
+    };
+    const leaf_values = [_]ValueSpec{
+        .{ .vreg = 0, .kind = .reference, .source = .{ .native_register = 2 } },
+        // Deliberately aliases the caller's physical register. Export may
+        // elide duplicate loads only when both interpreter values agree.
+        .{ .vreg = 1, .kind = .scalar32, .source = .{ .native_register = 1 } },
+    };
+    const outer_monitors = [_]MonitorSpec{.{
+        .source = .{ .native_register = 0 },
+        .kind = .synchronized,
+    }};
+    const leaf_monitors = [_]MonitorSpec{.{
+        .source = .{ .native_register = 2 },
+        .kind = .synchronized,
+    }};
+    const callers = [_]InlineFrameSpec{.{
+        .method_id = 700,
+        .dex_pc = 2,
+        .register_count = 2,
+        .values = &outer_values,
+        .monitors = &outer_monitors,
+    }};
+    var table = try Table.init(std.testing.allocator, &.{.{
+        .id = 46,
+        .method_id = 701,
+        .dex_pc = 6,
+        .values = &leaf_values,
+        .inline_frames = &callers,
+        .monitors = &leaf_monitors,
+    }}, .{ .register_count = 2, .native_register_count = 8, .max_dex_pc = 8 });
+    defer table.deinit();
+
+    var outer_registers = [_]u32{ @truncate(@as(u64, @bitCast(outer_handle))), 77 };
+    var outer_references = [_]u64{ @bitCast(outer_handle), @bitCast(Handle.none) };
+    var outer_kinds = [_]bool{ true, false };
+    var outer = Frame{
+        .method_id = 700,
+        .execution = .{
+            .pc = 2,
+            .registers = &outer_registers,
+            .instructions = &.{},
+            .reference_registers = &outer_references,
+            .register_is_ref = &outer_kinds,
+        },
+        .active = true,
+    };
+    outer.execution.managed_frame_state.held_monitors[0] = @bitCast(outer_handle);
+    outer.execution.managed_frame_state.held_monitor_count = 1;
+    outer.execution.managed_frame_state.synchronized_monitor_owned = true;
+    outer.execution.synchronized_monitor = @bitCast(outer_handle);
+
+    var leaf_registers = [_]u32{ @truncate(@as(u64, @bitCast(leaf_handle))), 77 };
+    var leaf_references = [_]u64{ @bitCast(leaf_handle), @bitCast(Handle.none) };
+    var leaf_kinds = [_]bool{ true, false };
+    var leaf = Frame{
+        .method_id = 701,
+        .execution = .{
+            .pc = 6,
+            .registers = &leaf_registers,
+            .instructions = &.{},
+            .reference_registers = &leaf_references,
+            .register_is_ref = &leaf_kinds,
+        },
+        .previous = &outer,
+        .active = true,
+    };
+    leaf.execution.managed_frame_state.held_monitors[0] = @bitCast(leaf_handle);
+    leaf.execution.managed_frame_state.held_monitor_count = 1;
+    leaf.execution.managed_frame_state.synchronized_monitor_owned = true;
+    leaf.execution.synchronized_monitor = @bitCast(leaf_handle);
+
+    var image: [8]u64 = @splat(0xfeedfacefeedface);
+    var scratch: [14]u64 = undefined;
+    try table.exportOsr(46, &leaf, .{ .native_registers = &image, .scratch = &scratch });
+    try std.testing.expectEqual(@as(u64, @bitCast(outer_handle)), image[0]);
+    try std.testing.expectEqual(@as(u64, 77), image[1]);
+    try std.testing.expectEqual(@as(u64, @bitCast(leaf_handle)), image[2]);
+
+    var monitors: [2]u64 = @splat(0);
+    try std.testing.expectEqual(@as(usize, 2), try table.copyOsrMonitors(46, &leaf, &monitors));
+    try std.testing.expectEqualSlices(u64, &.{
+        @as(u64, @bitCast(outer_handle)),
+        @as(u64, @bitCast(leaf_handle)),
+    }, &monitors);
+
+    const before = image;
+    leaf.execution.registers[1] = 78;
+    try std.testing.expectError(error.AliasedOsrRegister, table.exportOsr(46, &leaf, .{
+        .native_registers = &image,
+        .scratch = &scratch,
+    }));
+    try std.testing.expectEqualSlices(u64, &before, &image);
+
+    const monitors_before = monitors;
+    outer.method_id = 999;
+    try std.testing.expectError(error.InvalidFrameChain, table.copyOsrMonitors(46, &leaf, &monitors));
+    try std.testing.expectEqualSlices(u64, &monitors_before, &monitors);
+}
+
 fn allocationFailureProbe(allocator: std.mem.Allocator) !void {
     const values = [_]ValueSpec{
         .{ .vreg = 0, .kind = .scalar64, .source = .{ .constant = 1 } },
         .{ .vreg = 2, .kind = .scalar64, .source = .{ .constant = 2 } },
     };
-    var table = try Table.init(allocator, &.{.{ .id = 1, .method_id = 2, .dex_pc = 3, .values = &values }}, test_options);
+    const caller_values = [_]ValueSpec{
+        .{ .vreg = 0, .kind = .scalar64, .source = .{ .constant = 3 } },
+        .{ .vreg = 2, .kind = .scalar64, .source = .{ .constant = 4 } },
+    };
+    const callers = [_]InlineFrameSpec{.{
+        .method_id = 1,
+        .dex_pc = 2,
+        .register_count = 4,
+        .values = &caller_values,
+    }};
+    var table = try Table.init(allocator, &.{.{
+        .id = 1,
+        .method_id = 2,
+        .dex_pc = 3,
+        .values = &values,
+        .inline_frames = &callers,
+    }}, test_options);
     defer table.deinit();
 }
 

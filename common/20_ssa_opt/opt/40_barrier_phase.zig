@@ -611,8 +611,6 @@ fn rawBaseHandle(op: ssa.Operation) ?ssa.ValueId {
         .aget_byte,
         .aget_char,
         .aget_short,
-        .monitor_enter,
-        .monitor_exit,
         .check_cast,
         .instance_of,
         .array_length,

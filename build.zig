@@ -57,6 +57,7 @@ pub fn build(b: *std.Build) void {
     const x64_encoder = b.addModule("x64_encoder", .{ .root_source_file = b.path("common/40_backend/30_x64_encoder.zig"), .target = target, .optimize = optimize_mode });
     const x64_register_encoder = b.addModule("x64_register_encoder", .{ .root_source_file = b.path("common/40_backend/40_x64_register_encoder.zig"), .target = target, .optimize = optimize_mode });
     const x64_runtime_shim = b.addModule("x64_runtime_shim", .{ .root_source_file = b.path("common/40_backend/50_x64_runtime_shim.zig"), .target = target, .optimize = optimize_mode });
+    const x64_vector_backend = b.addModule("x64_vector_backend", .{ .root_source_file = b.path("common/40_backend/60_x64_vector_backend.zig"), .target = target, .optimize = optimize_mode });
 
     const liveness = b.addModule("liveness", .{ .root_source_file = b.path("common/50_regalloc/00_liveness.zig"), .target = target, .optimize = optimize_mode });
     const intervals = b.addModule("intervals", .{ .root_source_file = b.path("common/50_regalloc/10_intervals.zig"), .target = target, .optimize = optimize_mode });
@@ -69,7 +70,9 @@ pub fn build(b: *std.Build) void {
     const runtime_thread_registry = b.addModule("runtime_thread_registry", .{ .root_source_file = b.path("common/60_runtime/10_thread_registry.zig"), .target = target, .optimize = optimize_mode });
     const runtime_heap = b.addModule("runtime_heap", .{ .root_source_file = b.path("common/60_runtime/20_heap.zig"), .target = target, .optimize = optimize_mode });
     const runtime_gc = b.addModule("runtime_gc", .{ .root_source_file = b.path("common/60_runtime/25_gc.zig"), .target = target, .optimize = optimize_mode });
+    const runtime_monitor = b.addModule("runtime_monitor", .{ .root_source_file = b.path("common/60_runtime/27_monitor.zig"), .target = target, .optimize = optimize_mode });
     const runtime_stack_map = b.addModule("runtime_stack_map", .{ .root_source_file = b.path("common/60_runtime/30_stack_map.zig"), .target = target, .optimize = optimize_mode });
+    const runtime_method_sync = b.addModule("runtime_method_sync", .{ .root_source_file = b.path("common/60_runtime/35_method_synchronization.zig"), .target = target, .optimize = optimize_mode });
     const runtime_jit = b.addModule("runtime_jit", .{ .root_source_file = b.path("common/60_runtime/40_jit_runtime.zig"), .target = target, .optimize = optimize_mode });
     const runtime_interpreter = b.addModule("runtime_interpreter", .{ .root_source_file = b.path("common/60_runtime/45_interpreter_runtime.zig"), .target = target, .optimize = optimize_mode });
     const runtime_code_manager = b.addModule("runtime_code_manager", .{ .root_source_file = b.path("common/60_runtime/50_code_manager.zig"), .target = target, .optimize = optimize_mode });
@@ -243,9 +246,16 @@ pub fn build(b: *std.Build) void {
     runtime_gc.addImport("runtime_value", runtime_value);
     runtime_gc.addImport("runtime_heap", runtime_heap);
     runtime_gc.addImport("runtime_thread_registry", runtime_thread_registry);
+    runtime_monitor.addImport("runtime_value", runtime_value);
+    runtime_monitor.addImport("runtime_gc", runtime_gc);
+    runtime_monitor.addImport("runtime_thread_registry", runtime_thread_registry);
+    runtime_method_sync.addImport("runtime_gc", runtime_gc);
+    runtime_method_sync.addImport("runtime_value", runtime_value);
     runtime_stack_map.addImport("runtime_value", runtime_value);
     runtime_jit.addImport("runtime_value", runtime_value);
     runtime_jit.addImport("runtime_gc", runtime_gc);
+    runtime_jit.addImport("runtime_monitor", runtime_monitor);
+    runtime_jit.addImport("runtime_method_sync", runtime_method_sync);
     runtime_jit.addImport("runtime_stack_map", runtime_stack_map);
     runtime_jit.addImport("runtime_thread_registry", runtime_thread_registry);
     runtime_jit.addImport("runtime_code_manager", runtime_code_manager);
@@ -257,6 +267,9 @@ pub fn build(b: *std.Build) void {
     runtime_interpreter.addImport("interpreter", interpreter);
     runtime_interpreter.addImport("runtime_gc", runtime_gc);
     runtime_interpreter.addImport("runtime_heap", runtime_heap);
+    runtime_interpreter.addImport("runtime_monitor", runtime_monitor);
+    runtime_interpreter.addImport("runtime_method_sync", runtime_method_sync);
+    runtime_interpreter.addImport("runtime_thread_registry", runtime_thread_registry);
     runtime_interpreter.addImport("runtime_value", runtime_value);
 
     x64_runtime_shim.addImport("code_buffer", code_buffer);
@@ -266,6 +279,8 @@ pub fn build(b: *std.Build) void {
     x64_runtime_shim.addImport("runtime_gc", runtime_gc);
     x64_runtime_shim.addImport("runtime_heap", runtime_heap);
     x64_runtime_shim.addImport("runtime_jit", runtime_jit);
+    x64_runtime_shim.addImport("runtime_method_sync", runtime_method_sync);
+    x64_runtime_shim.addImport("runtime_monitor", runtime_monitor);
     x64_runtime_shim.addImport("runtime_code_manager", runtime_code_manager);
     x64_runtime_shim.addImport("runtime_deopt", runtime_deopt);
     x64_runtime_shim.addImport("runtime_stack_map", runtime_stack_map);
@@ -273,6 +288,8 @@ pub fn build(b: *std.Build) void {
     x64_runtime_shim.addImport("runtime_value", runtime_value);
     x64_runtime_shim.addImport("x64_register_encoder", x64_register_encoder);
     x64_runtime_shim.addImport("instructions", instructions);
+    x64_vector_backend.addImport("code_buffer", code_buffer);
+    x64_vector_backend.addImport("jit_memory", jit_memory);
 
     storage.addImport("lock", lock);
     actor_runtime.addImport("scheduler", scheduler);
@@ -313,6 +330,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "x64_encoder", .module = x64_encoder },
         .{ .name = "x64_register_encoder", .module = x64_register_encoder },
         .{ .name = "x64_runtime_shim", .module = x64_runtime_shim },
+        .{ .name = "x64_vector_backend", .module = x64_vector_backend },
         .{ .name = "liveness", .module = liveness },
         .{ .name = "intervals", .module = intervals },
         .{ .name = "linear_scan", .module = linear_scan },
@@ -323,7 +341,9 @@ pub fn build(b: *std.Build) void {
         .{ .name = "runtime_thread_registry", .module = runtime_thread_registry },
         .{ .name = "runtime_heap", .module = runtime_heap },
         .{ .name = "runtime_gc", .module = runtime_gc },
+        .{ .name = "runtime_monitor", .module = runtime_monitor },
         .{ .name = "runtime_stack_map", .module = runtime_stack_map },
+        .{ .name = "runtime_method_sync", .module = runtime_method_sync },
         .{ .name = "runtime_jit", .module = runtime_jit },
         .{ .name = "runtime_interpreter", .module = runtime_interpreter },
         .{ .name = "runtime_code_manager", .module = runtime_code_manager },
@@ -429,4 +449,20 @@ pub fn build(b: *std.Build) void {
             previous_runtime_test,
         );
     }
+
+    const vector_test_step = b.step("test-vector", "Run x86-64 platform vector backend tests");
+    addModuleTest(b, vector_test_step, x64_vector_backend, test_filters);
+
+    const interpreter_runtime_test_step = b.step("test-interpreter-runtime", "Run interpreter managed-runtime integration tests");
+    addModuleTest(b, interpreter_runtime_test_step, interpreter, test_filters);
+    addModuleTest(b, interpreter_runtime_test_step, runtime_monitor, test_filters);
+    addModuleTest(b, interpreter_runtime_test_step, runtime_interpreter, test_filters);
+
+    const jit_runtime_test_step = b.step("test-jit-runtime", "Run managed JIT runtime and x86-64 shim tests");
+    addModuleTest(b, jit_runtime_test_step, runtime_jit, test_filters);
+    addModuleTest(b, jit_runtime_test_step, x64_runtime_shim, test_filters);
+
+    const cfg_root_map_test_step = b.step("test-cfg-root-maps", "Run CFG coverage and precise root-map tests");
+    addModuleTest(b, cfg_root_map_test_step, machine_bridge, test_filters);
+    addModuleTest(b, cfg_root_map_test_step, runtime_stack_map, test_filters);
 }

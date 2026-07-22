@@ -35,6 +35,8 @@ pub const VerifyError = error{
 
 pub const RegId = u32;
 pub const INVALID_REG: RegId = std.math.maxInt(RegId);
+pub const FloatOperation = lowering.FloatOperation;
+pub const ValueType = typedir.Type;
 
 pub const Opcode = enum(u8) {
     mov,
@@ -77,6 +79,8 @@ pub const Opcode = enum(u8) {
     call_static,
     call_virtual,
     call_quick,
+    monitor_enter,
+    monitor_exit,
     jump,
     branch,
     switch_,
@@ -111,6 +115,7 @@ pub const Inst = struct {
     false_target: ?cfg.BlockId = null,
     condition: ?Condition = null,
     imm: i64 = 0,
+    float_op: ?FloatOperation = null,
     field_idx: ?u32 = null,
     address: ?RegId = null,
     state_handle: ?RegId = null,
@@ -118,6 +123,7 @@ pub const Inst = struct {
     resolve_id: ?u32 = null,
     guard_site_id: ?u32 = null,
     exception_site_id: ?u32 = null,
+    monitor_site_id: ?u32 = null,
     pre_write: barrier_phase.PreWriteBarrier = .none,
     post_write: barrier_phase.PostWriteBarrier = .none,
     flags: Flags = .{},
@@ -151,9 +157,19 @@ pub const Stats = struct {
     resolves: u32 = 0,
     loop_epoch_guards: u32 = 0,
     bounds_exception_sites: u32 = 0,
+    monitor_sites: u32 = 0,
     pointer_accesses: u32 = 0,
     forwarded: u32 = 0,
     cse: u32 = 0,
+};
+
+pub const CoverageStats = struct {
+    reachable_blocks: u32 = 0,
+    cfg_edges: u32 = 0,
+    join_blocks: u32 = 0,
+    loop_edges: u32 = 0,
+    phi_edge_moves: u32 = 0,
+    safepoint_sites: u32 = 0,
 };
 
 pub const Function = struct {
@@ -186,7 +202,140 @@ pub const Function = struct {
         self.* = undefined;
     }
 
+    /// Proves that machine blocks are an exact reachable projection of the
+    /// source CFG and that every logical safepoint id is present exactly once.
+    /// Root-map construction relies on this proof before solving multi-block
+    /// liveness, especially at phi joins and loop backedges.
+    pub fn verifyCoverage(self: *const Function, allocator: std.mem.Allocator) VerifyError!CoverageStats {
+        const graph = self.source.source.graph;
+        if (self.blocks.len == 0 or graph.entry >= self.blocks.len or
+            graph.blocks.len != self.blocks.len or self.successors.len != self.blocks.len or
+            self.source.source.blocks.len != self.blocks.len) return error.BadBlock;
+
+        const reachable = try allocator.alloc(bool, self.blocks.len);
+        defer allocator.free(reachable);
+        @memset(reachable, false);
+        const work = try allocator.alloc(cfg.BlockId, self.blocks.len);
+        defer allocator.free(work);
+        var head: usize = 0;
+        var tail: usize = 0;
+        work[tail] = graph.entry;
+        reachable[graph.entry] = true;
+        tail += 1;
+
+        var stats: CoverageStats = .{};
+        while (head < tail) : (head += 1) {
+            const block_id = work[head];
+            if (block_id >= self.blocks.len) return error.BadBlock;
+            stats.reachable_blocks += 1;
+            const machine_successors = self.successors[block_id];
+            const graph_block = graph.blocks[block_id];
+            if (!std.mem.eql(cfg.BlockId, machine_successors, graph_block.successors)) return error.BadBlock;
+            if (graph_block.predecessors.len > 1) stats.join_blocks += 1;
+            for (machine_successors, 0..) |successor, successor_index| {
+                if (successor >= self.blocks.len) return error.BadBlock;
+                for (machine_successors[0..successor_index]) |previous| {
+                    if (previous == successor) return error.BadBlock;
+                }
+                stats.cfg_edges += 1;
+                if (self.source.source.tree.dominates(successor, block_id)) stats.loop_edges += 1;
+                if (!reachable[successor]) {
+                    if (tail >= work.len) return error.BadBlock;
+                    reachable[successor] = true;
+                    work[tail] = successor;
+                    tail += 1;
+                }
+            }
+        }
+        for (reachable) |is_reachable| if (!is_reachable) return error.BadBlock;
+
+        for (self.blocks) |block| {
+            if (block.id >= self.blocks.len or block.id != graph.blocks[block.id].id) return error.BadBlock;
+            for (block.insts) |inst| {
+                if (inst.target) |target| if (!hasLocalSuccessor(self.successors, block.id, target)) return error.BadInstruction;
+                if (inst.false_target) |target| if (!hasLocalSuccessor(self.successors, block.id, target)) return error.BadInstruction;
+            }
+        }
+
+        for (graph.blocks) |from_block| {
+            for (from_block.successors) |to| {
+                var expected_moves: usize = 0;
+                for (self.source.source.blocks[to].phis) |phi| {
+                    for (phi.incoming) |incoming| {
+                        if (incoming.pred == from_block.id) expected_moves += 1;
+                    }
+                }
+                var matching_edges: usize = 0;
+                for (self.edges) |edge| {
+                    if (edge.from != from_block.id or edge.to != to) continue;
+                    matching_edges += 1;
+                    if (edge.moves.len != expected_moves) return error.BadEdgeMove;
+                    for (edge.moves, 0..) |move, move_index| {
+                        if (move.dst >= self.reg_types.len or move.src >= self.reg_types.len or
+                            move.ty != self.reg_types[move.dst]) return error.BadEdgeMove;
+                        for (edge.moves[0..move_index]) |previous| {
+                            if (previous.dst == move.dst) return error.BadEdgeMove;
+                        }
+                        var found = false;
+                        for (self.source.source.blocks[to].phis) |phi| {
+                            if (phi.dest != move.dst) continue;
+                            for (phi.incoming) |incoming| {
+                                if (incoming.pred == from_block.id and incoming.value == move.src) {
+                                    found = true;
+                                    break;
+                                }
+                            }
+                            if (found) break;
+                        }
+                        if (!found) return error.BadEdgeMove;
+                    }
+                    stats.phi_edge_moves += @intCast(edge.moves.len);
+                }
+                if (matching_edges != @intFromBool(expected_moves != 0)) return error.BadEdgeMove;
+            }
+        }
+        for (self.edges) |edge| {
+            if (!hasLocalSuccessor(self.successors, edge.from, edge.to)) return error.BadEdgeMove;
+        }
+
+        const resolve_and_guards = std.math.add(u32, self.stats.resolves, self.stats.loop_epoch_guards) catch return error.BadInstruction;
+        const monitors_end = std.math.add(u32, resolve_and_guards, self.stats.monitor_sites) catch return error.BadInstruction;
+        const total_sites = std.math.add(u32, monitors_end, self.stats.bounds_exception_sites) catch return error.BadInstruction;
+        const seen_sites = try allocator.alloc(bool, total_sites);
+        defer allocator.free(seen_sites);
+        @memset(seen_sites, false);
+        for (self.blocks) |block| {
+            for (block.insts) |inst| {
+                const site = if (inst.opcode == .resolve_handle)
+                    inst.resolve_id
+                else if (inst.opcode == .loop_epoch_guard)
+                    inst.guard_site_id
+                else if (inst.opcode == .check_bounds and inst.exception_site_id != null)
+                    inst.exception_site_id
+                else if (inst.opcode == .monitor_enter or inst.opcode == .monitor_exit)
+                    inst.monitor_site_id
+                else
+                    null;
+                if (site) |site_id| {
+                    if (site_id >= total_sites or seen_sites[site_id]) return error.BadInstruction;
+                    if (inst.opcode == .resolve_handle and site_id >= self.stats.resolves) return error.BadInstruction;
+                    if (inst.opcode == .loop_epoch_guard and
+                        (site_id < self.stats.resolves or site_id >= resolve_and_guards)) return error.BadInstruction;
+                    if ((inst.opcode == .monitor_enter or inst.opcode == .monitor_exit) and
+                        (site_id < resolve_and_guards or site_id >= monitors_end)) return error.BadInstruction;
+                    if (inst.opcode == .check_bounds and site_id < monitors_end) return error.BadInstruction;
+                    seen_sites[site_id] = true;
+                    stats.safepoint_sites += 1;
+                }
+            }
+        }
+        for (seen_sites) |seen| if (!seen) return error.BadInstruction;
+        if (stats.safepoint_sites != total_sites) return error.BadInstruction;
+        return stats;
+    }
+
     pub fn verify(self: *const Function) VerifyError!void {
+        _ = try self.verifyCoverage(self.allocator);
         if (self.reg_types.len != self.runtime_values.len or self.value_kinds.len != self.source.source.values.len or self.successors.len != self.blocks.len) return error.InvalidLowering;
 
         var defined = try self.allocator.alloc(bool, self.reg_types.len);
@@ -220,15 +369,17 @@ pub const Function = struct {
         }
 
         const barriers = self.source.barriers;
-        const exception_site_base: u32 = if (barriers) |plan|
+        const monitor_site_base: u32 = if (barriers) |plan|
             std.math.add(u32, @intCast(plan.resolves.len), plan.stats.loop_epoch_guards) catch return error.BadInstruction
         else
             0;
+        const exception_site_base = std.math.add(u32, monitor_site_base, self.stats.monitor_sites) catch return error.BadInstruction;
         const loop_guard_count: u32 = if (barriers) |plan| plan.stats.loop_epoch_guards else 0;
         const loop_guard_seen = try self.allocator.alloc(bool, loop_guard_count);
         defer self.allocator.free(loop_guard_seen);
         @memset(loop_guard_seen, false);
         var verified_exception_sites: u32 = 0;
+        var verified_monitor_sites: u32 = 0;
         for (self.blocks, 0..) |block, i| {
             if (block.id != i) return error.BadBlock;
             for (block.insts) |inst| {
@@ -261,8 +412,13 @@ pub const Function = struct {
                     },
                     .check_bounds, .field_load_ptr, .field_store_ptr, .array_load_ptr, .array_store_ptr, .satb_pre_write, .card_mark => if (inst.address != null) try self.verifyAddress(inst),
                     .call_direct, .call_static, .call_virtual, .call_quick => if (inst.address != null) try self.verifyAddress(inst),
+                    .monitor_enter, .monitor_exit => {
+                        if (inst.address != null or inst.state_handle == null or inst.reloc_token != null or inst.resolve_id != null or
+                            !self.isGcRoot(inst.state_handle.?)) return error.BadInstruction;
+                    },
                     else => {},
                 }
+                if ((inst.opcode == .f32_op or inst.opcode == .f64_op) != (inst.float_op != null)) return error.BadInstruction;
                 for (inst.uses) |use| switch (self.runtime_values[use]) {
                     .dalvik => {},
                     .derived_ptr => return error.BadInstruction,
@@ -284,9 +440,18 @@ pub const Function = struct {
                     else => false,
                 };
                 if (inst.address != null and !permits_address) return error.BadInstruction;
-                if (inst.address == null and inst.state_handle != null and inst.opcode != .resolve_handle) return error.BadInstruction;
+                if (inst.address == null and inst.state_handle != null and inst.opcode != .resolve_handle and
+                    inst.opcode != .monitor_enter and inst.opcode != .monitor_exit) return error.BadInstruction;
                 if (inst.address == null and inst.opcode != .resolve_handle and (inst.reloc_token != null or inst.resolve_id != null)) return error.BadInstruction;
                 if ((inst.opcode == .loop_epoch_guard) != (inst.guard_site_id != null)) return error.BadInstruction;
+                const is_monitor = inst.opcode == .monitor_enter or inst.opcode == .monitor_exit;
+                if (is_monitor != (inst.monitor_site_id != null)) return error.BadInstruction;
+                if (is_monitor) {
+                    const expected = std.math.add(u32, monitor_site_base, verified_monitor_sites) catch return error.BadInstruction;
+                    if (inst.monitor_site_id.? != expected or inst.defs.len != 0 or inst.uses.len != 1 or
+                        inst.state_handle == null or inst.uses[0] != inst.state_handle.?) return error.BadInstruction;
+                    verified_monitor_sites += 1;
+                }
                 const is_mapped_bounds = inst.opcode == .check_bounds and inst.address != null;
                 if (is_mapped_bounds != (inst.exception_site_id != null)) return error.BadInstruction;
                 if (is_mapped_bounds) {
@@ -312,6 +477,8 @@ pub const Function = struct {
         }
         if (verified_exception_sites != self.stats.bounds_exception_sites or
             verified_exception_sites != self.source.stats.bounds_exception_sites) return error.BadInstruction;
+        if (verified_monitor_sites != self.stats.monitor_sites or
+            verified_monitor_sites != self.source.stats.monitor_sites) return error.BadInstruction;
     }
 
     fn verifyResolve(self: *const Function, inst: Inst) VerifyError!void {
@@ -486,6 +653,8 @@ fn mapOpcode(kind: lowering.Kind) ?Opcode {
         .call_static => .call_static,
         .call_virtual => .call_virtual,
         .call_quick => .call_quick,
+        .monitor_enter => .monitor_enter,
+        .monitor_exit => .monitor_exit,
         .branch => .jump,
         .cond_branch => .branch,
         .switch_ => .switch_,
@@ -565,6 +734,7 @@ fn updateStats(inst: Inst, stats: *Stats) void {
         .const_i32, .const_i64 => stats.constants += 1,
         .jump, .branch, .switch_ => stats.branches += 1,
         .call_direct, .call_static, .call_virtual, .call_quick => stats.calls += 1,
+        .monitor_enter, .monitor_exit => stats.monitor_sites += 1,
         .check_null => stats.checks += 1,
         .check_bounds => {
             stats.checks += 1;
@@ -579,6 +749,85 @@ fn updateStats(inst: Inst, stats: *Stats) void {
     if (inst.flags.cse) stats.cse += 1;
 }
 
+fn setMachineType(reg_types: []typedir.Type, reg: RegId, ty: typedir.Type) Error!void {
+    if (reg >= reg_types.len) return error.InvalidLowering;
+    const current = reg_types[reg];
+    if (current == ty) return;
+    if (current == .unknown or
+        (current == .int and ty == .float) or
+        (current == .long and ty == .double))
+    {
+        reg_types[reg] = ty;
+        return;
+    }
+    return error.InvalidLowering;
+}
+
+/// Dalvik constants and incoming parameters are physically untyped bit
+/// patterns. Once scalar arithmetic consumes them, specialize their machine
+/// register class before interval construction so GP and XMM values can never
+/// share an incorrectly classified allocation.
+fn refineScalarXmmTypes(reg_types: []typedir.Type, source: *const lowering.Function) Error!void {
+    for (source.blocks) |block| for (block.insts) |inst| {
+        const operation = inst.float_op orelse continue;
+        const ty: typedir.Type = switch (inst.kind) {
+            .f32_op => .float,
+            .f64_op => .double,
+            else => return error.InvalidLowering,
+        };
+        switch (operation) {
+            .add, .sub, .mul, .div, .rem, .neg => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, ty);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, ty);
+            },
+            .compare_l, .compare_g => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .int);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, ty);
+            },
+            .int_to_float => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .float);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .int);
+            },
+            .int_to_double => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .double);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .int);
+            },
+            .long_to_float => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .float);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .long);
+            },
+            .long_to_double => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .double);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .long);
+            },
+            .float_to_int => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .int);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .float);
+            },
+            .float_to_long => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .long);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .float);
+            },
+            .float_to_double => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .double);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .float);
+            },
+            .double_to_int => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .int);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .double);
+            },
+            .double_to_long => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .long);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .double);
+            },
+            .double_to_float => {
+                for (inst.defs) |reg| try setMachineType(reg_types, reg, .float);
+                for (inst.uses) |reg| try setMachineType(reg_types, reg, .double);
+            },
+        }
+    };
+}
+
 pub fn build(allocator: std.mem.Allocator, source: *const lowering.Function) Error!Function {
     source.verify() catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -587,6 +836,7 @@ pub fn build(allocator: std.mem.Allocator, source: *const lowering.Function) Err
 
     const reg_types = try allocator.dupe(typedir.Type, source.value_types);
     errdefer allocator.free(reg_types);
+    try refineScalarXmmTypes(reg_types, source);
     const runtime_values = try allocator.dupe(lowering.RuntimeValueClass, source.runtime_values);
     errdefer allocator.free(runtime_values);
 
@@ -690,6 +940,7 @@ pub fn build(allocator: std.mem.Allocator, source: *const lowering.Function) Err
                 .false_target = lowered.false_target,
                 .condition = if (opcode == .branch) conditionForLowered(source, lowered) else null,
                 .imm = lowered.imm,
+                .float_op = lowered.float_op,
                 .field_idx = lowered.field_idx,
                 .address = lowered.address,
                 .state_handle = lowered.state_handle,
@@ -697,6 +948,7 @@ pub fn build(allocator: std.mem.Allocator, source: *const lowering.Function) Err
                 .resolve_id = lowered.resolve_id,
                 .guard_site_id = lowered.guard_site_id,
                 .exception_site_id = lowered.exception_site_id,
+                .monitor_site_id = lowered.monitor_site_id,
                 .pre_write = lowered.pre_write,
                 .post_write = lowered.post_write,
                 .flags = flagsFrom(lowered),
@@ -850,4 +1102,101 @@ test "machine_bridge print helper emits stable summary" {
     const output = stream.buffered();
     try std.testing.expect(std.mem.indexOf(u8, output, "machine_bridge blocks=") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "ret") != null);
+}
+
+test "machine coverage proves joins loop backedges and complete phi edges" {
+    const join_insts = [_]Instruction{
+        .{ .const_ = .{ .dest = 0, .value = 1 } },
+        .{ .if_eqz = .{ .src = 0, .offset = 2 } },
+        .{ .const_ = .{ .dest = 1, .value = 10 } },
+        .{ .goto_ = .{ .offset = 2 } },
+        .{ .const_ = .{ .dest = 1, .value = 20 } },
+        .{ .return_ = .{ .src = 1 } },
+    };
+    var join_pipeline: TestPipeline = undefined;
+    try initTestPipeline(std.testing.allocator, &join_insts, &join_pipeline);
+    defer join_pipeline.deinit();
+    var join_machine = try build(std.testing.allocator, &join_pipeline.lowered);
+    defer join_machine.deinit();
+    const join_coverage = try join_machine.verifyCoverage(std.testing.allocator);
+    try std.testing.expect(join_coverage.join_blocks >= 1);
+    try std.testing.expect(join_coverage.phi_edge_moves >= 2);
+    try std.testing.expectEqual(@as(u32, @intCast(join_pipeline.graph.blocks.len)), join_coverage.reachable_blocks);
+
+    const loop_insts = [_]Instruction{
+        .{ .const_ = .{ .dest = 0, .value = 0 } },
+        .{ .const_ = .{ .dest = 1, .value = 1 } },
+        .{ .const_ = .{ .dest = 2, .value = 3 } },
+        .{ .add_int = .{ .dest = 0, .src1 = 0, .src2 = 1 } },
+        .{ .if_lt = .{ .src1 = 0, .src2 = 2, .offset = -1 } },
+        .{ .return_ = .{ .src = 0 } },
+    };
+    var loop_pipeline: TestPipeline = undefined;
+    try initTestPipeline(std.testing.allocator, &loop_insts, &loop_pipeline);
+    defer loop_pipeline.deinit();
+    var loop_machine = try build(std.testing.allocator, &loop_pipeline.lowered);
+    defer loop_machine.deinit();
+    const loop_coverage = try loop_machine.verifyCoverage(std.testing.allocator);
+    try std.testing.expect(loop_coverage.loop_edges >= 1);
+    try std.testing.expect(loop_coverage.join_blocks >= 1);
+    try std.testing.expect(loop_coverage.phi_edge_moves >= 2);
+}
+
+test "machine coverage rejects CFG phi and safepoint holes" {
+    const insts = [_]Instruction{
+        .{ .const_ = .{ .dest = 0, .value = 1 } },
+        .{ .if_eqz = .{ .src = 0, .offset = 2 } },
+        .{ .const_ = .{ .dest = 1, .value = 10 } },
+        .{ .goto_ = .{ .offset = 2 } },
+        .{ .const_ = .{ .dest = 1, .value = 20 } },
+        .{ .return_ = .{ .src = 1 } },
+    };
+    var pipeline: TestPipeline = undefined;
+    try initTestPipeline(std.testing.allocator, &insts, &pipeline);
+    defer pipeline.deinit();
+    var machine = try build(std.testing.allocator, &pipeline.lowered);
+    defer machine.deinit();
+    _ = try machine.verifyCoverage(std.testing.allocator);
+
+    const entry = pipeline.graph.entry;
+    const saved_successor = machine.successors[entry][0];
+    machine.successors[entry][0] = entry;
+    try std.testing.expectError(error.BadBlock, machine.verifyCoverage(std.testing.allocator));
+    machine.successors[entry][0] = saved_successor;
+
+    try std.testing.expect(machine.edges.len != 0 and machine.edges[0].moves.len != 0);
+    const saved_source = machine.edges[0].moves[0].src;
+    machine.edges[0].moves[0].src = @intCast(machine.reg_types.len);
+    try std.testing.expectError(error.BadEdgeMove, machine.verifyCoverage(std.testing.allocator));
+    machine.edges[0].moves[0].src = saved_source;
+
+    machine.stats.resolves += 1;
+    try std.testing.expectError(error.BadInstruction, machine.verifyCoverage(std.testing.allocator));
+    machine.stats.resolves -= 1;
+    _ = try machine.verifyCoverage(std.testing.allocator);
+}
+
+fn coverageAllocationFailureProbe(allocator: std.mem.Allocator) !void {
+    const insts = [_]Instruction{
+        .{ .const_ = .{ .dest = 0, .value = 0 } },
+        .{ .const_ = .{ .dest = 1, .value = 1 } },
+        .{ .const_ = .{ .dest = 2, .value = 2 } },
+        .{ .add_int = .{ .dest = 0, .src1 = 0, .src2 = 1 } },
+        .{ .if_lt = .{ .src1 = 0, .src2 = 2, .offset = -1 } },
+        .{ .return_ = .{ .src = 0 } },
+    };
+    var pipeline: TestPipeline = undefined;
+    try initTestPipeline(allocator, &insts, &pipeline);
+    defer pipeline.deinit();
+    var machine = try build(allocator, &pipeline.lowered);
+    defer machine.deinit();
+    _ = try machine.verifyCoverage(allocator);
+}
+
+test "machine CFG coverage is leak free at every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        coverageAllocationFailureProbe,
+        .{},
+    );
 }
