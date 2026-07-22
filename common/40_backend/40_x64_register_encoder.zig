@@ -55,6 +55,9 @@ pub const DeoptMonitorSpec = struct {
 };
 
 pub const DeoptInlineFrameSpec = struct {
+    /// Stable compiler activation identity. Method ids alone are insufficient
+    /// because recursive inlining may contain the same method more than once.
+    activation_id: u32,
     method_id: u32,
     dex_pc: u32,
     register_count: u16,
@@ -73,10 +76,25 @@ pub const DeoptPointSpec = struct {
     method_id: u32,
     dex_pc: u32,
     values: []const DeoptValueSpec,
+    /// Leaf identity in the compiler-owned inline activation tree. Zero is the
+    /// non-inlined root activation and requires an empty caller chain.
+    activation_id: u32 = 0,
     /// Outer-to-inner caller activations materialized before the leaf frame.
     inline_frames: []const DeoptInlineFrameSpec = &.{},
     /// Held monitors acquired by the leaf activation, in acquisition order.
     monitors: []const DeoptMonitorSpec = &.{},
+};
+
+/// One immutable activation created by the compiler's call-inlining planner.
+/// `parent_dex_pc` is the bytecode position at which the parent resumes if this
+/// activation deoptimizes. IDs are compilation-local and sorted; parent IDs
+/// must precede children, making the provenance graph acyclic by construction.
+pub const InlineActivationSpec = struct {
+    id: u32,
+    parent_id: u32,
+    method_id: u32,
+    register_count: u16,
+    parent_dex_pc: u32,
 };
 
 pub const DeoptOptions = struct {
@@ -89,6 +107,9 @@ pub const DeoptOptions = struct {
     /// Sorted monitor-enter safepoint ids that open synchronized inlined
     /// regions. Unlisted monitor-enter operations are explicit bytecode locks.
     synchronized_monitor_enter_sites: []const u32 = &.{},
+    /// Compiler-owned activation namespace used to authenticate every supplied
+    /// inline frame chain. Empty is valid only when every point is non-inlined.
+    inline_activations: []const InlineActivationSpec = &.{},
 };
 
 pub const OsrEntrySpec = struct {
@@ -216,6 +237,7 @@ pub const Stats = struct {
     edge_copy_cycles: u32 = 0,
     deopt_points: u32 = 0,
     deopt_frames: u32 = 0,
+    deopt_inline_activations: u32 = 0,
     deopt_values: u32 = 0,
     deopt_monitors: u32 = 0,
     deopt_xmm_values: u32 = 0,
@@ -3213,6 +3235,79 @@ fn pointMonitorCount(point: DeoptPointSpec) Error!usize {
     return count;
 }
 
+fn findInlineActivation(activations: []const InlineActivationSpec, id: u32) ?usize {
+    var low: usize = 0;
+    var high = activations.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const candidate = activations[middle].id;
+        if (candidate < id) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low >= activations.len or activations[low].id != id) return null;
+    return low;
+}
+
+/// Cross-checks deoptimization frame maps against the compiler's independent
+/// activation namespace. This proof runs before register allocation metadata is
+/// translated or executable bytes are published.
+fn validateInlineActivations(allocator: std.mem.Allocator, options: DeoptOptions) Error!void {
+    const activations = options.inline_activations;
+    for (activations, 0..) |activation, index| {
+        if (activation.id == 0 or activation.register_count == 0 or activation.parent_dex_pc > options.max_dex_pc) {
+            return error.InvalidDeoptMetadata;
+        }
+        if (index != 0 and activations[index - 1].id >= activation.id) return error.InvalidDeoptMetadata;
+        if (activation.parent_id != 0) {
+            if (activation.parent_id >= activation.id) return error.InvalidDeoptMetadata;
+            const parent_index = findInlineActivation(activations[0..index], activation.parent_id) orelse
+                return error.InvalidDeoptMetadata;
+            if (parent_index >= index) return error.InvalidDeoptMetadata;
+        }
+    }
+
+    const used = try allocator.alloc(bool, activations.len);
+    defer allocator.free(used);
+    @memset(used, false);
+    for (options.points) |point| {
+        if (point.activation_id == 0) {
+            if (point.inline_frames.len != 0) return error.InvalidDeoptMetadata;
+            continue;
+        }
+        if (point.inline_frames.len == 0) return error.InvalidDeoptMetadata;
+        var activation_index = findInlineActivation(activations, point.activation_id) orelse
+            return error.InvalidDeoptMetadata;
+        var activation = activations[activation_index];
+        if (activation.method_id != point.method_id or activation.register_count != options.register_count) {
+            return error.InvalidDeoptMetadata;
+        }
+        used[activation_index] = true;
+
+        var reverse_index = point.inline_frames.len;
+        while (reverse_index != 0) {
+            reverse_index -= 1;
+            const frame = point.inline_frames[reverse_index];
+            if (activation.parent_id == 0 or frame.activation_id != activation.parent_id or
+                frame.dex_pc != activation.parent_dex_pc)
+            {
+                return error.InvalidDeoptMetadata;
+            }
+            activation_index = findInlineActivation(activations, activation.parent_id) orelse
+                return error.InvalidDeoptMetadata;
+            activation = activations[activation_index];
+            if (activation.method_id != frame.method_id or activation.register_count != frame.register_count) {
+                return error.InvalidDeoptMetadata;
+            }
+            used[activation_index] = true;
+        }
+        if (activation.parent_id != 0) return error.InvalidDeoptMetadata;
+    }
+    for (used) |is_used| if (!is_used) return error.InvalidDeoptMetadata;
+}
+
 fn validatePointMonitorState(point: DeoptPointSpec, state: MonitorRegionState) Error!void {
     if (try pointMonitorCount(point) != state.depth) return error.InvalidDeoptMetadata;
     var cursor: usize = 0;
@@ -3367,6 +3462,9 @@ fn buildDeoptTable(
     try validateSpillPlan(source, allocation, spill_plan);
     const deopt = options orelse return null;
     if (deopt.points.len == 0 or deopt.register_count == 0) return error.InvalidDeoptMetadata;
+    try validateInlineActivations(allocator, deopt);
+    if (deopt.inline_activations.len > std.math.maxInt(u32)) return error.InvalidDeoptMetadata;
+    stats.deopt_inline_activations = @intCast(deopt.inline_activations.len);
     try validateDeoptMonitorRegions(allocator, source, deopt);
     const maps = root_maps orelse return error.MissingDeoptSafepoint;
     var value_liveness = try buildLiveness(allocator, source, false);
@@ -3564,8 +3662,8 @@ fn osrLandingSiteId(source: *const machine.Function, deopt: ?DeoptOptions, entry
 fn validateOsrLiveRegister(
     source: *const machine.Function,
     allocation: *const regalloc.Allocation,
-    mapped_values: []const runtime_deopt.ValueSpec,
-    mapped_monitors: []const runtime_deopt.MonitorSpec,
+    table: *const runtime_deopt.Table,
+    frames: []const runtime_deopt.FrameRecord,
     osr_block: cfg.BlockId,
     reg: machine.RegId,
 ) Error!void {
@@ -3581,16 +3679,18 @@ fn validateOsrLiveRegister(
     if (value_id >= source.source.source.values.len) return error.InvalidDeoptMetadata;
     const vreg = source.source.source.values[value_id].reg;
     const physical = try x64Reg(try physOf(allocation, reg));
-    for (mapped_monitors) |monitor| switch (monitor.source) {
-        .native_register => |mapped| if (mapped == physical) return,
-        else => {},
-    };
-    for (mapped_values) |value| {
-        const width = value.kind.registerWidth();
-        if (vreg < value.vreg or vreg >= value.vreg + width) continue;
-        switch (value.source) {
+    for (frames) |frame| {
+        for (table.monitorsForFrame(frame)) |monitor| switch (monitor.source) {
             .native_register => |mapped| if (mapped == physical) return,
             else => {},
+        };
+        for (table.valuesForFrame(frame)) |value| {
+            const width = value.kind.registerWidth();
+            if (vreg < value.vreg or vreg >= value.vreg + width) continue;
+            switch (value.source) {
+                .native_register => |mapped| if (mapped == physical) return,
+                else => {},
+            }
         }
     }
     return error.InvalidDeoptMetadata;
@@ -3851,7 +3951,6 @@ fn buildOsrEntries(
         }
         const selected_index = point_index orelse return error.InvalidDeoptMetadata;
         const deopt_point = options.points[selected_index];
-        if (deopt_point.inline_frames.len != 0) return error.InvalidDeoptMetadata;
         const safepoint = try resolveDeoptPosition(source, options, selected_index);
         if (safepoint.block != spec.block or safepoint.pc != deopt_point.dex_pc) {
             return error.InvalidDeoptMetadata;
@@ -3866,16 +3965,16 @@ fn buildOsrEntries(
         }
         if (!natural_loop) return error.InvalidDeoptMetadata;
         const record = deopt_table.find(spec.point_id) catch return error.InvalidDeoptMetadata;
-        const mapped_values = deopt_table.valuesFor(record);
         const deopt_frames = deopt_table.framesFor(record);
-        if (deopt_frames.len != 1) return error.InvalidDeoptMetadata;
-        const mapped_monitors = deopt_table.monitorsForFrame(deopt_frames[0]);
-        try validateOsrMappedSources(mapped_values);
-        try validateOsrMonitorSources(mapped_monitors);
+        if (deopt_frames.len != deopt_point.inline_frames.len + 1) return error.InvalidDeoptMetadata;
+        for (deopt_frames) |frame| {
+            try validateOsrMappedSources(deopt_table.valuesForFrame(frame));
+            try validateOsrMonitorSources(deopt_table.monitorsForFrame(frame));
+        }
         for (0..source.reg_types.len) |reg_index| {
             const reg: machine.RegId = @intCast(reg_index);
             if (try osrRegisterReadBeforeDefinition(allocator, source, safepoint, reg)) {
-                try validateOsrLiveRegister(source, allocation, mapped_values, mapped_monitors, spec.block, reg);
+                try validateOsrLiveRegister(source, allocation, deopt_table, deopt_frames, spec.block, reg);
             }
         }
         const offset = try buffer.labelOffset(osr_labels[entry_index]);
@@ -3912,7 +4011,22 @@ fn collectOsrRequiredRegisters(
         }
         const selected_index = point_index orelse return error.InvalidDeoptMetadata;
         const deopt_point = options.points[selected_index];
-        if (deopt_point.inline_frames.len != 0) return error.InvalidDeoptMetadata;
+        for (deopt_point.inline_frames) |frame| {
+            for (frame.values) |value| switch (value.source) {
+                .machine_register => |reg| {
+                    if (reg >= source.reg_types.len) return error.InvalidDeoptMetadata;
+                    try appendUniqueRegister(&required, allocator, reg);
+                },
+                .constant => {},
+            };
+            for (frame.monitors) |monitor| switch (monitor.source) {
+                .machine_register => |reg| {
+                    if (reg >= source.reg_types.len or !source.isGcRoot(reg)) return error.InvalidDeoptMetadata;
+                    try appendUniqueRegister(&required, allocator, reg);
+                },
+                .constant => return error.InvalidDeoptMetadata,
+            };
+        }
         for (deopt_point.values) |value| switch (value.source) {
             .machine_register => |reg| {
                 if (reg >= source.reg_types.len) return error.InvalidDeoptMetadata;
@@ -4335,6 +4449,48 @@ fn expectBinaryI32(insts: []const Instruction, a: i32, b: i32, expected: i32) !v
     const allocation = try cache.addBytes(bytes);
     const Fn = fn (i32, i32) callconv(.c) i32;
     try std.testing.expectEqual(expected, allocation.typedEntry(Fn)(a, b));
+}
+
+test "inline activation provenance distinguishes recursive frames and rejects orphans" {
+    const callers = [_]DeoptInlineFrameSpec{.{
+        .activation_id = 1,
+        .method_id = 7,
+        .dex_pc = 3,
+        .register_count = 1,
+        .values = &.{},
+    }};
+    const points = [_]DeoptPointSpec{.{
+        .id = 1,
+        .method_id = 7,
+        .dex_pc = 4,
+        .values = &.{},
+        .activation_id = 2,
+        .inline_frames = &callers,
+    }};
+    const recursive = [_]InlineActivationSpec{
+        .{ .id = 1, .parent_id = 0, .method_id = 7, .register_count = 1, .parent_dex_pc = 0 },
+        .{ .id = 2, .parent_id = 1, .method_id = 7, .register_count = 1, .parent_dex_pc = 3 },
+    };
+    try validateInlineActivations(std.testing.allocator, .{
+        .points = &points,
+        .register_count = 1,
+        .max_dex_pc = 4,
+        .inline_activations = &recursive,
+    });
+
+    const orphaned = recursive ++ [_]InlineActivationSpec{.{
+        .id = 3,
+        .parent_id = 1,
+        .method_id = 8,
+        .register_count = 1,
+        .parent_dex_pc = 2,
+    }};
+    try std.testing.expectError(error.InvalidDeoptMetadata, validateInlineActivations(std.testing.allocator, .{
+        .points = &points,
+        .register_count = 1,
+        .max_dex_pc = 4,
+        .inline_activations = &orphaned,
+    }));
 }
 
 test "x64_register_encoder executes parameter arithmetic without frame prologue" {
@@ -5543,23 +5699,34 @@ test "x64 compiler translates deoptimization values after register allocation" {
     );
 
     const allocation_failure_callers = [_]DeoptInlineFrameSpec{.{
+        .activation_id = 1,
         .method_id = 22,
         .dex_pc = 0,
         .register_count = 3,
         .values = &values,
     }};
+    const allocation_failure_activations = [_]InlineActivationSpec{
+        .{ .id = 1, .parent_id = 0, .method_id = 22, .register_count = 3, .parent_dex_pc = 0 },
+        .{ .id = 2, .parent_id = 1, .method_id = 23, .register_count = 3, .parent_dex_pc = 0 },
+    };
     const allocation_failure_points = [_]DeoptPointSpec{.{
         .id = 17,
         .safepoint_id = safepoint,
         .method_id = 23,
         .dex_pc = 0,
         .values = &values,
+        .activation_id = 2,
         .inline_frames = &allocation_failure_callers,
     }};
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         deoptEncodingFailureProbe,
-        .{ &optimized.machine, DeoptOptions{ .points = &allocation_failure_points, .register_count = 3, .max_dex_pc = 2 } },
+        .{ &optimized.machine, DeoptOptions{
+            .points = &allocation_failure_points,
+            .register_count = 3,
+            .max_dex_pc = 2,
+            .inline_activations = &allocation_failure_activations,
+        } },
     );
 }
 
@@ -5788,27 +5955,70 @@ test "x64 compiler publishes a frameful OSR landing stub" {
     };
     values[0] = .{ .vreg = 0, .kind = .reference, .source = .{ .machine_register = object orelse return error.TestUnexpectedResult } };
     values[1] = .{ .vreg = 1, .kind = .scalar32, .source = .{ .machine_register = loop_value orelse return error.TestUnexpectedResult } };
+    const caller_values = [_]DeoptValueSpec{
+        .{ .vreg = 0, .kind = .reference, .source = .{ .machine_register = object orelse return error.TestUnexpectedResult } },
+        .{ .vreg = 1, .kind = .scalar32, .source = .{ .machine_register = loop_value orelse return error.TestUnexpectedResult } },
+    };
+    const callers = [_]DeoptInlineFrameSpec{.{
+        .activation_id = 1,
+        .method_id = 8,
+        .dex_pc = 1,
+        .register_count = 2,
+        .values = &caller_values,
+    }};
+    const activations = [_]InlineActivationSpec{
+        .{ .id = 1, .parent_id = 0, .method_id = 8, .register_count = 2, .parent_dex_pc = 0 },
+        .{ .id = 2, .parent_id = 1, .method_id = 9, .register_count = 10, .parent_dex_pc = 1 },
+    };
     const points = [_]DeoptPointSpec{.{
         .id = 61,
         .safepoint_id = safepoint,
         .method_id = 9,
         .dex_pc = dex_pc orelse return error.TestUnexpectedResult,
         .values = &values,
+        .activation_id = 2,
+        .inline_frames = &callers,
     }};
     const osr = [_]OsrEntrySpec{.{ .point_id = 61, .block = header orelse return error.TestUnexpectedResult }};
     var epoch = std.atomic.Value(u64).init(0);
     var abi = testRuntimeAbi();
     abi.deopt_epoch_address = @intFromPtr(&epoch);
     abi.deopt_helper = 1;
-    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+    try std.testing.expectError(error.InvalidDeoptMetadata, encodeWithOptions(std.testing.allocator, &optimized.machine, .{
         .runtime = abi,
         .deopt = .{ .points = &points, .register_count = 10, .max_dex_pc = 7 },
+        .osr_entries = &osr,
+    }));
+    const forged_activations = [_]InlineActivationSpec{
+        activations[0],
+        .{ .id = 2, .parent_id = 1, .method_id = 9, .register_count = 10, .parent_dex_pc = 2 },
+    };
+    try std.testing.expectError(error.InvalidDeoptMetadata, encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = abi,
+        .deopt = .{
+            .points = &points,
+            .register_count = 10,
+            .max_dex_pc = 7,
+            .inline_activations = &forged_activations,
+        },
+        .osr_entries = &osr,
+    }));
+    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = abi,
+        .deopt = .{
+            .points = &points,
+            .register_count = 10,
+            .max_dex_pc = 7,
+            .inline_activations = &activations,
+        },
         .osr_entries = &osr,
     });
     defer native.deinit();
     try native.verify();
     try std.testing.expect(native.stats.frame_bytes > 0);
     try std.testing.expectEqual(@as(u32, 1), native.stats.osr_frame_landings);
+    try std.testing.expectEqual(@as(u32, 2), native.stats.deopt_frames);
+    try std.testing.expectEqual(@as(u32, 2), native.stats.deopt_inline_activations);
     const maps = &(native.root_maps orelse return error.TestUnexpectedResult);
     for (maps.rootsFor(try maps.find(safepoint))) |root| {
         try std.testing.expectEqual(runtime_stack_map.LocationKind.native_register, root.kind);

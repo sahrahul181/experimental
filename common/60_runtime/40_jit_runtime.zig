@@ -669,7 +669,7 @@ pub fn codeOsrEnterBridge(
     source_image: ?*const [16]u64,
 ) callconv(.c) usize {
     const source_owns_synchronized = source_frame != null and
-        source_frame.?.execution.managed_frame_state.synchronized_monitor_owned;
+        reconstructedSynchronizationOwned(source_frame.?);
     const base = codeLeaseEnterBridgeInner(state, fallback_target, method, 0, false);
     if (state.code_lease_slot == 0) {
         if (source_owns_synchronized) state.synchronized_owner = .interpreter;
@@ -742,42 +742,48 @@ pub fn transferOsrMonitorOwnership(
     if (state.held_monitor_count != 0) return false;
     const count = table.monitorCount(point_id) catch return false;
     if (count > max_native_monitors) return false;
-    if (count == 0) {
-        if (source_frame) |frame| {
-            if (frame.execution.managed_frame_state.held_monitor_count != 0 or
-                frame.execution.managed_frame_state.synchronized_monitor_owned or
-                frame.execution.synchronized_monitor != null)
-            {
-                return false;
-            }
-        }
-        return true;
-    }
-    if (state.monitor_table == 0 or state.collector == 0 or state.satb_buffer == 0) return false;
     const frame = source_frame orelse return false;
-    const image = source_image orelse return false;
     var staged: [max_native_monitors]u64 = @splat(@bitCast(Handle.none));
     const staged_count = table.copyOsrMonitors(point_id, frame, &staged) catch return false;
     if (staged_count != count) return false;
     const record = table.find(point_id) catch return false;
     const frames = table.framesFor(record);
-    if (frames.len != 1) return false;
-    const method_monitors = table.monitorsForFrame(frames[0]);
-    for (method_monitors, 0..) |monitor, index| switch (monitor.source) {
-        .native_register => |register| {
-            if (register >= image.len or image[register] != staged[index]) return false;
-        },
-        .stack_slot, .xmm_register, .constant => return false,
-    };
+    if (count == 0) return true;
+    if (state.monitor_table == 0 or state.collector == 0 or state.satb_buffer == 0) return false;
+    const image = source_image orelse return false;
+    var monitor_cursor: usize = 0;
+    var synchronized = false;
+    for (frames) |frame_record| {
+        const frame_monitors = table.monitorsForFrame(frame_record);
+        if (frame_monitors.len != 0 and frame_monitors[0].kind == .synchronized) synchronized = true;
+        for (frame_monitors) |monitor| {
+            switch (monitor.source) {
+                .native_register => |register| {
+                    if (register >= image.len or image[register] != staged[monitor_cursor]) return false;
+                },
+                .stack_slot, .xmm_register, .constant => return false,
+            }
+            monitor_cursor += 1;
+        }
+    }
+    if (monitor_cursor != count) return false;
 
     @memcpy(state.held_monitors[0..count], staged[0..count]);
     state.held_monitor_count = @intCast(count);
-    @memset(frame.execution.managed_frame_state.held_monitors[0..count], @as(u64, @bitCast(Handle.none)));
-    frame.execution.managed_frame_state.held_monitor_count = 0;
-    frame.execution.managed_frame_state.synchronized_monitor_owned = false;
-    frame.execution.synchronized_monitor = null;
-    state.entry_synchronized_monitor = @intFromBool(method_monitors.len != 0 and method_monitors[0].kind == .synchronized);
-    if (state.entry_synchronized_monitor != 0) state.synchronized_owner = .compiled;
+    var source: ?*runtime_deopt.Frame = frame;
+    var reverse_index = frames.len;
+    while (reverse_index != 0) {
+        reverse_index -= 1;
+        const source_activation = source orelse unreachable;
+        const frame_monitor_count: usize = frames[reverse_index].monitor_count;
+        @memset(source_activation.execution.managed_frame_state.held_monitors[0..frame_monitor_count], @as(u64, @bitCast(Handle.none)));
+        source_activation.execution.managed_frame_state.held_monitor_count = 0;
+        source_activation.execution.managed_frame_state.synchronized_monitor_owned = false;
+        source_activation.execution.synchronized_monitor = null;
+        source = source_activation.previous;
+    }
+    state.entry_synchronized_monitor = @intFromBool(synchronized);
+    if (synchronized) state.synchronized_owner = .compiled;
     _ = state.runtime.counters.monitor_osr_transfers.fetchAdd(1, .monotonic);
     return true;
 }
@@ -1036,7 +1042,7 @@ test "code OSR entry resolves a version-owned interior label under one lease" {
         try std.testing.expectEqual(@as(usize, 77), codeLeaseExitBridge(&managed.native_state, 77));
         try std.testing.expectEqual(@as(u64, 0), manager.stats().active_leases);
 
-        var source = runtime_deopt.Frame{ .execution = .{
+        var source_caller = runtime_deopt.Frame{ .execution = .{
             .pc = 4,
             .registers = &.{},
             .instructions = &.{},
@@ -1052,6 +1058,14 @@ test "code OSR entry resolves a version-owned interior label under one lease" {
             },
             .synchronized_monitor = 1,
         } };
+        var source = runtime_deopt.Frame{
+            .previous = &source_caller,
+            .execution = .{
+                .pc = 5,
+                .registers = &.{},
+                .instructions = &.{},
+            },
+        };
         try std.testing.expectEqual(@as(usize, 0x1234), codeOsrEnterBridge(&managed.native_state, 0x1234, 0, 10, &source, null));
         try std.testing.expectEqual(CodeDispatchStatus.fallback_osr_metadata, managed.native_state.last_code_dispatch);
         try std.testing.expectEqual(SynchronizedOwner.interpreter, managed.native_state.synchronized_owner);

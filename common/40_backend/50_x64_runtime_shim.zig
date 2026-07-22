@@ -1174,7 +1174,46 @@ test "JIT monitor ownership transfers across deoptimization and OSR without relo
     destination.execution.managed_frame_state.synchronized_monitor_owned = false;
     destination.execution.synchronized_monitor = null;
 
+    const osr_caller_values = [_]runtime_deopt.ValueSpec{.{
+        .vreg = 0,
+        .kind = .reference,
+        .source = .{ .native_register = 0 },
+    }};
+    const osr_callers = [_]runtime_deopt.InlineFrameSpec{.{
+        .method_id = 76,
+        .dex_pc = 2,
+        .register_count = 1,
+        .values = &osr_caller_values,
+        .monitors = &monitor_specs,
+    }};
+    var osr_table = try runtime_deopt.Table.init(std.testing.allocator, &.{.{
+        .id = 5,
+        .method_id = 77,
+        .dex_pc = 3,
+        .values = &values,
+        .inline_frames = &osr_callers,
+        .monitors = &monitor_specs,
+    }}, .{ .register_count = 1, .native_register_count = 16, .max_dex_pc = 8 });
+    defer osr_table.deinit();
+
+    // Two synchronized activations may own the same reentrant monitor. OSR
+    // transfers both acquisition records without touching the monitor table.
     try monitors.enter(object, &collector, &registry, &context, &satb);
+    try monitors.enter(object, &collector, &registry, &context, &satb);
+    var caller_registers: [1]u32 = .{@truncate(@as(u64, @bitCast(object)))};
+    var caller_references: [1]u64 = .{@bitCast(object)};
+    var caller_kinds: [1]bool = .{true};
+    var source_caller = runtime_deopt.Frame{
+        .method_id = 76,
+        .active = true,
+        .execution = .{
+            .pc = 2,
+            .registers = &caller_registers,
+            .instructions = &.{},
+            .reference_registers = &caller_references,
+            .register_is_ref = &caller_kinds,
+        },
+    };
     var source_registers: [1]u32 = .{@truncate(@as(u64, @bitCast(object)))};
     var source_references: [1]u64 = .{@bitCast(object)};
     var source_kinds: [1]bool = .{true};
@@ -1188,21 +1227,29 @@ test "JIT monitor ownership transfers across deoptimization and OSR without relo
             .reference_registers = &source_references,
             .register_is_ref = &source_kinds,
         },
+        .previous = &source_caller,
     };
     var osr_gp: [16]u64 = @splat(0);
-    var osr_scratch: [18]u64 = undefined;
-    try std.testing.expect(!runtime_jit.transferOsrMonitorOwnership(&managed.native_state, &deopt_table, 5, &source, &osr_gp));
+    var osr_scratch: [20]u64 = undefined;
+    try std.testing.expect(!runtime_jit.transferOsrMonitorOwnership(&managed.native_state, &osr_table, 5, &source, &osr_gp));
     try std.testing.expectEqual(@as(u32, 0), managed.native_state.held_monitor_count);
+    source_caller.execution.managed_frame_state.held_monitors[0] = @bitCast(object);
+    source_caller.execution.managed_frame_state.held_monitor_count = 1;
+    source_caller.execution.managed_frame_state.synchronized_monitor_owned = true;
+    source_caller.execution.synchronized_monitor = @bitCast(object);
     source.execution.managed_frame_state.held_monitors[0] = @bitCast(object);
     source.execution.managed_frame_state.held_monitor_count = 1;
     source.execution.managed_frame_state.synchronized_monitor_owned = true;
     source.execution.synchronized_monitor = @bitCast(object);
-    try deopt_table.exportOsr(5, &source, .{ .native_registers = &osr_gp, .scratch = &osr_scratch });
-    try std.testing.expect(runtime_jit.transferOsrMonitorOwnership(&managed.native_state, &deopt_table, 5, &source, &osr_gp));
+    try osr_table.exportOsr(5, &source, .{ .native_registers = &osr_gp, .scratch = &osr_scratch });
+    try std.testing.expect(runtime_jit.transferOsrMonitorOwnership(&managed.native_state, &osr_table, 5, &source, &osr_gp));
     try std.testing.expectEqual(@as(u8, 0), source.execution.managed_frame_state.held_monitor_count);
     try std.testing.expect(!source.execution.managed_frame_state.synchronized_monitor_owned);
     try std.testing.expectEqual(@as(?u64, null), source.execution.synchronized_monitor);
-    try std.testing.expectEqual(@as(u32, 1), managed.native_state.held_monitor_count);
+    try std.testing.expectEqual(@as(u8, 0), source_caller.execution.managed_frame_state.held_monitor_count);
+    try std.testing.expect(!source_caller.execution.managed_frame_state.synchronized_monitor_owned);
+    try std.testing.expectEqual(@as(?u64, null), source_caller.execution.synchronized_monitor);
+    try std.testing.expectEqual(@as(u32, 2), managed.native_state.held_monitor_count);
     try std.testing.expectEqual(runtime_jit.SynchronizedOwner.compiled, managed.native_state.synchronized_owner);
     try std.testing.expectEqual(@as(u64, 1), runtime.stats().monitor_osr_transfers);
     managed.deinit();
@@ -3026,18 +3073,24 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
         },
     };
     const inline_frames = [_]x64_encoder.DeoptInlineFrameSpec{.{
+        .activation_id = 1,
         .method_id = 700,
         .dex_pc = 1,
         .register_count = 2,
         .values = &caller_values,
         .monitors = point_monitors[0..1],
     }};
+    const inline_activations = [_]x64_encoder.InlineActivationSpec{
+        .{ .id = 1, .parent_id = 0, .method_id = 700, .register_count = 2, .parent_dex_pc = 0 },
+        .{ .id = 2, .parent_id = 1, .method_id = 0, .register_count = 2, .parent_dex_pc = 1 },
+    };
     const points = [_]x64_encoder.DeoptPointSpec{.{
         .id = 5,
         .safepoint_id = site_id orelse return error.TestUnexpectedResult,
         .method_id = 0,
         .dex_pc = 1,
         .values = &point_values,
+        .activation_id = 2,
         .inline_frames = &inline_frames,
         .monitors = point_monitors[1..2],
     }};
@@ -3061,12 +3114,14 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
             .max_dex_pc = 2,
             .entry_monitors = point_monitors[0..1],
             .synchronized_monitor_enter_sites = &.{synchronized_enter_site orelse return error.TestUnexpectedResult},
+            .inline_activations = &inline_activations,
         },
     });
     defer native.deinit();
     try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_guards);
     try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_traps);
     try std.testing.expectEqual(@as(u32, 2), native.stats.deopt_frames);
+    try std.testing.expectEqual(@as(u32, 2), native.stats.deopt_inline_activations);
     try std.testing.expectEqual(@as(u32, 4), native.stats.deopt_values);
     try std.testing.expectEqual(@as(u32, 2), native.stats.deopt_monitors);
     const native_bytes = try native.finalize();

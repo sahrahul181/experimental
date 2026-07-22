@@ -159,7 +159,8 @@ pub const Capture = struct {
 
 pub const OsrImage = struct {
     native_registers: []u64,
-    /// Requires `value_count + native_register_count` words.
+    /// Requires every frame's value and monitor count plus
+    /// `native_register_count` words.
     scratch: []u64,
 };
 
@@ -671,76 +672,75 @@ pub const Table = struct {
         }
     }
 
-    /// Transactionally exports an interpreter frame into the physical image
-    /// expected at an OSR entry. The same table drives deoptimization in the
-    /// reverse direction, preventing format drift between the two paths.
+    /// Transactionally exports an interpreter activation chain into the
+    /// physical image expected at an OSR entry. The leaf's `previous` links
+    /// must match this point's inner-to-outer frame records. The same table
+    /// drives deoptimization in the reverse direction, preventing format drift
+    /// between the two paths.
     pub fn exportOsr(
         self: *const Table,
         point_id: u32,
-        frame: *const Frame,
+        leaf: *const Frame,
         image: OsrImage,
     ) Error!void {
         const record = try self.find(point_id);
-        if (record.frame_count != 1) return error.UnsupportedOsrFrameChain;
-        const values = self.valuesFor(record);
+        const frames = self.framesFor(record);
         const native_count: usize = self.native_register_count;
-        if (!frame.active or frame.method_id != record.method_id or frame.execution.pc != record.dex_pc or
-            frame.execution.registers.len != self.register_count or
-            frame.execution.reference_registers.len != self.register_count or
-            frame.execution.register_is_ref.len != self.register_count or
-            image.native_registers.len < native_count or
+        if (image.native_registers.len < native_count or
             image.scratch.len < try self.requiredScratchWords(point_id) + native_count)
         {
             return error.OsrStateMismatch;
         }
+        try self.validateOsrFrameChain(frames, leaf);
 
-        const monitors = self.monitorsForFrame(self.framesFor(record)[0]);
-        if (frame.execution.managed_frame_state.held_monitor_count != monitors.len) return error.MonitorStateMismatch;
-        const synchronized = monitors.len != 0 and monitors[0].kind == .synchronized;
-        if (frame.execution.managed_frame_state.synchronized_monitor_owned != synchronized) return error.MonitorStateMismatch;
-        if (synchronized) {
-            if (frame.execution.synchronized_monitor == null or
-                frame.execution.synchronized_monitor.? != frame.execution.managed_frame_state.held_monitors[0])
-            {
-                return error.MonitorStateMismatch;
-            }
-        } else if (frame.execution.synchronized_monitor != null) {
-            return error.MonitorStateMismatch;
-        }
-        const staged_values = image.scratch[0..values.len];
-        const staged_monitors = image.scratch[values.len..][0..monitors.len];
-        const staged_registers = image.scratch[values.len + monitors.len ..][0..native_count];
+        const staged_word_count = try self.requiredScratchWords(point_id);
+        const staged_registers = image.scratch[staged_word_count..][0..native_count];
         @memset(staged_registers, 0);
         var assigned: [std.math.maxInt(u8) + 1]bool = @splat(false);
-        for (values, 0..) |value, index| {
-            const bits = try readFrameValue(frame, value);
-            staged_values[index] = bits;
-            switch (value.source) {
-                .constant => |expected| if (bits != expected) return error.OsrStateMismatch,
-                .stack_slot, .xmm_register => return error.UnsupportedOsrSource,
-                .native_register => |register| {
-                    if (register >= native_count) return error.OutOfBounds;
-                    if (assigned[register] and staged_registers[register] != bits) return error.AliasedOsrRegister;
-                    assigned[register] = true;
-                    staged_registers[register] = bits;
-                },
+        var scratch_cursor = staged_word_count;
+        var current: ?*const Frame = leaf;
+        var reverse_index = frames.len;
+        while (reverse_index != 0) {
+            reverse_index -= 1;
+            const frame_record = frames[reverse_index];
+            const frame = current orelse unreachable;
+            const frame_word_count: usize = frame_record.value_count + frame_record.monitor_count;
+            scratch_cursor -= frame_word_count;
+            var frame_cursor = scratch_cursor;
+            for (self.valuesForFrame(frame_record)) |value| {
+                const bits = try readFrameValue(frame, value);
+                image.scratch[frame_cursor] = bits;
+                frame_cursor += 1;
+                switch (value.source) {
+                    .constant => |expected| if (bits != expected) return error.OsrStateMismatch,
+                    .stack_slot, .xmm_register => return error.UnsupportedOsrSource,
+                    .native_register => |register| {
+                        if (register >= native_count) return error.OutOfBounds;
+                        if (assigned[register] and staged_registers[register] != bits) return error.AliasedOsrRegister;
+                        assigned[register] = true;
+                        staged_registers[register] = bits;
+                    },
+                }
             }
-        }
-        for (monitors, 0..) |monitor, index| {
-            const bits = frame.execution.managed_frame_state.held_monitors[index];
-            if (!validHeldMonitorBits(bits)) return error.MonitorStateMismatch;
-            staged_monitors[index] = bits;
-            switch (monitor.source) {
-                .native_register => |register| {
-                    if (register >= native_count) return error.OutOfBounds;
-                    if (assigned[register] and staged_registers[register] != bits) return error.AliasedOsrRegister;
-                    assigned[register] = true;
-                    staged_registers[register] = bits;
-                },
-                .stack_slot, .xmm_register => return error.UnsupportedOsrSource,
-                .constant => return error.InvalidMonitorSource,
+            for (self.monitorsForFrame(frame_record), 0..) |monitor, monitor_index| {
+                const bits = frame.execution.managed_frame_state.held_monitors[monitor_index];
+                image.scratch[frame_cursor] = bits;
+                frame_cursor += 1;
+                switch (monitor.source) {
+                    .native_register => |register| {
+                        if (register >= native_count) return error.OutOfBounds;
+                        if (assigned[register] and staged_registers[register] != bits) return error.AliasedOsrRegister;
+                        assigned[register] = true;
+                        staged_registers[register] = bits;
+                    },
+                    .stack_slot, .xmm_register => return error.UnsupportedOsrSource,
+                    .constant => return error.InvalidMonitorSource,
+                }
             }
+            std.debug.assert(frame_cursor == scratch_cursor + frame_word_count);
+            current = frame.previous;
         }
+        std.debug.assert(scratch_cursor == 0);
         @memcpy(image.native_registers[0..native_count], staged_registers);
     }
 
@@ -750,23 +750,74 @@ pub const Table = struct {
     pub fn copyOsrMonitors(
         self: *const Table,
         point_id: u32,
-        frame: *const Frame,
+        leaf: *const Frame,
         destination: []u64,
     ) Error!usize {
         const record = try self.find(point_id);
-        if (record.frame_count != 1) return error.UnsupportedOsrFrameChain;
-        const monitors = self.monitorsForFrame(self.framesFor(record)[0]);
-        if (!frame.active or frame.method_id != record.method_id or frame.execution.pc != record.dex_pc or
-            frame.execution.managed_frame_state.held_monitor_count != monitors.len or destination.len < monitors.len)
-        {
-            return error.MonitorStateMismatch;
+        const frames = self.framesFor(record);
+        const count = try self.monitorCount(point_id);
+        if (destination.len < count) return error.MonitorStateMismatch;
+        try self.validateOsrFrameChain(frames, leaf);
+
+        var cursor = count;
+        var current: ?*const Frame = leaf;
+        var reverse_index = frames.len;
+        while (reverse_index != 0) {
+            reverse_index -= 1;
+            const frame_record = frames[reverse_index];
+            const frame = current orelse unreachable;
+            const monitor_count: usize = frame_record.monitor_count;
+            cursor -= monitor_count;
+            @memcpy(destination[cursor..][0..monitor_count], frame.execution.managed_frame_state.held_monitors[0..monitor_count]);
+            current = frame.previous;
         }
-        for (monitors, 0..) |_, index| {
-            const bits = frame.execution.managed_frame_state.held_monitors[index];
-            if (!validHeldMonitorBits(bits)) return error.MonitorStateMismatch;
-            destination[index] = bits;
+        std.debug.assert(cursor == 0);
+        return count;
+    }
+
+    fn validateOsrFrameChain(self: *const Table, frames: []const FrameRecord, leaf: *const Frame) Error!void {
+        var current: ?*const Frame = leaf;
+        var reverse_index = frames.len;
+        var inner_count: usize = 0;
+        while (reverse_index != 0) {
+            reverse_index -= 1;
+            const expected = frames[reverse_index];
+            const frame = current orelse return error.InvalidFrameChain;
+            if (!frame.active or frame.method_id != expected.method_id or frame.execution.pc != expected.dex_pc or
+                frame.execution.registers.len != expected.register_count or
+                frame.execution.reference_registers.len != expected.register_count or
+                frame.execution.register_is_ref.len != expected.register_count)
+            {
+                return error.InvalidFrameChain;
+            }
+            var inner = leaf;
+            for (0..inner_count) |_| {
+                if (frame == inner) return error.InvalidFrameChain;
+                inner = inner.previous orelse return error.InvalidFrameChain;
+            }
+
+            const monitors = self.monitorsForFrame(expected);
+            const monitor_count: usize = frame.execution.managed_frame_state.held_monitor_count;
+            if (monitor_count != monitors.len) return error.MonitorStateMismatch;
+            const synchronized = monitors.len != 0 and monitors[0].kind == .synchronized;
+            if (frame.execution.managed_frame_state.synchronized_monitor_owned != synchronized) {
+                return error.MonitorStateMismatch;
+            }
+            if (synchronized) {
+                if (frame.execution.synchronized_monitor == null or
+                    frame.execution.synchronized_monitor.? != frame.execution.managed_frame_state.held_monitors[0])
+                {
+                    return error.MonitorStateMismatch;
+                }
+            } else if (frame.execution.synchronized_monitor != null) {
+                return error.MonitorStateMismatch;
+            }
+            for (frame.execution.managed_frame_state.held_monitors[0..monitor_count]) |bits| {
+                if (!validHeldMonitorBits(bits)) return error.MonitorStateMismatch;
+            }
+            current = frame.previous;
+            inner_count += 1;
         }
-        return monitors.len;
     }
 
     pub fn importOsr(
@@ -1628,6 +1679,111 @@ test "OSR export and import round trip through the deoptimization format" {
         .scratch = &export_scratch,
     }));
     try std.testing.expectEqualSlices(u64, &before, &native_image);
+}
+
+test "OSR transactionally exports a nested synchronized activation chain" {
+    const outer_handle = Handle{ .index = 31, .generation = 4 };
+    const leaf_handle = Handle{ .index = 32, .generation = 5 };
+    const outer_values = [_]ValueSpec{
+        .{ .vreg = 0, .kind = .reference, .source = .{ .native_register = 0 } },
+        .{ .vreg = 1, .kind = .scalar32, .source = .{ .native_register = 1 } },
+    };
+    const leaf_values = [_]ValueSpec{
+        .{ .vreg = 0, .kind = .reference, .source = .{ .native_register = 2 } },
+        // Deliberately aliases the caller's physical register. Export may
+        // elide duplicate loads only when both interpreter values agree.
+        .{ .vreg = 1, .kind = .scalar32, .source = .{ .native_register = 1 } },
+    };
+    const outer_monitors = [_]MonitorSpec{.{
+        .source = .{ .native_register = 0 },
+        .kind = .synchronized,
+    }};
+    const leaf_monitors = [_]MonitorSpec{.{
+        .source = .{ .native_register = 2 },
+        .kind = .synchronized,
+    }};
+    const callers = [_]InlineFrameSpec{.{
+        .method_id = 700,
+        .dex_pc = 2,
+        .register_count = 2,
+        .values = &outer_values,
+        .monitors = &outer_monitors,
+    }};
+    var table = try Table.init(std.testing.allocator, &.{.{
+        .id = 46,
+        .method_id = 701,
+        .dex_pc = 6,
+        .values = &leaf_values,
+        .inline_frames = &callers,
+        .monitors = &leaf_monitors,
+    }}, .{ .register_count = 2, .native_register_count = 8, .max_dex_pc = 8 });
+    defer table.deinit();
+
+    var outer_registers = [_]u32{ @truncate(@as(u64, @bitCast(outer_handle))), 77 };
+    var outer_references = [_]u64{ @bitCast(outer_handle), @bitCast(Handle.none) };
+    var outer_kinds = [_]bool{ true, false };
+    var outer = Frame{
+        .method_id = 700,
+        .execution = .{
+            .pc = 2,
+            .registers = &outer_registers,
+            .instructions = &.{},
+            .reference_registers = &outer_references,
+            .register_is_ref = &outer_kinds,
+        },
+        .active = true,
+    };
+    outer.execution.managed_frame_state.held_monitors[0] = @bitCast(outer_handle);
+    outer.execution.managed_frame_state.held_monitor_count = 1;
+    outer.execution.managed_frame_state.synchronized_monitor_owned = true;
+    outer.execution.synchronized_monitor = @bitCast(outer_handle);
+
+    var leaf_registers = [_]u32{ @truncate(@as(u64, @bitCast(leaf_handle))), 77 };
+    var leaf_references = [_]u64{ @bitCast(leaf_handle), @bitCast(Handle.none) };
+    var leaf_kinds = [_]bool{ true, false };
+    var leaf = Frame{
+        .method_id = 701,
+        .execution = .{
+            .pc = 6,
+            .registers = &leaf_registers,
+            .instructions = &.{},
+            .reference_registers = &leaf_references,
+            .register_is_ref = &leaf_kinds,
+        },
+        .previous = &outer,
+        .active = true,
+    };
+    leaf.execution.managed_frame_state.held_monitors[0] = @bitCast(leaf_handle);
+    leaf.execution.managed_frame_state.held_monitor_count = 1;
+    leaf.execution.managed_frame_state.synchronized_monitor_owned = true;
+    leaf.execution.synchronized_monitor = @bitCast(leaf_handle);
+
+    var image: [8]u64 = @splat(0xfeedfacefeedface);
+    var scratch: [14]u64 = undefined;
+    try table.exportOsr(46, &leaf, .{ .native_registers = &image, .scratch = &scratch });
+    try std.testing.expectEqual(@as(u64, @bitCast(outer_handle)), image[0]);
+    try std.testing.expectEqual(@as(u64, 77), image[1]);
+    try std.testing.expectEqual(@as(u64, @bitCast(leaf_handle)), image[2]);
+
+    var monitors: [2]u64 = @splat(0);
+    try std.testing.expectEqual(@as(usize, 2), try table.copyOsrMonitors(46, &leaf, &monitors));
+    try std.testing.expectEqualSlices(u64, &.{
+        @as(u64, @bitCast(outer_handle)),
+        @as(u64, @bitCast(leaf_handle)),
+    }, &monitors);
+
+    const before = image;
+    leaf.execution.registers[1] = 78;
+    try std.testing.expectError(error.AliasedOsrRegister, table.exportOsr(46, &leaf, .{
+        .native_registers = &image,
+        .scratch = &scratch,
+    }));
+    try std.testing.expectEqualSlices(u64, &before, &image);
+
+    const monitors_before = monitors;
+    outer.method_id = 999;
+    try std.testing.expectError(error.InvalidFrameChain, table.copyOsrMonitors(46, &leaf, &monitors));
+    try std.testing.expectEqualSlices(u64, &monitors_before, &monitors);
 }
 
 fn allocationFailureProbe(allocator: std.mem.Allocator) !void {
