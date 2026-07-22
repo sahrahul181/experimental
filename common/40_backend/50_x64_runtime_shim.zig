@@ -9,6 +9,7 @@ const optimizer = @import("optimizer");
 const runtime_gc = @import("runtime_gc");
 const runtime_heap = @import("runtime_heap");
 const runtime_jit = @import("runtime_jit");
+const runtime_monitor = @import("runtime_monitor");
 const runtime_code_manager = @import("runtime_code_manager");
 const runtime_deopt = @import("runtime_deopt");
 const runtime_stack_map = @import("runtime_stack_map");
@@ -66,9 +67,17 @@ pub const EncodedShims = struct {
     card_mark_helper: []u8,
     card_mark_repeat_helper: []u8,
     static_root_post_write_helper: []u8,
+    monitor_enter_helper: []u8,
+    monitor_exit_helper: []u8,
+    f32_remainder_helper: []u8,
+    f64_remainder_helper: []u8,
 
     pub fn deinit(self: *EncodedShims) void {
+        self.allocator.free(self.f64_remainder_helper);
+        self.allocator.free(self.f32_remainder_helper);
         self.allocator.free(self.static_root_post_write_helper);
+        self.allocator.free(self.monitor_exit_helper);
+        self.allocator.free(self.monitor_enter_helper);
         self.allocator.free(self.card_mark_repeat_helper);
         self.allocator.free(self.card_mark_helper);
         self.allocator.free(self.satb_pre_write_helper);
@@ -183,11 +192,11 @@ fn emitCapturedXmmRegisters(buffer: *code_buffer.Buffer) Error!void {
     }
 }
 
-fn emitCapturedStackBase(buffer: *code_buffer.Buffer, frame_bytes: u32) Error!void {
+fn emitCapturedStackBase(buffer: *code_buffer.Buffer, frame_bytes: u32, caller_save_bytes: u32) Error!void {
     // Seven GP pushes and the helper CALL separate the adjusted helper rsp
     // from the managed frame's rsp by 64 bytes.
     try buffer.emitBytes(&.{ 0x48, 0x8d, 0x84, 0x24 }); // lea rax, [rsp + disp32]
-    try buffer.emitU32(frame_bytes + 64);
+    try buffer.emitU32(frame_bytes + 64 + caller_save_bytes);
     try emitMovMemReg(buffer, r15, @offsetOf(runtime_jit.NativeThreadState, "captured_stack_base"), rax);
 }
 
@@ -219,7 +228,7 @@ fn emitSlowHelper(buffer: *code_buffer.Buffer, bridge_address: usize) Error!void
     const frame_bytes = home_bytes + xmm_save_bytes + alignment_bytes;
     try emitAdjustStack(buffer, true, frame_bytes);
     try emitSavedXmmRegisters(buffer, home_bytes);
-    try emitCapturedStackBase(buffer, frame_bytes);
+    try emitCapturedStackBase(buffer, frame_bytes, 0);
 
     if (builtin.os.tag == .windows) {
         try emitMovRegReg(buffer, rcx, r15);
@@ -247,6 +256,47 @@ fn emitSlowHelper(buffer: *code_buffer.Buffer, bridge_address: usize) Error!void
     try buffer.emitBytes(&.{ 0x0f, 0x0b }); // fail closed: ud2
 }
 
+/// Safepointing monitor adapter. The generated caller saves rax before using
+/// it as the indirect call target, so restore that original value in both the
+/// captured root image and the managed register save set. Its extra caller
+/// push is also included when reconstructing spill-slot addresses.
+fn emitMonitorHelper(buffer: *code_buffer.Buffer, bridge_address: usize) Error!void {
+    try emitCapturedGpRegisters(buffer);
+    try buffer.emitBytes(&.{ 0x48, 0x8b, 0x44, 0x24, 0x08 }); // mov rax, [rsp + 8]
+    try emitMovMemReg(buffer, r15, @offsetOf(runtime_jit.NativeThreadState, "captured_gp"), rax);
+    try emitSavedManagedRegisters(buffer);
+    const home_bytes: u32 = if (builtin.os.tag == .windows) 32 else 0;
+    const frame_bytes = home_bytes + xmm_save_bytes;
+    try emitAdjustStack(buffer, true, frame_bytes);
+    try emitSavedXmmRegisters(buffer, home_bytes);
+    try emitCapturedStackBase(buffer, frame_bytes, 8);
+
+    if (builtin.os.tag == .windows) {
+        try emitMovRegReg(buffer, rcx, r15);
+        try emitMovRegReg(buffer, rdx, r10);
+        try emitMovRegReg(buffer, r8, r11);
+    } else {
+        try emitMovRegReg(buffer, rdi, r15);
+        try emitMovRegReg(buffer, rsi, r10);
+        try emitMovRegReg(buffer, rdx, r11);
+    }
+    try emitMovRegImm64(buffer, rax, bridge_address);
+    try emitCall(buffer, rax);
+    try emitMovRegReg(buffer, r10, rax);
+    try emitMovRegMem(buffer, r12, r15, @offsetOf(runtime_jit.NativeThreadState, "acknowledged_epoch"));
+
+    try emitRestoredXmmRegisters(buffer, home_bytes);
+    try emitAdjustStack(buffer, false, frame_bytes);
+    try emitRestoredManagedRegisters(buffer);
+    try buffer.emitBytes(&.{ 0x4d, 0x85, 0xd2 }); // test r10, r10
+    const failed = try buffer.newLabel();
+    try buffer.emitBytes(&.{ 0x0f, 0x84 });
+    _ = try buffer.reloc(failed, .rel32, 0);
+    try buffer.emitU8(0xc3);
+    try buffer.bindLabel(failed);
+    try buffer.emitBytes(&.{ 0x0f, 0x0b });
+}
+
 fn emitDeoptHelper(buffer: *code_buffer.Buffer, bridge_address: usize) Error!void {
     try emitCapturedGpRegisters(buffer);
     try emitCapturedXmmRegisters(buffer);
@@ -256,7 +306,7 @@ fn emitDeoptHelper(buffer: *code_buffer.Buffer, bridge_address: usize) Error!voi
     const frame_bytes = home_bytes + xmm_save_bytes + alignment_bytes;
     try emitAdjustStack(buffer, true, frame_bytes);
     try emitSavedXmmRegisters(buffer, home_bytes);
-    try emitCapturedStackBase(buffer, frame_bytes);
+    try emitCapturedStackBase(buffer, frame_bytes, 0);
 
     if (builtin.os.tag == .windows) {
         try emitMovRegReg(buffer, rcx, r15);
@@ -309,6 +359,47 @@ fn emitBarrierHelper(buffer: *code_buffer.Buffer, bridge_address: usize) Error!v
     try buffer.emitU8(0xc3);
     try buffer.bindLabel(failed);
     try buffer.emitBytes(&.{ 0x0f, 0x0b });
+}
+
+fn floatRemainder32Bridge(lhs_bits: u64, rhs_bits: u64) callconv(.c) u64 {
+    const lhs: f32 = @bitCast(@as(u32, @truncate(lhs_bits)));
+    const rhs: f32 = @bitCast(@as(u32, @truncate(rhs_bits)));
+    const result: u32 = @bitCast(@rem(lhs, rhs));
+    return result;
+}
+
+fn floatRemainder64Bridge(lhs_bits: u64, rhs_bits: u64) callconv(.c) u64 {
+    const lhs: f64 = @bitCast(lhs_bits);
+    const rhs: f64 = @bitCast(rhs_bits);
+    return @bitCast(@rem(lhs, rhs));
+}
+
+/// Private no-safepoint ABI: r10/r11 carry raw IEEE operands and r10 returns
+/// raw result bits. All allocator-visible GP and XMM registers are preserved,
+/// so this adapter can execute inside a live managed interval without a stack
+/// map or relocation handshake.
+fn emitNumericHelper(buffer: *code_buffer.Buffer, bridge_address: usize) Error!void {
+    try emitSavedManagedRegisters(buffer);
+    const home_bytes: u32 = if (builtin.os.tag == .windows) 32 else 0;
+    const frame_bytes = home_bytes + xmm_save_bytes;
+    try emitAdjustStack(buffer, true, frame_bytes);
+    try emitSavedXmmRegisters(buffer, home_bytes);
+
+    if (builtin.os.tag == .windows) {
+        try emitMovRegReg(buffer, rcx, r10);
+        try emitMovRegReg(buffer, rdx, r11);
+    } else {
+        try emitMovRegReg(buffer, rdi, r10);
+        try emitMovRegReg(buffer, rsi, r11);
+    }
+    try emitMovRegImm64(buffer, rax, bridge_address);
+    try emitCall(buffer, rax);
+    try emitMovRegReg(buffer, r10, rax);
+
+    try emitRestoredXmmRegisters(buffer, home_bytes);
+    try emitAdjustStack(buffer, false, frame_bytes);
+    try emitRestoredManagedRegisters(buffer);
+    try buffer.emitU8(0xc3);
 }
 
 fn emitReservedSave(buffer: *code_buffer.Buffer) Error!void {
@@ -553,6 +644,30 @@ pub fn encode(allocator: std.mem.Allocator, bridge_address: usize) Error!Encoded
     defer static_root_buffer.deinit();
     try emitBarrierHelper(&static_root_buffer, @intFromPtr(&runtime_jit.referenceStaticPostWriteBridge));
     const static_root_post_write_helper = try static_root_buffer.finalize();
+    errdefer allocator.free(static_root_post_write_helper);
+
+    var monitor_enter_buffer = code_buffer.Buffer.init(allocator);
+    defer monitor_enter_buffer.deinit();
+    try emitMonitorHelper(&monitor_enter_buffer, @intFromPtr(&runtime_jit.monitorEnterBridge));
+    const monitor_enter_helper = try monitor_enter_buffer.finalize();
+    errdefer allocator.free(monitor_enter_helper);
+
+    var monitor_exit_buffer = code_buffer.Buffer.init(allocator);
+    defer monitor_exit_buffer.deinit();
+    try emitMonitorHelper(&monitor_exit_buffer, @intFromPtr(&runtime_jit.monitorExitBridge));
+    const monitor_exit_helper = try monitor_exit_buffer.finalize();
+    errdefer allocator.free(monitor_exit_helper);
+
+    var f32_remainder_buffer = code_buffer.Buffer.init(allocator);
+    defer f32_remainder_buffer.deinit();
+    try emitNumericHelper(&f32_remainder_buffer, @intFromPtr(&floatRemainder32Bridge));
+    const f32_remainder_helper = try f32_remainder_buffer.finalize();
+    errdefer allocator.free(f32_remainder_helper);
+
+    var f64_remainder_buffer = code_buffer.Buffer.init(allocator);
+    defer f64_remainder_buffer.deinit();
+    try emitNumericHelper(&f64_remainder_buffer, @intFromPtr(&floatRemainder64Bridge));
+    const f64_remainder_helper = try f64_remainder_buffer.finalize();
     return .{
         .allocator = allocator,
         .entry = entry,
@@ -564,7 +679,166 @@ pub fn encode(allocator: std.mem.Allocator, bridge_address: usize) Error!Encoded
         .card_mark_helper = card_mark_helper,
         .card_mark_repeat_helper = card_mark_repeat_helper,
         .static_root_post_write_helper = static_root_post_write_helper,
+        .monitor_enter_helper = monitor_enter_helper,
+        .monitor_exit_helper = monitor_exit_helper,
+        .f32_remainder_helper = f32_remainder_helper,
+        .f64_remainder_helper = f64_remainder_helper,
     };
+}
+
+fn remainderRuntimeAbi(f32_helper: usize, f64_helper: usize) x64_encoder.RuntimeAbi {
+    return .{
+        .handle_capacity = 1,
+        .region_count = 1,
+        .slow_resolve_helper = 1,
+        .f32_remainder_helper = f32_helper,
+        .f64_remainder_helper = f64_helper,
+        .field_layouts = &.{},
+    };
+}
+
+test "x64 numeric shims execute exact scalar remainder semantics" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    var shims = try encode(std.testing.allocator, 1);
+    defer shims.deinit();
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const f32_helper = try cache.addBytes(shims.f32_remainder_helper);
+    const f64_helper = try cache.addBytes(shims.f64_remainder_helper);
+    const abi = remainderRuntimeAbi(f32_helper.entryAddress(), f64_helper.entryAddress());
+
+    const float_insts = [_]Instruction{
+        .{ .rem_float = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
+        .{ .return_ = .{ .src = 2 } },
+    };
+    var float_optimized = try optimizer.optimize(std.testing.allocator, &float_insts, &.{}, .{});
+    defer float_optimized.deinit();
+    var float_native = try x64_encoder.encodeWithOptions(std.testing.allocator, &float_optimized.machine, .{ .runtime = abi });
+    defer float_native.deinit();
+    try float_native.verify();
+    try std.testing.expectEqual(@as(u32, 1), float_native.stats.xmm_remainders);
+    const float_bytes = try float_native.finalize();
+    defer std.testing.allocator.free(float_bytes);
+    const float_code = try cache.addBytes(float_bytes);
+    const FloatFn = fn (u32, u32) callconv(.c) u32;
+    const float_rem = float_code.typedEntry(FloatFn);
+
+    const f32_finite: f32 = @bitCast(float_rem(@bitCast(@as(f32, 7.5)), @bitCast(@as(f32, 2.0))));
+    try std.testing.expectEqual(@as(f32, 1.5), f32_finite);
+    const f32_negative: f32 = @bitCast(float_rem(@bitCast(@as(f32, -7.5)), @bitCast(@as(f32, 2.0))));
+    try std.testing.expectEqual(@as(f32, -1.5), f32_negative);
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, -0.0))), float_rem(@bitCast(@as(f32, -0.0)), @bitCast(@as(f32, 3.0))));
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.0))), float_rem(@bitCast(@as(f32, 1.0)), @bitCast(std.math.inf(f32))));
+    const f32_zero_divisor: f32 = @bitCast(float_rem(@bitCast(@as(f32, 1.0)), @bitCast(@as(f32, 0.0))));
+    try std.testing.expect(std.math.isNan(f32_zero_divisor));
+    const f32_infinite_dividend: f32 = @bitCast(float_rem(@bitCast(std.math.inf(f32)), @bitCast(@as(f32, 2.0))));
+    try std.testing.expect(std.math.isNan(f32_infinite_dividend));
+    const f32_nan: f32 = @bitCast(float_rem(@bitCast(std.math.nan(f32)), @bitCast(@as(f32, 2.0))));
+    try std.testing.expect(std.math.isNan(f32_nan));
+
+    const double_insts = [_]Instruction{
+        .{ .rem_double = .{ .dest = 4, .src1 = 0, .src2 = 2 } },
+        .{ .return_wide = .{ .src = 4 } },
+    };
+    var double_optimized = try optimizer.optimize(std.testing.allocator, &double_insts, &.{}, .{});
+    defer double_optimized.deinit();
+    var double_native = try x64_encoder.encodeWithOptions(std.testing.allocator, &double_optimized.machine, .{ .runtime = abi });
+    defer double_native.deinit();
+    try double_native.verify();
+    try std.testing.expectEqual(@as(u32, 1), double_native.stats.xmm_remainders);
+    const double_bytes = try double_native.finalize();
+    defer std.testing.allocator.free(double_bytes);
+    const double_code = try cache.addBytes(double_bytes);
+    const DoubleFn = fn (u64, u64, u64, u64) callconv(.c) u64;
+    const double_rem = double_code.typedEntry(DoubleFn);
+
+    const f64_finite: f64 = @bitCast(double_rem(@bitCast(@as(f64, 17.25)), 0, @bitCast(@as(f64, 4.0)), 0));
+    try std.testing.expectEqual(@as(f64, 1.25), f64_finite);
+    const f64_negative: f64 = @bitCast(double_rem(@bitCast(@as(f64, -17.25)), 0, @bitCast(@as(f64, 4.0)), 0));
+    try std.testing.expectEqual(@as(f64, -1.25), f64_negative);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, -0.0))), double_rem(@bitCast(@as(f64, -0.0)), 0, @bitCast(@as(f64, 3.0)), 0));
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, 1.0))), double_rem(@bitCast(@as(f64, 1.0)), 0, @bitCast(std.math.inf(f64)), 0));
+    const f64_zero_divisor: f64 = @bitCast(double_rem(@bitCast(@as(f64, 1.0)), 0, @bitCast(@as(f64, 0.0)), 0));
+    try std.testing.expect(std.math.isNan(f64_zero_divisor));
+    const f64_infinite_dividend: f64 = @bitCast(double_rem(@bitCast(std.math.inf(f64)), 0, @bitCast(@as(f64, 2.0)), 0));
+    try std.testing.expect(std.math.isNan(f64_infinite_dividend));
+    const f64_nan: f64 = @bitCast(double_rem(@bitCast(std.math.nan(f64)), 0, @bitCast(@as(f64, 2.0)), 0));
+    try std.testing.expect(std.math.isNan(f64_nan));
+}
+
+test "x64 numeric remainder helper preserves live XMM state through spills" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .rem_float = .{ .dest = 9, .src1 = 0, .src2 = 1 } },
+        .{ .add_float = .{ .dest = 10, .src1 = 2, .src2 = 3 } },
+        .{ .add_float = .{ .dest = 11, .src1 = 4, .src2 = 5 } },
+        .{ .add_float = .{ .dest = 12, .src1 = 6, .src2 = 7 } },
+        .{ .add_float = .{ .dest = 13, .src1 = 10, .src2 = 11 } },
+        .{ .add_float = .{ .dest = 14, .src1 = 13, .src2 = 12 } },
+        .{ .add_float = .{ .dest = 15, .src1 = 14, .src2 = 8 } },
+        .{ .add_float = .{ .dest = 16, .src1 = 15, .src2 = 9 } },
+        .{ .return_ = .{ .src = 16 } },
+    };
+    var optimized = try optimizer.optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+    var shims = try encode(std.testing.allocator, 1);
+    defer shims.deinit();
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const f32_helper = try cache.addBytes(shims.f32_remainder_helper);
+    const f64_helper = try cache.addBytes(shims.f64_remainder_helper);
+    const abi = remainderRuntimeAbi(f32_helper.entryAddress(), f64_helper.entryAddress());
+    var native = try x64_encoder.encodeWithOptions(std.testing.allocator, &optimized.machine, .{ .runtime = abi });
+    defer native.deinit();
+    try native.verify();
+    try std.testing.expect(native.allocation.stats.spills > 0);
+    try std.testing.expect(native.stats.xmm_spill_loads > 0);
+    try std.testing.expect(native.stats.xmm_spill_stores > 0);
+    const bytes = try native.finalize();
+    defer std.testing.allocator.free(bytes);
+    const code = try cache.addBytes(bytes);
+    const Fn = fn (u32, u32, u32, u32, u32, u32, u32, u32, u32) callconv(.c) u32;
+    const result: f32 = @bitCast(code.typedEntry(Fn)(
+        @bitCast(@as(f32, 7.5)),
+        @bitCast(@as(f32, 2.0)),
+        @bitCast(@as(f32, 3.0)),
+        @bitCast(@as(f32, 4.0)),
+        @bitCast(@as(f32, 5.0)),
+        @bitCast(@as(f32, 6.0)),
+        @bitCast(@as(f32, 7.0)),
+        @bitCast(@as(f32, 8.0)),
+        @bitCast(@as(f32, 9.0)),
+    ));
+    try std.testing.expectEqual(@as(f32, 43.5), result);
+
+    const mixed_insts = [_]Instruction{
+        .{ .rem_float = .{ .dest = 7, .src1 = 5, .src2 = 6 } },
+        .{ .add_int = .{ .dest = 8, .src1 = 0, .src2 = 1 } },
+        .{ .add_int = .{ .dest = 9, .src1 = 2, .src2 = 3 } },
+        .{ .add_int = .{ .dest = 10, .src1 = 8, .src2 = 9 } },
+        .{ .add_int = .{ .dest = 11, .src1 = 10, .src2 = 4 } },
+        .{ .float_to_int = .{ .dest = 12, .src = 7 } },
+        .{ .add_int = .{ .dest = 13, .src1 = 11, .src2 = 12 } },
+        .{ .return_ = .{ .src = 13 } },
+    };
+    var mixed_optimized = try optimizer.optimize(std.testing.allocator, &mixed_insts, &.{}, .{});
+    defer mixed_optimized.deinit();
+    var mixed_native = try x64_encoder.encodeWithOptions(std.testing.allocator, &mixed_optimized.machine, .{ .runtime = abi });
+    defer mixed_native.deinit();
+    try mixed_native.verify();
+    const mixed_bytes = try mixed_native.finalize();
+    defer std.testing.allocator.free(mixed_bytes);
+    const mixed_code = try cache.addBytes(mixed_bytes);
+    const MixedFn = fn (i32, i32, i32, i32, i32, u32, u32) callconv(.c) i32;
+    try std.testing.expectEqual(@as(i32, 16), mixed_code.typedEntry(MixedFn)(
+        1,
+        2,
+        3,
+        4,
+        5,
+        @bitCast(@as(f32, 7.5)),
+        @bitCast(@as(f32, 2.0)),
+    ));
 }
 
 test "x64 shims execute generated field access across evacuation" {
@@ -643,6 +917,150 @@ test "x64 shims execute generated field access across evacuation" {
 
     try std.testing.expect(try handles.commitRelocation(ticket, 1, @ptrCast(&to_space[24])));
     try std.testing.expectEqual(@as(usize, 99), call(&frame));
+}
+
+test "x64 monitor helpers execute reentrant balanced ownership with precise safepoints" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+
+    var storage: [512]u8 align(runtime_value.object_alignment) = @splat(0);
+    const regions = [_]runtime_value.Region{try runtime_value.Region.fromSlice(&storage)};
+    var handles = try runtime_value.HandleTable.init(std.testing.allocator, 4, &regions);
+    defer handles.deinit();
+    var heap = try runtime_heap.ManagedHeap.init(std.testing.allocator, &handles, 128);
+    defer heap.deinit();
+    var allocator = heap.threadAllocator();
+    const reservation = try allocator.allocate(16, runtime_value.object_alignment);
+    const object = try handles.reserve(0, 0);
+    try heap.publishObject(reservation, object);
+
+    var monitors = try runtime_monitor.MonitorTable.init(std.testing.allocator, std.testing.io, &handles);
+    defer monitors.deinit() catch unreachable;
+    var collector = try runtime_gc.ConcurrentCollector.init(std.testing.allocator, &heap, &handles, .{
+        .satb_queue_capacity = 8,
+        .max_satb_buffers = 1,
+        .card_bytes = 64,
+        .static_root_slots = monitors.rootSlotAddresses(),
+    });
+    defer collector.deinit() catch unreachable;
+    var registry = try runtime_thread_registry.Registry.init(std.testing.allocator, std.testing.io, 1);
+    defer registry.deinit() catch unreachable;
+    var context = try runtime_thread_registry.ThreadContext.init(std.testing.allocator, 16);
+    defer context.deinit();
+    try registry.register(&context);
+    defer registry.unregister(&context) catch unreachable;
+    var satb = try runtime_gc.SatbBuffer.init(std.testing.allocator, 8);
+    defer satb.deinit() catch unreachable;
+    try collector.registerThreadSatbBuffer(&satb, &context);
+    defer collector.unregisterSatbBuffer(&satb) catch unreachable;
+
+    var runtime = try runtime_jit.Runtime.init(std.testing.allocator, &handles, &registry);
+    defer runtime.deinit() catch unreachable;
+    try runtime.installCollector(&collector);
+    try runtime.installMonitorTable(&monitors);
+    var managed = try runtime.enter(&context);
+    defer managed.deinit();
+
+    var encoded_shims = try encode(std.testing.allocator, @intFromPtr(&runtime_jit.slowResolveBridge));
+    defer encoded_shims.deinit();
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const entry_code = try cache.addBytes(encoded_shims.entry);
+    const slow_code = try cache.addBytes(encoded_shims.slow_helper);
+    const enter_code = try cache.addBytes(encoded_shims.monitor_enter_helper);
+    const exit_code = try cache.addBytes(encoded_shims.monitor_exit_helper);
+
+    const insts = [_]Instruction{
+        .{ .monitor_enter = .{ .src = 0 } },
+        .{ .monitor_enter = .{ .src = 0 } },
+        .{ .monitor_exit = .{ .src = 0 } },
+        .{ .monitor_exit = .{ .src = 0 } },
+        .{ .return_object = .{ .src = 0 } },
+    };
+    var optimized = try optimizer.optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+    try std.testing.expectEqual(@as(u32, 4), optimized.machine.stats.monitor_sites);
+    try std.testing.expectEqual(@as(u32, 0), optimized.machine.stats.resolves);
+    try std.testing.expectError(error.MissingMonitorHelper, x64_encoder.encodeWithOptions(
+        std.testing.allocator,
+        &optimized.machine,
+        .{ .runtime = .{
+            .handle_capacity = handles.entryCapacity(),
+            .region_count = handles.regionCount(),
+            .slow_resolve_helper = slow_code.entryAddress(),
+            .field_layouts = &.{},
+        } },
+    ));
+    var native = try x64_encoder.encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = .{
+            .handle_capacity = handles.entryCapacity(),
+            .region_count = handles.regionCount(),
+            .slow_resolve_helper = slow_code.entryAddress(),
+            .monitor_enter_helper = enter_code.entryAddress(),
+            .monitor_exit_helper = exit_code.entryAddress(),
+            .field_layouts = &.{},
+        },
+    });
+    defer native.deinit();
+    try std.testing.expectEqual(@as(u32, 2), native.stats.monitor_enters);
+    try std.testing.expectEqual(@as(u32, 2), native.stats.monitor_exits);
+    const monitor_maps = if (native.root_maps) |*maps| maps else return error.TestUnexpectedResult;
+    var mapped_monitors: u32 = 0;
+    for (optimized.machine.blocks) |block| for (block.insts) |inst| {
+        if (inst.opcode != .monitor_enter and inst.opcode != .monitor_exit) continue;
+        const record = try monitor_maps.find(inst.monitor_site_id orelse return error.TestUnexpectedResult);
+        try std.testing.expect(monitor_maps.rootsFor(record).len != 0);
+        mapped_monitors += 1;
+    };
+    try std.testing.expectEqual(@as(u32, 4), mapped_monitors);
+    const target_bytes = try native.finalize();
+    defer std.testing.allocator.free(target_bytes);
+    const target_code = try cache.addBytes(target_bytes);
+
+    try managed.installRootMaps(monitor_maps);
+    var frame = CallFrame{ .image = try managed.registerImage(), .target = target_code.entryAddress() };
+    frame.gp_args[0] = @bitCast(object);
+    const EntryFn = fn (*const CallFrame) callconv(.c) usize;
+    try std.testing.expectEqual(@as(usize, @bitCast(object)), entry_code.typedEntry(EntryFn)(&frame));
+    try std.testing.expectEqual(@as(u32, 0), managed.native_state.held_monitor_count);
+    try std.testing.expectEqual(runtime_jit.SlowResolveStatus.ok, managed.native_state.last_error);
+    try std.testing.expectEqual(@as(u64, 2), runtime.stats().monitor_enters);
+    try std.testing.expectEqual(@as(u64, 2), runtime.stats().monitor_exits);
+    try std.testing.expectEqual(@as(u64, 1), monitors.stats().reentrant_enters);
+    try std.testing.expectEqual(monitors.stats().associations, monitors.stats().disassociations);
+
+    // A native activation that leaves through an uncommon/fail-safe edge may
+    // still own monitors. ManagedEntry teardown releases them in reverse order
+    // rather than leaking ownership into the next native invocation.
+    const unwind_insts = [_]Instruction{
+        .{ .monitor_enter = .{ .src = 0 } },
+        .{ .return_object = .{ .src = 0 } },
+    };
+    var unwind_optimized = try optimizer.optimize(std.testing.allocator, &unwind_insts, &.{}, .{});
+    defer unwind_optimized.deinit();
+    var unwind_native = try x64_encoder.encodeWithOptions(std.testing.allocator, &unwind_optimized.machine, .{
+        .runtime = .{
+            .handle_capacity = handles.entryCapacity(),
+            .region_count = handles.regionCount(),
+            .slow_resolve_helper = slow_code.entryAddress(),
+            .monitor_enter_helper = enter_code.entryAddress(),
+            .monitor_exit_helper = exit_code.entryAddress(),
+            .field_layouts = &.{},
+        },
+    });
+    defer unwind_native.deinit();
+    const unwind_bytes = try unwind_native.finalize();
+    defer std.testing.allocator.free(unwind_bytes);
+    const unwind_code = try cache.addBytes(unwind_bytes);
+    const unwind_maps = if (unwind_native.root_maps) |*maps| maps else return error.TestUnexpectedResult;
+    try managed.installRootMaps(unwind_maps);
+    frame.image = try managed.registerImage();
+    frame.target = unwind_code.entryAddress();
+    try std.testing.expectEqual(@as(usize, @bitCast(object)), entry_code.typedEntry(EntryFn)(&frame));
+    try std.testing.expectEqual(@as(u32, 1), managed.native_state.held_monitor_count);
+    managed.deinit();
+    try std.testing.expectEqual(@as(u32, 0), managed.native_state.held_monitor_count);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().monitor_unwind_exits);
+    try std.testing.expectEqual(monitors.stats().associations, monitors.stats().disassociations);
 }
 
 test "x64 reference store executes SATB and card barriers" {

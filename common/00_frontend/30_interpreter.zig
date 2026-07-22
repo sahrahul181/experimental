@@ -5,6 +5,10 @@
 const std = @import("std");
 const instmod = @import("instructions");
 pub const Instruction = instmod.Instruction;
+pub const Invoke = instmod.Invoke;
+pub const CatchHandler = instmod.CatchHandler;
+pub const TryBlock = instmod.TryBlock;
+pub const null_reference_bits: u64 = std.math.maxInt(u32);
 
 pub const ReturnType = enum(u8) {
     void,
@@ -26,6 +30,11 @@ pub const RuntimeError = error{
     ManagedMemoryFailure,
     NullReference,
     ArrayIndexOutOfBounds,
+    NegativeArraySize,
+    ManagedException,
+    StackOverflow,
+    IllegalMonitorState,
+    MonitorCapacityExceeded,
     MissingManagedMemory,
     InvalidFrame,
 };
@@ -34,10 +43,44 @@ pub const ManagedMemoryStatus = enum(u8) {
     ok,
     null_reference,
     array_index_out_of_bounds,
+    negative_array_size,
+    managed_exception,
+    stack_overflow,
+    illegal_monitor_state,
+    monitor_capacity_exceeded,
     failure,
 };
 
+pub const ManagedFrameState = struct {
+    pub const max_held_monitors = 16;
+    root_mark: usize = 0,
+    active: bool = false,
+    held_monitors: [max_held_monitors]u64 = @splat(null_reference_bits),
+    held_monitor_count: u8 = 0,
+};
+
 pub const ManagedMemoryVTable = struct {
+    enter_frame: ?*const fn (*anyopaque, *ManagedFrameState, []u64, []const bool) ManagedMemoryStatus = null,
+    poll_frame: ?*const fn (*anyopaque, *ManagedFrameState, []u64, []const bool) ManagedMemoryStatus = null,
+    leave_frame: ?*const fn (*anyopaque, *ManagedFrameState) void = null,
+    allocate_instance: ?*const fn (*anyopaque, u32, *u64) ManagedMemoryStatus = null,
+    allocate_array: ?*const fn (*anyopaque, u32, i32, *u64) ManagedMemoryStatus = null,
+    load_instance_reference: ?*const fn (*anyopaque, u64, u32, *u64) ManagedMemoryStatus = null,
+    load_array_reference: ?*const fn (*anyopaque, u64, i32, *u64) ManagedMemoryStatus = null,
+    load_static_reference: ?*const fn (*anyopaque, u32, *u64) ManagedMemoryStatus = null,
+    array_length: ?*const fn (*anyopaque, u64, *u32) ManagedMemoryStatus = null,
+    invoke_method: ?*const fn (
+        *anyopaque,
+        *const Invoke,
+        []const u32,
+        []const u64,
+        []const bool,
+        *ExecutionResult,
+        *u64,
+    ) ManagedMemoryStatus = null,
+    exception_matches: ?*const fn (*anyopaque, u64, u32, *bool) ManagedMemoryStatus = null,
+    monitor_enter: ?*const fn (*anyopaque, u64) ManagedMemoryStatus = null,
+    monitor_exit: ?*const fn (*anyopaque, u64) ManagedMemoryStatus = null,
     store_instance_reference: *const fn (*anyopaque, u64, u32, u64) ManagedMemoryStatus,
     store_array_reference: *const fn (*anyopaque, u64, i32, u64) ManagedMemoryStatus,
     store_static_reference: *const fn (*anyopaque, u32, u64) ManagedMemoryStatus,
@@ -54,11 +97,16 @@ pub const ExecutionFrame = struct {
     instructions: []const Instruction,
     result_register: [2]u32 = .{ 0, 0 },
     result_reference: u64 = 0,
+    pending_exception: u64 = null_reference_bits,
+    /// Try ranges and targets are decoded instruction indices, never raw DEX
+    /// code-unit offsets. Runtime method verification establishes this.
+    try_blocks: []const TryBlock = &.{},
     register_is_ref: []bool = &.{},
     /// Full-width managed handles indexed by Dalvik register. Scalar values
     /// remain in `registers`; this sidecar preserves handle generation bits.
     reference_registers: []u64 = &.{},
     managed_memory: ?ManagedMemory = null,
+    managed_frame_state: ManagedFrameState = .{},
 
     // --- Helper Methods for Type Punning ---
     // Dalvik registers are untyped 32-bit slots. These helpers safely cast
@@ -203,6 +251,11 @@ fn managedStatus(status: ManagedMemoryStatus) RuntimeError!void {
         .ok => {},
         .null_reference => error.NullReference,
         .array_index_out_of_bounds => error.ArrayIndexOutOfBounds,
+        .negative_array_size => error.NegativeArraySize,
+        .managed_exception => error.ManagedException,
+        .stack_overflow => error.StackOverflow,
+        .illegal_monitor_state => error.IllegalMonitorState,
+        .monitor_capacity_exceeded => error.MonitorCapacityExceeded,
         .failure => error.ManagedMemoryFailure,
     };
 }
@@ -211,12 +264,176 @@ fn managedMemory(frame: *const ExecutionFrame) RuntimeError!ManagedMemory {
     return frame.managed_memory orelse error.MissingManagedMemory;
 }
 
+fn invokeManaged(frame: *ExecutionFrame, invocation: *const Invoke) RuntimeError!void {
+    const memory = try managedMemory(frame);
+    const callback = memory.vtable.invoke_method orelse return error.UnimplementedOpcode;
+    try pollManagedFrame(frame);
+    var result: ExecutionResult = .{ .kind = .void };
+    var exception_bits = null_reference_bits;
+    const status = callback(
+        memory.context,
+        invocation,
+        frame.registers,
+        frame.reference_registers,
+        frame.register_is_ref,
+        &result,
+        &exception_bits,
+    );
+    if (status == .managed_exception) {
+        if (@as(u32, @truncate(exception_bits)) == std.math.maxInt(u32)) {
+            return error.ManagedMemoryFailure;
+        }
+        frame.pending_exception = exception_bits;
+        return error.ManagedException;
+    }
+    try managedStatus(status);
+    frame.pending_exception = null_reference_bits;
+    switch (result.kind) {
+        .void => {
+            frame.result_register = .{ 0, 0 };
+            frame.result_reference = null_reference_bits;
+        },
+        .single => {
+            frame.result_register = .{ result.value32, 0 };
+            frame.result_reference = null_reference_bits;
+            if (invocation.dest) |dest| {
+                frame.registers[dest] = result.value32;
+                setRef(frame.register_is_ref, dest, false);
+            }
+        },
+        .wide => {
+            frame.result_register = .{ @truncate(result.value64), @truncate(result.value64 >> 32) };
+            frame.result_reference = null_reference_bits;
+            if (invocation.dest) |dest| {
+                setWide(frame.registers, dest, result.value64);
+                setRefWide(frame.register_is_ref, dest, false);
+            }
+        },
+        .object => {
+            frame.result_register = .{ @truncate(result.value64), 0 };
+            frame.result_reference = result.value64;
+            if (invocation.dest) |dest| setReferenceBits(frame, dest, result.value64);
+        },
+    }
+}
+
+fn catchTarget(frame: *ExecutionFrame, throwing_pc: u32) RuntimeError!?u32 {
+    if (@as(u32, @truncate(frame.pending_exception)) == std.math.maxInt(u32)) {
+        return error.ManagedMemoryFailure;
+    }
+    var selected: ?u32 = null;
+    var selected_span: u32 = std.math.maxInt(u32);
+    for (frame.try_blocks) |try_block| {
+        if (throwing_pc < try_block.start_pc or throwing_pc >= try_block.end_pc) continue;
+        const span = try_block.end_pc - try_block.start_pc;
+        if (span >= selected_span) continue;
+        for (try_block.handlers) |handler| {
+            const matches = if (handler.type_idx) |type_idx| blk: {
+                const memory = try managedMemory(frame);
+                const callback = memory.vtable.exception_matches orelse return error.ManagedMemoryFailure;
+                var result = false;
+                try managedStatus(callback(memory.context, frame.pending_exception, type_idx, &result));
+                break :blk result;
+            } else true;
+            if (!matches) continue;
+            if (handler.target_pc >= frame.instructions.len) return error.InvalidFrame;
+            selected = handler.target_pc;
+            selected_span = span;
+            break;
+        }
+    }
+    return selected;
+}
+
+fn invokeManagedWithCatch(
+    frame: *ExecutionFrame,
+    invocation: *const Invoke,
+    throwing_pc: u32,
+) RuntimeError!?u32 {
+    invokeManaged(frame, invocation) catch |err| switch (err) {
+        error.ManagedException => return (try catchTarget(frame, throwing_pc)) orelse error.ManagedException,
+        else => return err,
+    };
+    return null;
+}
+
+fn monitorEnterManaged(frame: *ExecutionFrame, object_bits: u64) RuntimeError!void {
+    if (!frame.managed_frame_state.active) return error.InvalidFrame;
+    if (frame.managed_frame_state.held_monitor_count == ManagedFrameState.max_held_monitors) {
+        return error.MonitorCapacityExceeded;
+    }
+    const memory = try managedMemory(frame);
+    const callback = memory.vtable.monitor_enter orelse return error.UnimplementedOpcode;
+    try pollManagedFrame(frame);
+    try managedStatus(callback(memory.context, object_bits));
+    const index: usize = frame.managed_frame_state.held_monitor_count;
+    frame.managed_frame_state.held_monitors[index] = object_bits;
+    frame.managed_frame_state.held_monitor_count += 1;
+}
+
+fn monitorExitManaged(frame: *ExecutionFrame, object_bits: u64) RuntimeError!void {
+    if (!frame.managed_frame_state.active) return error.InvalidFrame;
+    var found: ?usize = null;
+    var cursor: usize = frame.managed_frame_state.held_monitor_count;
+    while (cursor != 0) {
+        cursor -= 1;
+        if (frame.managed_frame_state.held_monitors[cursor] == object_bits) {
+            found = cursor;
+            break;
+        }
+    }
+    const index = found orelse return error.IllegalMonitorState;
+    const memory = try managedMemory(frame);
+    const callback = memory.vtable.monitor_exit orelse return error.UnimplementedOpcode;
+    try managedStatus(callback(memory.context, object_bits));
+    const count: usize = frame.managed_frame_state.held_monitor_count;
+    std.mem.copyForwards(
+        u64,
+        frame.managed_frame_state.held_monitors[index .. count - 1],
+        frame.managed_frame_state.held_monitors[index + 1 .. count],
+    );
+    frame.managed_frame_state.held_monitor_count -= 1;
+    frame.managed_frame_state.held_monitors[frame.managed_frame_state.held_monitor_count] = null_reference_bits;
+}
+
+fn enterManagedFrame(frame: *ExecutionFrame) RuntimeError!bool {
+    const memory = frame.managed_memory orelse return false;
+    const callback = memory.vtable.enter_frame orelse return false;
+    if (memory.vtable.poll_frame == null or memory.vtable.leave_frame == null) return error.InvalidFrame;
+    if (frame.register_is_ref.len != frame.registers.len or
+        frame.reference_registers.len != frame.registers.len) return error.InvalidFrame;
+    try managedStatus(callback(
+        memory.context,
+        &frame.managed_frame_state,
+        frame.reference_registers,
+        frame.register_is_ref,
+    ));
+    return true;
+}
+
+fn pollManagedFrame(frame: *ExecutionFrame) RuntimeError!void {
+    const memory = frame.managed_memory orelse return;
+    const callback = memory.vtable.poll_frame orelse return;
+    try managedStatus(callback(
+        memory.context,
+        &frame.managed_frame_state,
+        frame.reference_registers,
+        frame.register_is_ref,
+    ));
+}
+
 pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
     if ((frame.register_is_ref.len != 0 and frame.register_is_ref.len != frame.registers.len) or
         (frame.reference_registers.len != 0 and frame.reference_registers.len != frame.registers.len))
     {
         return error.InvalidFrame;
     }
+    const managed_frame_entered = try enterManagedFrame(frame);
+    defer if (managed_frame_entered) {
+        const memory = frame.managed_memory.?;
+        memory.vtable.leave_frame.?(memory.context, &frame.managed_frame_state);
+    };
+    if (managed_frame_entered) try pollManagedFrame(frame);
     // OPTIMIZATION 5: Safety Stripping
     // We explicitly disable runtime bounds checking inside the hot loop.
     // The DEX parser/verifier guarantees that `pc` and register indices are bounds-safe.
@@ -231,6 +448,7 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
     const regs_is_ref = frame.register_is_ref;
 
     while (pc < insts.len) {
+        const instruction_pc = pc;
         const inst = insts[pc];
         pc += 1; // Pre-increment PC for branch offsets
 
@@ -811,7 +1029,14 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
             // PHASE 5: Object Instantiation & Typing
             // (Runtime-dependent — implementation lives in the VM layer)
             // ==========================================
-            .new_instance => return error.UnimplementedOpcode,
+            .new_instance => |op| {
+                const memory = frame.managed_memory orelse return error.UnimplementedOpcode;
+                const allocate = memory.vtable.allocate_instance orelse return error.UnimplementedOpcode;
+                try pollManagedFrame(frame);
+                var bits: u64 = 0;
+                try managedStatus(allocate(memory.context, op.type_idx, &bits));
+                setReferenceBits(frame, op.dest, bits);
+            },
             .instance_of => return error.UnimplementedOpcode,
             .check_cast => return error.UnimplementedOpcode,
 
@@ -822,7 +1047,13 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
             // -- Static Fields --
             .sget => return error.UnimplementedOpcode,
             .sget_wide => return error.UnimplementedOpcode,
-            .sget_object => return error.UnimplementedOpcode,
+            .sget_object => |op| {
+                const memory = try managedMemory(frame);
+                const load = memory.vtable.load_static_reference orelse return error.UnimplementedOpcode;
+                var bits: u64 = 0;
+                try managedStatus(load(memory.context, op.field_idx, &bits));
+                setReferenceBits(frame, op.dest_or_src, bits);
+            },
             .sget_boolean => return error.UnimplementedOpcode,
             .sget_byte => return error.UnimplementedOpcode,
             .sget_char => return error.UnimplementedOpcode,
@@ -846,7 +1077,13 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
             // -- Instance Fields --
             .iget => return error.UnimplementedOpcode,
             .iget_wide => return error.UnimplementedOpcode,
-            .iget_object => return error.UnimplementedOpcode,
+            .iget_object => |op| {
+                const memory = try managedMemory(frame);
+                const load = memory.vtable.load_instance_reference orelse return error.UnimplementedOpcode;
+                var bits: u64 = 0;
+                try managedStatus(load(memory.context, referenceBits(frame, op.obj), op.field_idx, &bits));
+                setReferenceBits(frame, op.dest_or_src, bits);
+            },
             .iget_boolean => return error.UnimplementedOpcode,
             .iget_byte => return error.UnimplementedOpcode,
             .iget_char => return error.UnimplementedOpcode,
@@ -871,7 +1108,13 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
             // -- Quickened Fields --
             .iget_quick => return error.UnimplementedOpcode,
             .iget_wide_quick => return error.UnimplementedOpcode,
-            .iget_object_quick => return error.UnimplementedOpcode,
+            .iget_object_quick => |op| {
+                const memory = try managedMemory(frame);
+                const load = memory.vtable.load_instance_reference orelse return error.UnimplementedOpcode;
+                var bits: u64 = 0;
+                try managedStatus(load(memory.context, referenceBits(frame, op.obj), op.field_idx, &bits));
+                setReferenceBits(frame, op.dest_or_src, bits);
+            },
             .iput_quick => return error.UnimplementedOpcode,
             .iput_wide_quick => return error.UnimplementedOpcode,
             .iput_object_quick => |op| {
@@ -888,30 +1131,82 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
             // PHASE 7: Method Invocation
             // (Runtime-dependent — implementation lives in the VM layer)
             // ==========================================
-            .invoke => return error.UnimplementedOpcode,
-            .invoke_virtual_quick => return error.UnimplementedOpcode,
-            .invoke_super_quick => return error.UnimplementedOpcode,
+            .invoke => |op| if (try invokeManagedWithCatch(frame, op, @intCast(instruction_pc))) |target| {
+                pc = target;
+                continue;
+            },
+            .invoke_virtual_quick => |op| if (try invokeManagedWithCatch(frame, op, @intCast(instruction_pc))) |target| {
+                pc = target;
+                continue;
+            },
+            .invoke_super_quick => |op| if (try invokeManagedWithCatch(frame, op, @intCast(instruction_pc))) |target| {
+                pc = target;
+                continue;
+            },
 
             // ==========================================
             // PHASE 8: Exceptions & Threading
             // (Runtime-dependent — implementation lives in the VM layer)
             // ==========================================
-            .throw_ => return error.UnimplementedOpcode,
-            .move_exception => return error.UnimplementedOpcode,
-            .monitor_enter => return error.UnimplementedOpcode,
-            .monitor_exit => return error.UnimplementedOpcode,
+            .throw_ => |op| {
+                if (frame.register_is_ref.len != 0 and !frame.register_is_ref[op.src]) {
+                    return error.ManagedMemoryFailure;
+                }
+                const exception_bits = referenceBits(frame, op.src);
+                if (@as(u32, @truncate(exception_bits)) == std.math.maxInt(u32)) return error.NullReference;
+                frame.pending_exception = exception_bits;
+                if (try catchTarget(frame, @intCast(instruction_pc))) |target| {
+                    pc = target;
+                    continue;
+                }
+                return error.ManagedException;
+            },
+            .move_exception => |op| {
+                if (@as(u32, @truncate(frame.pending_exception)) == std.math.maxInt(u32)) {
+                    return error.ManagedMemoryFailure;
+                }
+                setReferenceBits(frame, op.dest, frame.pending_exception);
+                frame.pending_exception = null_reference_bits;
+            },
+            .monitor_enter => |op| try monitorEnterManaged(frame, referenceBits(frame, op.src)),
+            .monitor_exit => |op| try monitorExitManaged(frame, referenceBits(frame, op.src)),
             // ==========================================
             // PHASE 4: Memory & Arrays
             // (Runtime-dependent — implementation lives in the VM layer)
             // ==========================================
-            .array_length => return error.UnimplementedOpcode,
-            .new_array => return error.UnimplementedOpcode,
+            .array_length => |op| {
+                const memory = try managedMemory(frame);
+                const load = memory.vtable.array_length orelse return error.UnimplementedOpcode;
+                var length: u32 = 0;
+                try managedStatus(load(memory.context, referenceBits(frame, op.array), &length));
+                regs[op.dest] = length;
+                setRef(frame.register_is_ref, op.dest, false);
+            },
+            .new_array => |op| {
+                const memory = frame.managed_memory orelse return error.UnimplementedOpcode;
+                const allocate = memory.vtable.allocate_array orelse return error.UnimplementedOpcode;
+                try pollManagedFrame(frame);
+                var bits: u64 = 0;
+                try managedStatus(allocate(memory.context, op.type_idx, getInt(regs, op.size), &bits));
+                setReferenceBits(frame, op.dest, bits);
+            },
             .filled_new_array => return error.UnimplementedOpcode,
             .fill_array_data => return error.UnimplementedOpcode,
 
             .aget => return error.UnimplementedOpcode,
             .aget_wide => return error.UnimplementedOpcode,
-            .aget_object => return error.UnimplementedOpcode,
+            .aget_object => |op| {
+                const memory = try managedMemory(frame);
+                const load = memory.vtable.load_array_reference orelse return error.UnimplementedOpcode;
+                var bits: u64 = 0;
+                try managedStatus(load(
+                    memory.context,
+                    referenceBits(frame, op.array),
+                    getInt(regs, op.index),
+                    &bits,
+                ));
+                setReferenceBits(frame, op.dest_or_src, bits);
+            },
             .aget_boolean => return error.UnimplementedOpcode,
             .aget_byte => return error.UnimplementedOpcode,
             .aget_char => return error.UnimplementedOpcode,
@@ -937,23 +1232,28 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
             // PHASE 1: Returns
             // ==========================================
             .return_void => {
+                try pollManagedFrame(frame);
                 frame.pc = pc;
                 return ExecutionResult{ .kind = .void };
             },
             .return_ => |op| {
+                try pollManagedFrame(frame);
                 frame.pc = pc;
                 return ExecutionResult{ .kind = .single, .value32 = regs[op.src] };
             },
             .return_wide => |op| {
+                try pollManagedFrame(frame);
                 frame.pc = pc;
                 return ExecutionResult{ .kind = .wide, .value64 = getWide(regs, op.src) };
             },
             .return_object => |op| {
+                try pollManagedFrame(frame);
                 frame.pc = pc;
                 const bits = referenceBits(frame, op.src);
                 return ExecutionResult{ .kind = .object, .value32 = @truncate(bits), .value64 = bits };
             },
         }
+        if (pc <= instruction_pc) try pollManagedFrame(frame);
     }
 
     return error.UnexpectedEndOfCode;
@@ -972,6 +1272,72 @@ const TestManagedMemory = struct {
     instance: [3]u64 = @splat(0),
     array: [3]u64 = @splat(0),
     static: [2]u64 = @splat(0),
+    instance_result: u64 = 0,
+    array_result: u64 = 0,
+    static_result: u64 = 0,
+    allocation_result: u64 = 0,
+    length_result: u32 = 0,
+    allocation: [2]i64 = @splat(0),
+    invoke_result: ExecutionResult = .{ .kind = .void },
+    invoke_exception: u64 = null_reference_bits,
+    invoke_status: ManagedMemoryStatus = .ok,
+    invoke_calls: u32 = 0,
+    matching_catch_type: u32 = 0,
+    exception_match_calls: u32 = 0,
+
+    fn exceptionMatches(raw: *anyopaque, _: u64, catch_type: u32, output: *bool) ManagedMemoryStatus {
+        const self: *TestManagedMemory = @ptrCast(@alignCast(raw));
+        self.exception_match_calls += 1;
+        output.* = catch_type == self.matching_catch_type;
+        return .ok;
+    }
+
+    fn invokeMethod(
+        raw: *anyopaque,
+        _: *const Invoke,
+        _: []const u32,
+        _: []const u64,
+        _: []const bool,
+        output: *ExecutionResult,
+        exception_output: *u64,
+    ) ManagedMemoryStatus {
+        const self: *TestManagedMemory = @ptrCast(@alignCast(raw));
+        self.invoke_calls += 1;
+        output.* = self.invoke_result;
+        exception_output.* = self.invoke_exception;
+        return self.invoke_status;
+    }
+
+    fn loadInstance(raw: *anyopaque, _: u64, _: u32, output: *u64) ManagedMemoryStatus {
+        const self: *TestManagedMemory = @ptrCast(@alignCast(raw));
+        output.* = self.instance_result;
+        return .ok;
+    }
+
+    fn loadArray(raw: *anyopaque, _: u64, _: i32, output: *u64) ManagedMemoryStatus {
+        const self: *TestManagedMemory = @ptrCast(@alignCast(raw));
+        output.* = self.array_result;
+        return .ok;
+    }
+
+    fn loadStatic(raw: *anyopaque, _: u32, output: *u64) ManagedMemoryStatus {
+        const self: *TestManagedMemory = @ptrCast(@alignCast(raw));
+        output.* = self.static_result;
+        return .ok;
+    }
+
+    fn loadLength(raw: *anyopaque, _: u64, output: *u32) ManagedMemoryStatus {
+        const self: *TestManagedMemory = @ptrCast(@alignCast(raw));
+        output.* = self.length_result;
+        return .ok;
+    }
+
+    fn allocateArray(raw: *anyopaque, type_idx: u32, length: i32, output: *u64) ManagedMemoryStatus {
+        const self: *TestManagedMemory = @ptrCast(@alignCast(raw));
+        self.allocation = .{ type_idx, length };
+        output.* = self.allocation_result;
+        return .ok;
+    }
 
     fn storeInstance(raw: *anyopaque, object: u64, field: u32, value: u64) ManagedMemoryStatus {
         const self: *TestManagedMemory = @ptrCast(@alignCast(raw));
@@ -992,11 +1358,116 @@ const TestManagedMemory = struct {
     }
 
     const table = ManagedMemoryVTable{
+        .allocate_array = allocateArray,
+        .load_instance_reference = loadInstance,
+        .load_array_reference = loadArray,
+        .load_static_reference = loadStatic,
+        .array_length = loadLength,
+        .invoke_method = invokeMethod,
+        .exception_matches = exceptionMatches,
         .store_instance_reference = storeInstance,
         .store_array_reference = storeArray,
         .store_static_reference = storeStatic,
     };
 };
+
+const TestManagedExecution = struct {
+    enters: u32 = 0,
+    polls: u32 = 0,
+    leaves: u32 = 0,
+    allocations: u32 = 0,
+
+    fn enter(raw: *anyopaque, state: *ManagedFrameState, _: []u64, _: []const bool) ManagedMemoryStatus {
+        const self: *TestManagedExecution = @ptrCast(@alignCast(raw));
+        if (state.active) return .failure;
+        state.active = true;
+        self.enters += 1;
+        return .ok;
+    }
+
+    fn poll(raw: *anyopaque, state: *ManagedFrameState, _: []u64, _: []const bool) ManagedMemoryStatus {
+        const self: *TestManagedExecution = @ptrCast(@alignCast(raw));
+        if (!state.active) return .failure;
+        self.polls += 1;
+        return .ok;
+    }
+
+    fn leave(raw: *anyopaque, state: *ManagedFrameState) void {
+        const self: *TestManagedExecution = @ptrCast(@alignCast(raw));
+        state.active = false;
+        self.leaves += 1;
+    }
+
+    fn allocate(raw: *anyopaque, _: u32, output: *u64) ManagedMemoryStatus {
+        const self: *TestManagedExecution = @ptrCast(@alignCast(raw));
+        self.allocations += 1;
+        output.* = 0x1122_3344_5566_7788;
+        return .ok;
+    }
+
+    fn storeInstance(_: *anyopaque, _: u64, _: u32, _: u64) ManagedMemoryStatus {
+        return .ok;
+    }
+
+    fn storeArray(_: *anyopaque, _: u64, _: i32, _: u64) ManagedMemoryStatus {
+        return .ok;
+    }
+
+    fn storeStatic(_: *anyopaque, _: u32, _: u64) ManagedMemoryStatus {
+        return .ok;
+    }
+
+    const table = ManagedMemoryVTable{
+        .enter_frame = enter,
+        .poll_frame = poll,
+        .leave_frame = leave,
+        .allocate_instance = allocate,
+        .store_instance_reference = storeInstance,
+        .store_array_reference = storeArray,
+        .store_static_reference = storeStatic,
+    };
+};
+
+test "managed interpreter polls entry allocation backedges and return with balanced frame cleanup" {
+    var managed: TestManagedExecution = .{};
+    var registers = [_]u32{0} ** 4;
+    var references = [_]u64{0} ** 4;
+    var kinds = [_]bool{false} ** 4;
+    const code = [_]Instruction{
+        .{ .new_instance = .{ .dest = 3, .type_idx = 7 } },
+        .{ .const_ = .{ .dest = 0, .value = 0 } },
+        .{ .const_ = .{ .dest = 1, .value = 1 } },
+        .{ .const_ = .{ .dest = 2, .value = 3 } },
+        .{ .add_int = .{ .dest = 0, .src1 = 0, .src2 = 1 } },
+        .{ .if_lt = .{ .src1 = 0, .src2 = 2, .offset = -1 } },
+        .{ .return_object = .{ .src = 3 } },
+    };
+    var frame = ExecutionFrame{
+        .pc = 0,
+        .registers = &registers,
+        .instructions = &code,
+        .register_is_ref = &kinds,
+        .reference_registers = &references,
+        .managed_memory = .{ .context = &managed, .vtable = &TestManagedExecution.table },
+    };
+    const result = try execute(&frame);
+    try std.testing.expectEqual(@as(u64, 0x1122_3344_5566_7788), result.value64);
+    try std.testing.expectEqual(@as(u32, 1), managed.enters);
+    try std.testing.expectEqual(@as(u32, 5), managed.polls);
+    try std.testing.expectEqual(@as(u32, 1), managed.leaves);
+    try std.testing.expectEqual(@as(u32, 1), managed.allocations);
+    try std.testing.expect(!frame.managed_frame_state.active);
+
+    frame.pc = 0;
+    frame.instructions = &[_]Instruction{.{ .throw_ = .{ .src = 0 } }};
+    references[0] = 0x1234_5678_9abc_def0;
+    kinds[0] = true;
+    try std.testing.expectError(error.ManagedException, execute(&frame));
+    try std.testing.expectEqual(@as(u64, 0x1234_5678_9abc_def0), frame.pending_exception);
+    try std.testing.expectEqual(@as(u32, 2), managed.enters);
+    try std.testing.expectEqual(@as(u32, 2), managed.leaves);
+    try std.testing.expect(!frame.managed_frame_state.active);
+}
 
 test "interpreter reference stores preserve full handles through managed callbacks" {
     const object_bits: u64 = 0x1122_3344_5566_7788;
@@ -1023,6 +1494,154 @@ test "interpreter reference stores preserve full handles through managed callbac
     try std.testing.expectEqualSlices(u64, &.{ object_bits, 7, value_bits }, &memory.instance);
     try std.testing.expectEqualSlices(u64, &.{ object_bits, 2, value_bits }, &memory.array);
     try std.testing.expectEqualSlices(u64, &.{ 9, value_bits }, &memory.static);
+}
+
+test "interpreter reference loads arrays and allocation preserve full handles" {
+    const object_bits: u64 = 0x1111_2222_3333_4444;
+    const array_bits: u64 = 0xaaaa_bbbb_cccc_dddd;
+    const instance_bits: u64 = 0x0123_4567_89ab_cdef;
+    const element_bits: u64 = 0xfedc_ba98_7654_3210;
+    const static_bits: u64 = 0x8877_6655_4433_2211;
+    const allocated_bits: u64 = 0x1020_3040_5060_7080;
+    var memory = TestManagedMemory{
+        .instance_result = instance_bits,
+        .array_result = element_bits,
+        .static_result = static_bits,
+        .allocation_result = allocated_bits,
+        .length_result = 23,
+    };
+    var registers = [_]u32{ 0, 0, 0, 2, 0, 4, 0, 0, 0 };
+    var references = [_]u64{ object_bits, 0, array_bits, 0, 0, 0, 0, 0, 0 };
+    var kinds = [_]bool{ true, false, true, false, false, false, false, false, false };
+    const code = [_]Instruction{
+        .{ .iget_object = .{ .field_idx = 7, .dest_or_src = 1, .obj = 0 } },
+        .{ .iget_object_quick = .{ .field_idx = 8, .dest_or_src = 4, .obj = 0 } },
+        .{ .aget_object = .{ .dest_or_src = 6, .array = 2, .index = 3 } },
+        .{ .sget_object = .{ .field_idx = 9, .dest_or_src = 7 } },
+        .{ .array_length = .{ .dest = 8, .array = 2 } },
+        .{ .new_array = .{ .type_idx = 5, .dest = 5, .size = 5 } },
+        .{ .return_object = .{ .src = 5 } },
+    };
+    var frame = ExecutionFrame{
+        .pc = 0,
+        .registers = &registers,
+        .instructions = &code,
+        .register_is_ref = &kinds,
+        .reference_registers = &references,
+        .managed_memory = .{ .context = &memory, .vtable = &TestManagedMemory.table },
+    };
+    const result = try execute(&frame);
+    try std.testing.expectEqual(instance_bits, references[1]);
+    try std.testing.expectEqual(instance_bits, references[4]);
+    try std.testing.expectEqual(element_bits, references[6]);
+    try std.testing.expectEqual(static_bits, references[7]);
+    try std.testing.expectEqual(@as(u32, 23), registers[8]);
+    try std.testing.expect(!kinds[8]);
+    try std.testing.expectEqualSlices(i64, &.{ 5, 4 }, &memory.allocation);
+    try std.testing.expectEqual(allocated_bits, result.value64);
+}
+
+test "managed memory status preserves array exception categories" {
+    try std.testing.expectError(error.NullReference, managedStatus(.null_reference));
+    try std.testing.expectError(error.ArrayIndexOutOfBounds, managedStatus(.array_index_out_of_bounds));
+    try std.testing.expectError(error.NegativeArraySize, managedStatus(.negative_array_size));
+}
+
+test "managed invocation transfers results and propagates full-width exceptions" {
+    const object_result: u64 = 0x1234_5678_9abc_def0;
+    const exception_bits: u64 = 0xfedc_ba98_7654_3210;
+    const args = [_]u16{0};
+    var invocation = Invoke{
+        .class_name = "Test",
+        .method_name = "callee",
+        .signature = "()Ljava/lang/Object;",
+        .args = &args,
+        .dest = null,
+        .kind = .static,
+    };
+    var memory = TestManagedMemory{
+        .invoke_result = .{ .kind = .object, .value64 = object_result },
+    };
+    var registers = [_]u32{ 7, 0 };
+    var references = [_]u64{ null_reference_bits, null_reference_bits };
+    var kinds = [_]bool{ false, false };
+    const code = [_]Instruction{
+        .{ .invoke = &invocation },
+        .{ .move_result_object = .{ .dest = 1 } },
+        .{ .return_object = .{ .src = 1 } },
+    };
+    var frame = ExecutionFrame{
+        .pc = 0,
+        .registers = &registers,
+        .instructions = &code,
+        .register_is_ref = &kinds,
+        .reference_registers = &references,
+        .managed_memory = .{ .context = &memory, .vtable = &TestManagedMemory.table },
+    };
+    const result = try execute(&frame);
+    try std.testing.expectEqual(object_result, result.value64);
+    try std.testing.expectEqual(@as(u32, 1), memory.invoke_calls);
+
+    memory.invoke_status = .managed_exception;
+    memory.invoke_exception = exception_bits;
+    frame.pc = 0;
+    frame.instructions = &[_]Instruction{.{ .invoke_virtual_quick = &invocation }};
+    try std.testing.expectError(error.ManagedException, execute(&frame));
+    try std.testing.expectEqual(exception_bits, frame.pending_exception);
+
+    frame.pc = 0;
+    frame.instructions = &[_]Instruction{
+        .{ .move_exception = .{ .dest = 0 } },
+        .{ .return_object = .{ .src = 0 } },
+    };
+    const caught = try execute(&frame);
+    try std.testing.expectEqual(exception_bits, caught.value64);
+    try std.testing.expectEqual(null_reference_bits, frame.pending_exception);
+}
+
+test "typed handlers select the innermost match and transfer pending exception" {
+    const exception_bits: u64 = 0x1234_5678_9abc_def0;
+    const inner_handlers = [_]instmod.CatchHandler{.{ .type_idx = 20, .target_pc = 2 }};
+    const outer_handlers = [_]instmod.CatchHandler{.{ .type_idx = null, .target_pc = 4 }};
+    const try_blocks = [_]TryBlock{
+        .{ .start_pc = 0, .end_pc = 1, .handlers = &inner_handlers },
+        .{ .start_pc = 0, .end_pc = 2, .handlers = &outer_handlers },
+    };
+    var memory = TestManagedMemory{ .matching_catch_type = 20 };
+    var registers = [_]u32{ @truncate(exception_bits), 0 };
+    var references = [_]u64{ exception_bits, null_reference_bits };
+    var kinds = [_]bool{ true, false };
+    const code = [_]Instruction{
+        .{ .throw_ = .{ .src = 0 } },
+        .return_void,
+        .{ .move_exception = .{ .dest = 1 } },
+        .{ .return_object = .{ .src = 1 } },
+        .{ .move_exception = .{ .dest = 1 } },
+        .{ .return_object = .{ .src = 1 } },
+    };
+    var frame = ExecutionFrame{
+        .pc = 0,
+        .registers = &registers,
+        .instructions = &code,
+        .try_blocks = &try_blocks,
+        .register_is_ref = &kinds,
+        .reference_registers = &references,
+        .managed_memory = .{ .context = &memory, .vtable = &TestManagedMemory.table },
+    };
+    const result = try execute(&frame);
+    try std.testing.expectEqual(exception_bits, result.value64);
+    try std.testing.expectEqual(@as(u32, 4), frame.pc);
+    try std.testing.expectEqual(@as(u32, 1), memory.exception_match_calls);
+    try std.testing.expectEqual(null_reference_bits, frame.pending_exception);
+
+    memory.matching_catch_type = 99;
+    frame.pc = 0;
+    frame.pending_exception = null_reference_bits;
+    kinds = .{ true, false };
+    references = .{ exception_bits, null_reference_bits };
+    const caught_by_outer = try execute(&frame);
+    try std.testing.expectEqual(exception_bits, caught_by_outer.value64);
+    try std.testing.expectEqual(@as(u32, 6), frame.pc);
 }
 
 test "ExecutionFrame register helpers" {

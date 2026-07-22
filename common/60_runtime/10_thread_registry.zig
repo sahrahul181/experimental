@@ -120,6 +120,26 @@ pub const ThreadContext = struct {
         return self.root_slots.items.len;
     }
 
+    /// Captures a nested owner-only root boundary without allocating. The
+    /// returned mark remains valid until roots below it are explicitly
+    /// removed. Interpreter frames use this to publish only their currently
+    /// reference-typed registers at each cooperative poll.
+    pub fn rootMark(self: *const ThreadContext) Error!usize {
+        const current = self.state.load(.acquire);
+        if (current != .detached and current != .running) return error.InvalidState;
+        return self.root_slots.items.len;
+    }
+
+    /// Restores a previously captured owner-only root boundary. This operation
+    /// never allocates and is the rollback primitive for transactional frame
+    /// root refreshes.
+    pub fn restoreRootMark(self: *ThreadContext, mark: usize) Error!void {
+        const current = self.state.load(.acquire);
+        if (current != .detached and current != .running) return error.InvalidState;
+        if (mark > self.root_slots.items.len) return error.InvalidState;
+        self.root_slots.shrinkRetainingCapacity(mark);
+    }
+
     fn publishRoots(self: *ThreadContext, epoch: u64) void {
         const previous = self.published_snapshot.load(.monotonic);
         const target: u8 = previous ^ 1;

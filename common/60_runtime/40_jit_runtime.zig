@@ -10,6 +10,7 @@ const runtime_value = @import("runtime_value");
 const runtime_stack_map = @import("runtime_stack_map");
 const thread_registry = @import("runtime_thread_registry");
 const runtime_gc = @import("runtime_gc");
+const runtime_monitor = @import("runtime_monitor");
 const runtime_code_manager = @import("runtime_code_manager");
 const runtime_deopt = @import("runtime_deopt");
 
@@ -18,12 +19,13 @@ const HandleTable = runtime_value.HandleTable;
 const Registry = thread_registry.Registry;
 const ThreadContext = thread_registry.ThreadContext;
 
-pub const Error = runtime_value.Error || runtime_stack_map.Error || thread_registry.Error || runtime_gc.Error || runtime_code_manager.Error || runtime_deopt.Error || std.mem.Allocator.Error || error{
+pub const Error = runtime_value.Error || runtime_stack_map.Error || thread_registry.Error || runtime_gc.Error || runtime_monitor.Error || runtime_code_manager.Error || runtime_deopt.Error || std.mem.Allocator.Error || error{
     ActiveEntries,
     ActiveCodeLease,
     InactiveEntry,
     InvalidTableLayout,
     MissingCollector,
+    MissingMonitorTable,
     PendingException,
     ThreadNotRunning,
 };
@@ -50,6 +52,8 @@ pub const ManagedExceptionKind = enum(u32) {
     none = 0,
     array_index_out_of_bounds = 1,
 };
+
+pub const max_native_monitors = 16;
 
 /// Allocation-free exception payload produced by generated code. Object
 /// materialization and handler lookup happen only after leaving the native
@@ -88,6 +92,9 @@ pub const SlowResolveStatus = enum(u32) {
     missing_canonical_root,
     missing_collector,
     gc_barrier_failure,
+    missing_monitor,
+    illegal_monitor_state,
+    monitor_capacity,
 };
 
 /// Pinned for the duration of a native call. r15 points here, allowing the
@@ -103,6 +110,9 @@ pub const NativeThreadState = extern struct {
     root_map_table: usize = 0,
     collector: usize = 0,
     satb_buffer: usize = 0,
+    monitor_table: usize = 0,
+    held_monitors: [max_native_monitors]u64 = @splat(@bitCast(Handle.none)),
+    held_monitor_count: u32 = 0,
     last_card_destination: u64 = 0,
     pending_exception: ManagedException = .{},
     code_manager: usize = 0,
@@ -134,6 +144,10 @@ pub const Stats = struct {
     code_failures: u64,
     deoptimizations: u64,
     deopt_failures: u64,
+    monitor_enters: u64,
+    monitor_exits: u64,
+    monitor_unwind_exits: u64,
+    monitor_failures: u64,
 };
 
 const Counters = struct {
@@ -153,6 +167,10 @@ const Counters = struct {
     code_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     deoptimizations: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     deopt_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    monitor_enters: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    monitor_exits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    monitor_unwind_exits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    monitor_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 pub const Runtime = struct {
@@ -161,6 +179,7 @@ pub const Runtime = struct {
     registry: *Registry,
     region_bases: []usize,
     collector: ?*runtime_gc.ConcurrentCollector = null,
+    monitor_table: ?*runtime_monitor.MonitorTable = null,
     code_manager: ?*runtime_code_manager.Manager = null,
     counters: Counters = .{},
 
@@ -197,6 +216,16 @@ pub const Runtime = struct {
         if (self.counters.active_entries.load(.acquire) != 0) return error.ActiveEntries;
         if (collector.handleTable() != self.handles) return error.InvalidTableLayout;
         self.collector = collector;
+    }
+
+    pub fn installMonitorTable(self: *Runtime, monitors: *runtime_monitor.MonitorTable) Error!void {
+        if (self.counters.active_entries.load(.acquire) != 0) return error.ActiveEntries;
+        if (monitors.handleTable() != self.handles) return error.InvalidTableLayout;
+        const collector = self.collector orelse return error.MissingCollector;
+        for (monitors.rootSlotAddresses()) |address| {
+            if (!collector.isStaticRootSlot(address)) return error.InvalidTableLayout;
+        }
+        self.monitor_table = monitors;
     }
 
     /// Installs the immutable-code publication domain used by architecture
@@ -239,6 +268,7 @@ pub const Runtime = struct {
                 .request_epoch_address = self.registry.requestEpochAddress(),
                 .collector = collector_address,
                 .satb_buffer = buffer_address,
+                .monitor_table = if (self.monitor_table) |monitors| @intFromPtr(monitors) else 0,
             },
         };
     }
@@ -261,6 +291,10 @@ pub const Runtime = struct {
             .code_failures = self.counters.code_failures.load(.acquire),
             .deoptimizations = self.counters.deoptimizations.load(.acquire),
             .deopt_failures = self.counters.deopt_failures.load(.acquire),
+            .monitor_enters = self.counters.monitor_enters.load(.acquire),
+            .monitor_exits = self.counters.monitor_exits.load(.acquire),
+            .monitor_unwind_exits = self.counters.monitor_unwind_exits.load(.acquire),
+            .monitor_failures = self.counters.monitor_failures.load(.acquire),
         };
     }
 };
@@ -276,6 +310,7 @@ pub const ManagedEntry = struct {
 
     pub fn deinit(self: *ManagedEntry) void {
         if (!self.active) return;
+        releaseHeldMonitors(&self.native_state);
         if (self.code_lease) |*lease| lease.deinit();
         self.code_lease = null;
         if (self.code_reader) |*reader| reader.deinit();
@@ -315,6 +350,7 @@ pub const ManagedEntry = struct {
             if (collector.bufferForThread(self.context)) |buffer| @intFromPtr(buffer) else return error.MissingSatbBuffer
         else
             0;
+        self.native_state.monitor_table = if (self.runtime.monitor_table) |monitors| @intFromPtr(monitors) else 0;
         self.native_state.code_manager = if (self.runtime.code_manager) |manager| @intFromPtr(manager) else 0;
         self.native_state.code_reader = if (self.code_reader) |*reader| @intFromPtr(reader) else 0;
         self.native_state.code_lease_slot = @intFromPtr(&self.code_lease);
@@ -591,6 +627,10 @@ pub fn midFunctionDeoptBridge(state: *NativeThreadState, site_id: u32) callconv(
     if (state.active == 0 or state.deopt_request == 0 or state.code_lease_slot == 0) {
         return deoptFailure(state, null);
     }
+    // Until monitor ownership is represented in immutable deoptimization
+    // metadata, never transfer a frame while this native activation owns a
+    // monitor. The entry remains responsible for fail-safe reverse unwind.
+    if (state.held_monitor_count != 0) return deoptFailure(state, null);
     const lease_slot: *?runtime_code_manager.Lease = @ptrFromInt(state.code_lease_slot);
     const lease = if (lease_slot.*) |*value| value else return deoptFailure(state, null);
     const metadata = lease.metadata() orelse return deoptFailure(state, null);
@@ -699,6 +739,8 @@ fn statusFor(err: Error) SlowResolveStatus {
         error.Shutdown => .shutdown,
         error.MissingSafepoint => .missing_root_map,
         error.MissingCollector, error.MissingSatbBuffer => .missing_collector,
+        error.MissingMonitorTable => .missing_monitor,
+        error.IllegalMonitorState => .illegal_monitor_state,
         else => .runtime_error,
     };
 }
@@ -741,6 +783,119 @@ fn addMappedRoots(
         if (slot.* == handle_bits) found_canonical = true;
     }
     if (!found_canonical) return error.InvalidLocation;
+}
+
+fn monitorFailure(state: *NativeThreadState, status: SlowResolveStatus) usize {
+    state.last_error = status;
+    _ = state.runtime.counters.monitor_failures.fetchAdd(1, .monotonic);
+    return 0;
+}
+
+fn prepareMonitorSafepoint(
+    state: *NativeThreadState,
+    handle_bits: u64,
+    site_key: u64,
+    roots: *thread_registry.RootScope,
+) Error!void {
+    if (state.active == 0) return error.InactiveEntry;
+    if (!state.context.isRunning()) return error.ThreadNotRunning;
+    try addMappedRoots(state, handle_bits, site_key, roots);
+    const participated = try state.runtime.registry.poll(state.context);
+    if (participated) _ = state.runtime.counters.handshake_polls.fetchAdd(1, .monotonic);
+    state.acknowledged_epoch = state.context.observedEpoch();
+}
+
+/// Safepointing monitor-enter target. The preserve-all adapter has captured
+/// the exact machine-site roots before this function is reached. Acquisition
+/// itself is allocation-free; only the contended path transitions the thread
+/// to passive blocked state and waits.
+pub fn monitorEnterBridge(state: *NativeThreadState, handle_bits: u64, site_key: u64) callconv(.c) usize {
+    state.last_site_key = site_key;
+    state.last_error = .ok;
+    if (state.held_monitor_count >= max_native_monitors) return monitorFailure(state, .monitor_capacity);
+    if (state.monitor_table == 0) return monitorFailure(state, .missing_monitor);
+    if (state.collector == 0 or state.satb_buffer == 0) return monitorFailure(state, .missing_collector);
+
+    var roots = state.context.beginRootScope() catch |err| return monitorFailure(state, statusFor(err));
+    defer roots.deinit();
+    prepareMonitorSafepoint(state, handle_bits, site_key, &roots) catch |err| {
+        return monitorFailure(state, if (err == error.InvalidLocation) .missing_canonical_root else statusFor(err));
+    };
+
+    const monitors: *runtime_monitor.MonitorTable = @ptrFromInt(state.monitor_table);
+    const collector: *runtime_gc.ConcurrentCollector = @ptrFromInt(state.collector);
+    const satb: *runtime_gc.SatbBuffer = @ptrFromInt(state.satb_buffer);
+    const handle: Handle = @bitCast(handle_bits);
+    monitors.enter(handle, collector, state.runtime.registry, state.context, satb) catch |err| {
+        return monitorFailure(state, statusFor(err));
+    };
+    state.held_monitors[state.held_monitor_count] = handle_bits;
+    state.held_monitor_count += 1;
+    _ = state.runtime.counters.monitor_enters.fetchAdd(1, .monotonic);
+    return 1;
+}
+
+/// Safepointing monitor-exit target. Ownership is checked against both the
+/// native frame's acquisition stack and the shared monitor table before the
+/// stack entry is removed.
+pub fn monitorExitBridge(state: *NativeThreadState, handle_bits: u64, site_key: u64) callconv(.c) usize {
+    state.last_site_key = site_key;
+    state.last_error = .ok;
+    if (state.held_monitor_count > max_native_monitors) return monitorFailure(state, .runtime_error);
+    var found: ?usize = null;
+    var cursor: usize = state.held_monitor_count;
+    while (cursor != 0) {
+        cursor -= 1;
+        if (state.held_monitors[cursor] == handle_bits) {
+            found = cursor;
+            break;
+        }
+    }
+    const index = found orelse return monitorFailure(state, .illegal_monitor_state);
+    if (state.monitor_table == 0) return monitorFailure(state, .missing_monitor);
+    if (state.collector == 0 or state.satb_buffer == 0) return monitorFailure(state, .missing_collector);
+
+    var roots = state.context.beginRootScope() catch |err| return monitorFailure(state, statusFor(err));
+    defer roots.deinit();
+    prepareMonitorSafepoint(state, handle_bits, site_key, &roots) catch |err| {
+        return monitorFailure(state, if (err == error.InvalidLocation) .missing_canonical_root else statusFor(err));
+    };
+
+    const monitors: *runtime_monitor.MonitorTable = @ptrFromInt(state.monitor_table);
+    const collector: *runtime_gc.ConcurrentCollector = @ptrFromInt(state.collector);
+    const satb: *runtime_gc.SatbBuffer = @ptrFromInt(state.satb_buffer);
+    monitors.exit(@bitCast(handle_bits), collector, satb) catch |err| {
+        return monitorFailure(state, statusFor(err));
+    };
+    const count: usize = state.held_monitor_count;
+    std.mem.copyForwards(u64, state.held_monitors[index .. count - 1], state.held_monitors[index + 1 .. count]);
+    state.held_monitor_count -= 1;
+    state.held_monitors[state.held_monitor_count] = @bitCast(Handle.none);
+    _ = state.runtime.counters.monitor_exits.fetchAdd(1, .monotonic);
+    return 1;
+}
+
+fn releaseHeldMonitors(state: *NativeThreadState) void {
+    if (state.held_monitor_count > max_native_monitors or state.monitor_table == 0 or
+        state.collector == 0 or state.satb_buffer == 0)
+    {
+        if (state.held_monitor_count != 0) _ = monitorFailure(state, .runtime_error);
+        return;
+    }
+    const monitors: *runtime_monitor.MonitorTable = @ptrFromInt(state.monitor_table);
+    const collector: *runtime_gc.ConcurrentCollector = @ptrFromInt(state.collector);
+    const satb: *runtime_gc.SatbBuffer = @ptrFromInt(state.satb_buffer);
+    while (state.held_monitor_count != 0) {
+        const index = state.held_monitor_count - 1;
+        const handle: Handle = @bitCast(state.held_monitors[index]);
+        monitors.exit(handle, collector, satb) catch |err| {
+            _ = monitorFailure(state, statusFor(err));
+            return;
+        };
+        state.held_monitors[index] = @bitCast(Handle.none);
+        state.held_monitor_count = index;
+        _ = state.runtime.counters.monitor_unwind_exits.fetchAdd(1, .monotonic);
+    }
 }
 
 /// Normal platform-ABI target called by the preserve-all machine-code adapter.

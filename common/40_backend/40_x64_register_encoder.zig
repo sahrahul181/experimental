@@ -26,7 +26,9 @@ pub const Error = code_buffer.Error || regalloc.Error || runtime_stack_map.Error
     InvalidDeoptMetadata,
     InvalidRuntimeAbi,
     MissingBarrierHelper,
+    MissingNumericHelper,
     MissingExceptionHelper,
+    MissingMonitorHelper,
     MissingArrayLayout,
     MissingFieldLayout,
     MissingStaticFieldLayout,
@@ -97,6 +99,10 @@ pub const RuntimeAbi = struct {
     card_mark_helper: usize = 0,
     card_mark_repeat_helper: usize = 0,
     static_root_post_write_helper: usize = 0,
+    monitor_enter_helper: usize = 0,
+    monitor_exit_helper: usize = 0,
+    f32_remainder_helper: usize = 0,
+    f64_remainder_helper: usize = 0,
     deopt_epoch_address: usize = 0,
     compiled_deopt_epoch: u64 = 0,
     deopt_helper: usize = 0,
@@ -187,6 +193,8 @@ pub const Stats = struct {
     card_barriers: u32 = 0,
     card_repeat_barriers: u32 = 0,
     static_root_barriers: u32 = 0,
+    monitor_enters: u32 = 0,
+    monitor_exits: u32 = 0,
     root_map_sites: u32 = 0,
     root_map_locations: u32 = 0,
     edge_copy_sites: u32 = 0,
@@ -216,6 +224,8 @@ pub const Stats = struct {
     xmm_comparisons: u32 = 0,
     xmm_conversions: u32 = 0,
     xmm_saturating_conversions: u32 = 0,
+    xmm_remainders: u32 = 0,
+    numeric_helper_calls: u32 = 0,
 };
 
 pub const Function = struct {
@@ -248,22 +258,27 @@ pub const Function = struct {
             ((self.stats.frame_bytes == 0) != (self.allocation.stats.spills == 0))) return error.InvalidMachine;
         const xmm_spill_insts = std.math.add(u32, self.stats.xmm_spill_loads, self.stats.xmm_spill_stores) catch return error.InvalidMachine;
         const xmm_unary_and_compare = std.math.add(u32, self.stats.xmm_negations, self.stats.xmm_comparisons) catch return error.InvalidMachine;
-        const xmm_semantic_sites = std.math.add(u32, xmm_unary_and_compare, self.stats.xmm_conversions) catch return error.InvalidMachine;
+        const xmm_conversion_and_remainder = std.math.add(u32, self.stats.xmm_conversions, self.stats.xmm_remainders) catch return error.InvalidMachine;
+        const xmm_semantic_sites = std.math.add(u32, xmm_unary_and_compare, xmm_conversion_and_remainder) catch return error.InvalidMachine;
         if (self.stats.xmm_spill_loads > self.stats.spill_loads or
             self.stats.xmm_spill_stores > self.stats.spill_stores or
             self.stats.xmm_saturating_conversions > self.stats.xmm_conversions or
+            self.stats.numeric_helper_calls != self.stats.xmm_remainders or
             xmm_spill_insts > self.stats.xmm_insts or xmm_semantic_sites > self.stats.xmm_insts) return error.InvalidMachine;
         if (self.stats.edge_copy_sites != self.source.edges.len or self.stats.edge_copy_moves != self.source.stats.edge_moves) return error.InvalidMachine;
         const resolve_sites = std.math.add(u32, self.source.stats.resolves, self.source.stats.loop_epoch_guards) catch return error.InvalidMachine;
         const emitted_resolves = std.math.add(u32, self.source.stats.resolves, self.stats.osr_derived_rematerializations) catch return error.InvalidMachine;
         const emitted_cold_resolves = std.math.add(u32, resolve_sites, self.stats.osr_derived_rematerializations) catch return error.InvalidMachine;
-        const machine_safepoint_sites = std.math.add(u32, resolve_sites, self.source.stats.bounds_exception_sites) catch return error.InvalidMachine;
+        const monitor_sites = std.math.add(u32, self.source.stats.monitor_sites, self.source.stats.bounds_exception_sites) catch return error.InvalidMachine;
+        const machine_safepoint_sites = std.math.add(u32, resolve_sites, monitor_sites) catch return error.InvalidMachine;
+        const emitted_monitor_sites = std.math.add(u32, self.stats.monitor_enters, self.stats.monitor_exits) catch return error.InvalidMachine;
         const deopt_sites = std.math.add(u32, machine_safepoint_sites, self.stats.deopt_block_entries) catch return error.InvalidMachine;
         const safepoint_sites = std.math.add(u32, deopt_sites, self.stats.osr_landing_safepoints) catch return error.InvalidMachine;
         if (self.stats.descriptor_loads != emitted_resolves or self.stats.fast_resolves != emitted_resolves or
             self.stats.cold_resolve_sites != emitted_cold_resolves or self.stats.loop_epoch_guards != self.source.stats.loop_epoch_guards or
             self.stats.loop_epoch_slow_sites != self.source.stats.loop_epoch_guards or
-            self.stats.bounds_exception_sites != self.source.stats.bounds_exception_sites) return error.InvalidMachine;
+            self.stats.bounds_exception_sites != self.source.stats.bounds_exception_sites or
+            emitted_monitor_sites != self.source.stats.monitor_sites) return error.InvalidMachine;
         if ((safepoint_sites == 0) != (self.root_maps == null)) return error.InvalidMachine;
         if (self.root_maps) |maps| {
             if (maps.records.len != safepoint_sites or self.stats.root_map_sites != safepoint_sites) return error.InvalidMachine;
@@ -350,7 +365,7 @@ pub const Function = struct {
             },
         );
         try writer.print(
-            " nonvolatile_frame_bytes={d} xmm_insts={d} xmm_spill_loads={d} xmm_spill_stores={d} xmm_negations={d} xmm_comparisons={d} xmm_conversions={d} xmm_saturating={d} deopt_block_entries={d} osr_entries={d} osr_frame_landings={d} osr_landing_safepoints={d} osr_remats={d} osr_restart_edges={d}\n",
+            " nonvolatile_frame_bytes={d} xmm_insts={d} xmm_spill_loads={d} xmm_spill_stores={d} xmm_negations={d} xmm_comparisons={d} xmm_conversions={d} xmm_saturating={d} xmm_remainders={d} numeric_helper_calls={d} deopt_block_entries={d} osr_entries={d} osr_frame_landings={d} osr_landing_safepoints={d} osr_remats={d} osr_restart_edges={d}\n",
             .{
                 self.stats.nonvolatile_frame_bytes,
                 self.stats.xmm_insts,
@@ -360,6 +375,8 @@ pub const Function = struct {
                 self.stats.xmm_comparisons,
                 self.stats.xmm_conversions,
                 self.stats.xmm_saturating_conversions,
+                self.stats.xmm_remainders,
+                self.stats.numeric_helper_calls,
                 self.stats.deopt_block_entries,
                 self.stats.osr_entries,
                 self.stats.osr_frame_landings,
@@ -679,6 +696,28 @@ fn emitLeaRawMemory(buffer: *code_buffer.Buffer, dst: u4, base: u4, displacement
 /// no-safepoint adapter; r10/r11 are reserved barrier arguments.
 fn emitBarrierCall(buffer: *code_buffer.Buffer, helper: usize) Error!void {
     if (helper == 0) return error.MissingBarrierHelper;
+    try emitPushRaw(buffer, 0);
+    try emitMovRawImm64(buffer, 0, helper);
+    try emitCallRaw(buffer, 0);
+    try emitPopRaw(buffer, 0);
+}
+
+/// Calls a no-safepoint preserve-all numeric adapter. Raw operands are in
+/// r10/r11 and the raw result returns in r10; rax may contain a live managed
+/// value and is therefore preserved by the generated caller.
+fn emitNumericCall(buffer: *code_buffer.Buffer, helper: usize) Error!void {
+    if (helper == 0) return error.MissingNumericHelper;
+    try emitPushRaw(buffer, 0);
+    try emitMovRawImm64(buffer, 0, helper);
+    try emitCallRaw(buffer, 0);
+    try emitPopRaw(buffer, 0);
+}
+
+/// Calls a safepointing preserve-all adapter. The adapter captures the exact
+/// root-map locations before entering the runtime and reloads r12 after a
+/// handshake. r10 carries the canonical Handle and r11 the site key.
+fn emitMonitorCall(buffer: *code_buffer.Buffer, helper: usize) Error!void {
+    if (helper == 0) return error.MissingMonitorHelper;
     try emitPushRaw(buffer, 0);
     try emitMovRawImm64(buffer, 0, helper);
     try emitCallRaw(buffer, 0);
@@ -2075,6 +2114,48 @@ fn encodeInst(
                         else => {},
                     }
                 },
+                .rem => {
+                    if (wide) {
+                        if (inst.defs.len != 2 or inst.uses.len != 4 or
+                            source.reg_types[inst.defs[0]] != .double or
+                            source.reg_types[inst.uses[0]] != .double or
+                            source.reg_types[inst.uses[2]] != .double) return error.InvalidMachine;
+                    } else {
+                        if (inst.defs.len != 1 or inst.uses.len != 2 or
+                            source.reg_types[inst.defs[0]] != .float or
+                            source.reg_types[inst.uses[0]] != .float or
+                            source.reg_types[inst.uses[1]] != .float) return error.InvalidMachine;
+                    }
+                    const abi = runtime orelse return error.MissingRuntimeAbi;
+                    const rhs_use: machine.RegId = inst.uses[if (wide) 2 else 1];
+                    const dst_location = allocation.locationOf(inst.defs[0]) orelse return error.InvalidMachine;
+                    const dst: regalloc.PhysReg = switch (dst_location) {
+                        .phys => |physical| physical,
+                        .spill => xmm_scratch_primary,
+                        .none => return error.InvalidMachine,
+                    };
+                    if (dst.class() != .xmm) return error.InvalidMachine;
+
+                    // The helper ABI transports raw bits through reserved GP
+                    // scratch, so operand location and the platform float ABI
+                    // cannot affect Dalvik remainder semantics.
+                    const lhs = try readInto(buffer, allocation, spill_plan, inst.uses[0], xmm_scratch_primary, stats);
+                    if (lhs.class() != .xmm) return error.InvalidMachine;
+                    try emitXmmToGp(buffer, .r10, lhs, wide);
+                    const rhs = try readInto(buffer, allocation, spill_plan, rhs_use, xmm_scratch_primary, stats);
+                    if (rhs.class() != .xmm) return error.InvalidMachine;
+                    try emitXmmToGp(buffer, .r11, rhs, wide);
+                    try emitNumericCall(buffer, if (wide) abi.f64_remainder_helper else abi.f32_remainder_helper);
+                    try emitGpToXmm(buffer, dst, .r10, wide);
+                    stats.native_insts += 7;
+                    stats.xmm_insts += 3;
+                    stats.xmm_remainders += 1;
+                    stats.numeric_helper_calls += 1;
+                    switch (dst_location) {
+                        .spill => try emitSpillStore(buffer, try spillSlot(spill_plan, inst.defs[0]), dst, stats),
+                        else => {},
+                    }
+                },
                 .neg => {
                     if (wide) {
                         if (inst.defs.len != 2 or inst.uses.len != 2 or
@@ -2220,7 +2301,6 @@ fn encodeInst(
                         else => {},
                     }
                 },
-                else => return error.UnsupportedInstruction,
             }
         },
         // The following resolve performs the same null discrimination and
@@ -2368,6 +2448,24 @@ fn encodeInst(
             stats.card_repeat_barriers += @intFromBool(repeat_proven);
             stats.native_insts += 6;
         },
+        .monitor_enter, .monitor_exit => {
+            if (inst.defs.len != 0 or inst.uses.len != 1 or !source.isGcRoot(inst.uses[0]) or
+                inst.state_handle == null or inst.state_handle.? != inst.uses[0]) return error.InvalidMachine;
+            const abi = runtime orelse return error.MissingRuntimeAbi;
+            const site = inst.monitor_site_id orelse return error.InvalidMachine;
+            const handle = try x64Reg(try readInto(buffer, allocation, spill_plan, inst.uses[0], .r10, stats));
+            try emitMovRawRaw(buffer, scratch_index, handle, true);
+            const pc = inst.pc orelse return error.InvalidMachine;
+            const site_key = (@as(u64, pc) << 32) | site;
+            try emitMovRawImm64(buffer, scratch_descriptor, site_key);
+            try emitMonitorCall(buffer, if (inst.opcode == .monitor_enter) abi.monitor_enter_helper else abi.monitor_exit_helper);
+            if (inst.opcode == .monitor_enter) {
+                stats.monitor_enters += 1;
+            } else {
+                stats.monitor_exits += 1;
+            }
+            stats.native_insts += 5;
+        },
         .jump => {
             try emitJump(buffer, try edgeTargetLabel(source, labels, edge_labels, block_id, inst.target));
             stats.jumps += 1;
@@ -2460,6 +2558,8 @@ fn instructionSafepointId(inst: machine.Inst) ?u32 {
         inst.guard_site_id
     else if (inst.opcode == .check_bounds)
         inst.exception_site_id
+    else if (inst.opcode == .monitor_enter or inst.opcode == .monitor_exit)
+        inst.monitor_site_id
     else
         null;
 }
@@ -2756,7 +2856,8 @@ fn buildRootMaps(
 ) Error!?runtime_stack_map.Table {
     try validateSpillPlan(source, allocation, spill_plan);
     const resolve_sites = std.math.add(u32, source.stats.resolves, source.stats.loop_epoch_guards) catch return error.InvalidMachine;
-    const machine_sites = std.math.add(u32, resolve_sites, source.stats.bounds_exception_sites) catch return error.InvalidMachine;
+    const monitor_and_bounds = std.math.add(u32, source.stats.monitor_sites, source.stats.bounds_exception_sites) catch return error.InvalidMachine;
+    const machine_sites = std.math.add(u32, resolve_sites, monitor_and_bounds) catch return error.InvalidMachine;
     const expected_sites = std.math.add(u32, machine_sites, try blockEntryDeoptCount(deopt)) catch return error.InvalidMachine;
     if (expected_sites == 0) return null;
 
@@ -2782,15 +2883,7 @@ fn buildRootMaps(
                 if (source.isGcRoot(reg)) unsetRoot(live, reg);
             }
             try addInstructionTrackedUses(source, live, inst, true);
-            if (inst.opcode == .resolve_handle or inst.opcode == .loop_epoch_guard or
-                (inst.opcode == .check_bounds and inst.exception_site_id != null))
-            {
-                const site_id = if (inst.opcode == .resolve_handle)
-                    inst.resolve_id orelse return error.InvalidMachine
-                else if (inst.opcode == .loop_epoch_guard)
-                    inst.guard_site_id orelse return error.InvalidMachine
-                else
-                    inst.exception_site_id orelse return error.InvalidMachine;
+            if (instructionSafepointId(inst)) |site_id| {
                 const canonical = inst.state_handle orelse return error.InvalidMachine;
                 if (canonical >= source.reg_types.len or !source.isGcRoot(canonical) or !rootIsSet(live, canonical)) return error.InvalidMachine;
                 const deopt_id = try deoptIdForSite(source, deopt, site_id);
@@ -3172,7 +3265,8 @@ fn osrRematerializesRegister(source: *const machine.Function, block: cfg.BlockId
 
 fn machineSafepointCount(source: *const machine.Function) Error!u32 {
     const resolves = std.math.add(u32, source.stats.resolves, source.stats.loop_epoch_guards) catch return error.InvalidDeoptMetadata;
-    return std.math.add(u32, resolves, source.stats.bounds_exception_sites) catch return error.InvalidDeoptMetadata;
+    const monitor_and_bounds = std.math.add(u32, source.stats.monitor_sites, source.stats.bounds_exception_sites) catch return error.InvalidDeoptMetadata;
+    return std.math.add(u32, resolves, monitor_and_bounds) catch return error.InvalidDeoptMetadata;
 }
 
 fn osrLandingSiteId(source: *const machine.Function, deopt: ?DeoptOptions, entry_index: usize) Error!u32 {
@@ -3646,8 +3740,10 @@ fn emitOsrRematerializations(
 pub fn encodeWithOptions(allocator: std.mem.Allocator, source: *const machine.Function, options: Options) Error!Function {
     source.verify() catch return error.InvalidMachine;
     if (options.runtime) |runtime| try runtime.verify();
-    if ((source.stats.resolves != 0 or source.stats.bounds_exception_sites != 0) and options.runtime == null) return error.MissingRuntimeAbi;
+    if ((source.stats.resolves != 0 or source.stats.bounds_exception_sites != 0 or source.stats.monitor_sites != 0) and options.runtime == null) return error.MissingRuntimeAbi;
     if (source.stats.bounds_exception_sites != 0 and options.runtime.?.bounds_exception_helper == 0) return error.MissingExceptionHelper;
+    if (source.stats.monitor_sites != 0 and
+        (options.runtime.?.monitor_enter_helper == 0 or options.runtime.?.monitor_exit_helper == 0)) return error.MissingMonitorHelper;
     if (options.deopt != null and (options.runtime == null or options.runtime.?.deopt_epoch_address == 0 or options.runtime.?.deopt_helper == 0)) {
         return error.InvalidRuntimeAbi;
     }
@@ -4456,14 +4552,24 @@ test "x64_register_encoder executes scalar double constants and arithmetic" {
     try std.testing.expectEqual(@as(f64, 3.75), result);
 }
 
-test "x64_register_encoder rejects unsupported scalar XMM remainder" {
+test "x64_register_encoder requires scalar remainder helper metadata" {
     const insts = [_]Instruction{
         .{ .rem_float = .{ .dest = 2, .src1 = 0, .src2 = 1 } },
         .{ .return_ = .{ .src = 2 } },
     };
     var optimized = try optimizedMachine(std.testing.allocator, &insts);
     defer optimized.deinit();
-    try std.testing.expectError(error.UnsupportedInstruction, encode(std.testing.allocator, &optimized.machine));
+    try std.testing.expectError(error.MissingRuntimeAbi, encode(std.testing.allocator, &optimized.machine));
+    var abi = testRuntimeAbi();
+    abi.f32_remainder_helper = 0;
+    try std.testing.expectError(error.MissingNumericHelper, encodeWithOptions(std.testing.allocator, &optimized.machine, .{ .runtime = abi }));
+
+    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{ .runtime = testRuntimeAbi() });
+    defer native.deinit();
+    try native.verify();
+    try std.testing.expectEqual(@as(u32, 1), native.stats.xmm_remainders);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.numeric_helper_calls);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, numericEncodingFailureProbe, .{&optimized.machine});
 }
 
 test "x64_register_encoder executes a spill-heavy aligned frame" {
@@ -4531,6 +4637,8 @@ fn testRuntimeAbi() RuntimeAbi {
         .satb_pre_write_helper = 0x2345_6789,
         .card_mark_helper = 0x3456_789a,
         .card_mark_repeat_helper = 0x4567_89ab,
+        .f32_remainder_helper = 0x5678_9abc,
+        .f64_remainder_helper = 0x6789_abcd,
         .field_layouts = &test_field_layouts,
     };
 }
@@ -4546,6 +4654,13 @@ fn boundsEncodingFailureProbe(allocator: std.mem.Allocator, source: *const machi
     var abi = testRuntimeAbi();
     abi.reference_array_layout = .{ .length_offset = 0, .data_offset = 8 };
     var native = try encodeWithOptions(allocator, source, .{ .runtime = abi });
+    defer native.deinit();
+    const bytes = try native.finalize();
+    defer allocator.free(bytes);
+}
+
+fn numericEncodingFailureProbe(allocator: std.mem.Allocator, source: *const machine.Function) !void {
+    var native = try encodeWithOptions(allocator, source, .{ .runtime = testRuntimeAbi() });
     defer native.deinit();
     const bytes = try native.finalize();
     defer allocator.free(bytes);
