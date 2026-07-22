@@ -71,6 +71,7 @@ pub fn build(b: *std.Build) void {
     const runtime_gc = b.addModule("runtime_gc", .{ .root_source_file = b.path("common/60_runtime/25_gc.zig"), .target = target, .optimize = optimize_mode });
     const runtime_monitor = b.addModule("runtime_monitor", .{ .root_source_file = b.path("common/60_runtime/27_monitor.zig"), .target = target, .optimize = optimize_mode });
     const runtime_stack_map = b.addModule("runtime_stack_map", .{ .root_source_file = b.path("common/60_runtime/30_stack_map.zig"), .target = target, .optimize = optimize_mode });
+    const runtime_method_sync = b.addModule("runtime_method_sync", .{ .root_source_file = b.path("common/60_runtime/35_method_synchronization.zig"), .target = target, .optimize = optimize_mode });
     const runtime_jit = b.addModule("runtime_jit", .{ .root_source_file = b.path("common/60_runtime/40_jit_runtime.zig"), .target = target, .optimize = optimize_mode });
     const runtime_interpreter = b.addModule("runtime_interpreter", .{ .root_source_file = b.path("common/60_runtime/45_interpreter_runtime.zig"), .target = target, .optimize = optimize_mode });
     const runtime_code_manager = b.addModule("runtime_code_manager", .{ .root_source_file = b.path("common/60_runtime/50_code_manager.zig"), .target = target, .optimize = optimize_mode });
@@ -241,10 +242,13 @@ pub fn build(b: *std.Build) void {
     runtime_monitor.addImport("runtime_value", runtime_value);
     runtime_monitor.addImport("runtime_gc", runtime_gc);
     runtime_monitor.addImport("runtime_thread_registry", runtime_thread_registry);
+    runtime_method_sync.addImport("runtime_gc", runtime_gc);
+    runtime_method_sync.addImport("runtime_value", runtime_value);
     runtime_stack_map.addImport("runtime_value", runtime_value);
     runtime_jit.addImport("runtime_value", runtime_value);
     runtime_jit.addImport("runtime_gc", runtime_gc);
     runtime_jit.addImport("runtime_monitor", runtime_monitor);
+    runtime_jit.addImport("runtime_method_sync", runtime_method_sync);
     runtime_jit.addImport("runtime_stack_map", runtime_stack_map);
     runtime_jit.addImport("runtime_thread_registry", runtime_thread_registry);
     runtime_jit.addImport("runtime_code_manager", runtime_code_manager);
@@ -257,6 +261,7 @@ pub fn build(b: *std.Build) void {
     runtime_interpreter.addImport("runtime_gc", runtime_gc);
     runtime_interpreter.addImport("runtime_heap", runtime_heap);
     runtime_interpreter.addImport("runtime_monitor", runtime_monitor);
+    runtime_interpreter.addImport("runtime_method_sync", runtime_method_sync);
     runtime_interpreter.addImport("runtime_thread_registry", runtime_thread_registry);
     runtime_interpreter.addImport("runtime_value", runtime_value);
 
@@ -267,6 +272,7 @@ pub fn build(b: *std.Build) void {
     x64_runtime_shim.addImport("runtime_gc", runtime_gc);
     x64_runtime_shim.addImport("runtime_heap", runtime_heap);
     x64_runtime_shim.addImport("runtime_jit", runtime_jit);
+    x64_runtime_shim.addImport("runtime_method_sync", runtime_method_sync);
     x64_runtime_shim.addImport("runtime_monitor", runtime_monitor);
     x64_runtime_shim.addImport("runtime_code_manager", runtime_code_manager);
     x64_runtime_shim.addImport("runtime_deopt", runtime_deopt);
@@ -329,6 +335,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "runtime_gc", .module = runtime_gc },
         .{ .name = "runtime_monitor", .module = runtime_monitor },
         .{ .name = "runtime_stack_map", .module = runtime_stack_map },
+        .{ .name = "runtime_method_sync", .module = runtime_method_sync },
         .{ .name = "runtime_jit", .module = runtime_jit },
         .{ .name = "runtime_interpreter", .module = runtime_interpreter },
         .{ .name = "runtime_code_manager", .module = runtime_code_manager },

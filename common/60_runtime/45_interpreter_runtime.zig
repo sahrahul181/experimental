@@ -10,6 +10,7 @@ const interpreter = @import("interpreter");
 const runtime_gc = @import("runtime_gc");
 const runtime_heap = @import("runtime_heap");
 const runtime_monitor = @import("runtime_monitor");
+const runtime_method_sync = @import("runtime_method_sync");
 const thread_registry = @import("runtime_thread_registry");
 const runtime_value = @import("runtime_value");
 
@@ -156,6 +157,7 @@ pub const Options = struct {
     interpreted_methods: []const InterpretedMethod = &.{},
     exception_types: []const ExceptionType = &.{},
     monitor_table: ?*runtime_monitor.MonitorTable = null,
+    method_synchronization: ?*const runtime_method_sync.Table = null,
     interpreter_stack: ?*InterpreterCallStack = null,
     thread_binding: ?ThreadBinding = null,
 };
@@ -185,6 +187,9 @@ pub const Stats = struct {
     monitor_enters: u64,
     monitor_exits: u64,
     monitor_unwind_exits: u64,
+    synchronized_invocations: u64,
+    synchronized_returns: u64,
+    synchronized_exceptions: u64,
     failures: u64,
 };
 
@@ -200,6 +205,7 @@ pub const Context = struct {
     interpreted_methods: []const InterpretedMethod,
     exception_types: []const ExceptionType,
     monitor_table: ?*runtime_monitor.MonitorTable,
+    method_synchronization: ?*const runtime_method_sync.Table,
     interpreter_stack: ?*InterpreterCallStack,
     thread_binding: ?ThreadBinding,
     last_card_destination: u64 = 0,
@@ -227,6 +233,9 @@ pub const Context = struct {
     monitor_enters: u64 = 0,
     monitor_exits: u64 = 0,
     monitor_unwind_exits: u64 = 0,
+    synchronized_invocations: u64 = 0,
+    synchronized_returns: u64 = 0,
+    synchronized_exceptions: u64 = 0,
     failures: u64 = 0,
 
     pub fn init(
@@ -268,6 +277,20 @@ pub const Context = struct {
                 if (!collector.isStaticRootSlot(address)) return error.InvalidLayout;
             }
         }
+        if (options.method_synchronization) |synchronization| {
+            if (synchronization.collectorDomain() != collector or options.monitor_table == null) return error.InvalidMethod;
+            for (options.interpreted_methods) |method| {
+                const entry = synchronization.find(method.id) orelse continue;
+                switch (entry.target) {
+                    .instance_parameter => |parameter| {
+                        if (parameter >= method.parameter_kinds.len or method.parameter_kinds[parameter] != .reference) {
+                            return error.InvalidMethod;
+                        }
+                    },
+                    .static_root_slot => {},
+                }
+            }
+        }
         if (options.interpreted_methods.len != 0) {
             const stack = options.interpreter_stack orelse return error.InvalidMethod;
             if (stack.owner != std.Thread.getCurrentId()) return error.WrongThread;
@@ -282,7 +305,8 @@ pub const Context = struct {
             options.reference_array_types.len != 0 or
             options.interpreted_methods.len != 0 or
             options.exception_types.len != 0 or
-            options.monitor_table != null)
+            options.monitor_table != null or
+            options.method_synchronization != null)
         {
             return error.MissingThreadBinding;
         }
@@ -298,6 +322,7 @@ pub const Context = struct {
             .interpreted_methods = options.interpreted_methods,
             .exception_types = options.exception_types,
             .monitor_table = options.monitor_table,
+            .method_synchronization = options.method_synchronization,
             .interpreter_stack = options.interpreter_stack,
             .thread_binding = options.thread_binding,
         };
@@ -333,6 +358,9 @@ pub const Context = struct {
             .monitor_enters = self.monitor_enters,
             .monitor_exits = self.monitor_exits,
             .monitor_unwind_exits = self.monitor_unwind_exits,
+            .synchronized_invocations = self.synchronized_invocations,
+            .synchronized_returns = self.synchronized_returns,
+            .synchronized_exceptions = self.synchronized_exceptions,
             .failures = self.failures,
         };
     }
@@ -761,6 +789,7 @@ fn leaveFrame(raw: *anyopaque, state: *interpreter.ManagedFrameState) void {
             context.monitor_unwind_exits += 1;
         }
     }
+    state.synchronized_monitor_owned = false;
     binding.context.restoreRootMark(state.root_mark) catch {
         context.failures += 1;
         return;
@@ -982,6 +1011,24 @@ fn invokeInterpretedMethod(
     }
     const method = context.interpretedMethod(invocation) catch return failed(context);
     if (invocation.args.len != method.parameter_registers.len) return failed(context);
+    var synchronized_monitor: ?u64 = null;
+    if (context.method_synchronization) |synchronization| if (synchronization.find(method.id)) |entry| {
+        synchronized_monitor = switch (entry.target) {
+            .instance_parameter => |parameter| blk: {
+                if (invocation.kind == .static or parameter >= invocation.args.len) return failed(context);
+                const source: usize = invocation.args[parameter];
+                if (source >= caller_references.len or !caller_reference_kinds[source]) return failed(context);
+                const handle: Handle = @bitCast(caller_references[source]);
+                if (handle.isNull()) return .null_reference;
+                break :blk @bitCast(handle);
+            },
+            .static_root_slot => blk: {
+                if (invocation.kind != .static) return failed(context);
+                const handle = synchronization.loadStatic(entry) catch return failed(context);
+                break :blk @bitCast(handle);
+            },
+        };
+    };
     if (invocation.kind != .static) {
         if (invocation.args.len == 0) return failed(context);
         const receiver: usize = invocation.args[0];
@@ -1031,7 +1078,9 @@ fn invokeInterpretedMethod(
         .reference_registers = storage.references,
         .try_blocks = method.try_blocks,
         .managed_memory = context.attachment(),
+        .synchronized_monitor = synchronized_monitor,
     };
+    if (synchronized_monitor != null) context.synchronized_invocations += 1;
     const result = interpreter.execute(&frame) catch |err| switch (err) {
         error.ManagedException => {
             if (@as(u32, @truncate(frame.pending_exception)) == std.math.maxInt(u32)) {
@@ -1039,6 +1088,7 @@ fn invokeInterpretedMethod(
             }
             exception_output.* = frame.pending_exception;
             context.exceptions_propagated += 1;
+            if (synchronized_monitor != null) context.synchronized_exceptions += 1;
             return .managed_exception;
         },
         error.StackOverflow => return .stack_overflow,
@@ -1050,6 +1100,7 @@ fn invokeInterpretedMethod(
     if (result.kind != method.return_type) return failed(context);
     output.* = result;
     context.invocation_returns += 1;
+    if (synchronized_monitor != null) context.synchronized_returns += 1;
     return .ok;
 }
 
@@ -2329,4 +2380,183 @@ test "interpreter allocation failure rolls back the constructing handle" {
     try std.testing.expectError(error.ManagedMemoryFailure, interpreter.execute(&frame));
     try std.testing.expect(!frame.managed_frame_state.active);
     try std.testing.expectEqual(@as(usize, 0), context.rootCount());
+}
+
+test "synchronized interpreted methods release on returns exceptions and reentrant cleanup" {
+    var storage: [2048]u8 align(runtime_value.object_alignment) = @splat(0);
+    const regions = [_]runtime_value.Region{try runtime_value.Region.fromSlice(&storage)};
+    var handles = try runtime_value.HandleTable.init(std.testing.allocator, 4, &regions);
+    defer handles.deinit();
+    var heap = try runtime_heap.ManagedHeap.init(std.testing.allocator, &handles, 128);
+    defer heap.deinit();
+    var heap_allocator = heap.threadAllocator();
+    const receiver = try publishTestObject(&heap, &handles, &heap_allocator, 8);
+    const class_object = try publishTestObject(&heap, &handles, &heap_allocator, 8);
+    var monitors = try runtime_monitor.MonitorTable.init(std.testing.allocator, std.testing.io, &handles);
+    defer monitors.deinit() catch unreachable;
+    var class_root = std.atomic.Value(u64).init(@bitCast(class_object));
+    var static_roots: [5]usize = undefined;
+    @memcpy(static_roots[0..4], monitors.rootSlotAddresses());
+    static_roots[4] = @intFromPtr(&class_root);
+    std.mem.sort(usize, &static_roots, {}, struct {
+        fn lessThan(_: void, lhs: usize, rhs: usize) bool {
+            return lhs < rhs;
+        }
+    }.lessThan);
+    var collector = try runtime_gc.ConcurrentCollector.init(std.testing.allocator, &heap, &handles, .{
+        .satb_queue_capacity = 8,
+        .max_satb_buffers = 1,
+        .card_bytes = 64,
+        .static_root_slots = &static_roots,
+    });
+    defer collector.deinit() catch unreachable;
+    var registry = try thread_registry.Registry.init(std.testing.allocator, std.testing.io, 1);
+    defer registry.deinit() catch unreachable;
+    var thread_context = try thread_registry.ThreadContext.init(std.testing.allocator, 16);
+    defer thread_context.deinit();
+    try registry.register(&thread_context);
+    defer registry.unregister(&thread_context) catch unreachable;
+    var satb = try runtime_gc.SatbBuffer.init(std.testing.allocator, 8);
+    defer satb.deinit() catch unreachable;
+    try collector.registerThreadSatbBuffer(&satb, &thread_context);
+    defer collector.unregisterSatbBuffer(&satb) catch unreachable;
+
+    const parameter_registers = [_]u16{0};
+    const parameter_kinds = [_]ParameterKind{.reference};
+    const normal_code = [_]interpreter.Instruction{.{ .return_object = .{ .src = 0 } }};
+    const static_code = [_]interpreter.Instruction{.return_void};
+    const throw_code = [_]interpreter.Instruction{.{ .throw_ = .{ .src = 0 } }};
+    const reentrant_code = [_]interpreter.Instruction{ .{ .monitor_enter = .{ .src = 0 } }, .return_void };
+    const methods = [_]InterpretedMethod{
+        .{ .id = 10, .instructions = &normal_code, .register_count = 1, .parameter_registers = &parameter_registers, .parameter_kinds = &parameter_kinds, .return_type = .object },
+        .{ .id = 20, .instructions = &static_code, .register_count = 1, .return_type = .void },
+        .{ .id = 30, .instructions = &throw_code, .register_count = 1, .parameter_registers = &parameter_registers, .parameter_kinds = &parameter_kinds, .return_type = .void },
+        .{ .id = 40, .instructions = &reentrant_code, .register_count = 1, .parameter_registers = &parameter_registers, .parameter_kinds = &parameter_kinds, .return_type = .void },
+    };
+    const synchronization_entries = [_]runtime_method_sync.Entry{
+        .{ .method_id = 10, .target = .{ .instance_parameter = 0 } },
+        .{ .method_id = 20, .target = .{ .static_root_slot = @intFromPtr(&class_root) } },
+        .{ .method_id = 30, .target = .{ .instance_parameter = 0 } },
+        .{ .method_id = 40, .target = .{ .instance_parameter = 0 } },
+    };
+    const synchronization = try runtime_method_sync.Table.init(&synchronization_entries, &collector);
+    var stack_registers: [16]u32 = @splat(0);
+    var stack_references: [16]u64 = @splat(@as(u64, @bitCast(Handle.none)));
+    var stack_kinds: [16]bool = @splat(false);
+    var call_stack = try InterpreterCallStack.init(&stack_registers, &stack_references, &stack_kinds);
+    var owner_allocator = heap.threadAllocator();
+    var runtime = try Context.init(&collector, &satb, .{
+        .interpreted_methods = &methods,
+        .monitor_table = &monitors,
+        .method_synchronization = &synchronization,
+        .interpreter_stack = &call_stack,
+        .thread_binding = .{ .registry = &registry, .context = &thread_context, .allocator = &owner_allocator },
+    });
+
+    var caller_registers = [_]u32{@truncate(@as(u64, @bitCast(receiver)))};
+    var caller_references = [_]u64{@bitCast(receiver)};
+    var caller_kinds = [_]bool{true};
+    const instance_args = [_]u16{0};
+    var invocation = interpreter.Invoke{
+        .class_name = "Synchronized",
+        .method_name = "normal",
+        .signature = "()Ljava/lang/Object;",
+        .args = &instance_args,
+        .call_target = 0,
+        .dest = null,
+        .kind = .direct,
+    };
+    var output: interpreter.ExecutionResult = .{ .kind = .void };
+    var exception_bits: u64 = @bitCast(Handle.none);
+    try std.testing.expectEqual(interpreter.ManagedMemoryStatus.ok, invokeInterpretedMethod(
+        &runtime,
+        &invocation,
+        &caller_registers,
+        &caller_references,
+        &caller_kinds,
+        &output,
+        &exception_bits,
+    ));
+    try std.testing.expectEqual(@as(u64, @bitCast(receiver)), output.value64);
+
+    invocation.call_target = 1;
+    invocation.args = &.{};
+    invocation.kind = .static;
+    try std.testing.expectEqual(interpreter.ManagedMemoryStatus.ok, invokeInterpretedMethod(
+        &runtime,
+        &invocation,
+        &caller_registers,
+        &caller_references,
+        &caller_kinds,
+        &output,
+        &exception_bits,
+    ));
+
+    invocation.call_target = 2;
+    invocation.args = &instance_args;
+    invocation.kind = .direct;
+    try std.testing.expectEqual(interpreter.ManagedMemoryStatus.managed_exception, invokeInterpretedMethod(
+        &runtime,
+        &invocation,
+        &caller_registers,
+        &caller_references,
+        &caller_kinds,
+        &output,
+        &exception_bits,
+    ));
+    try std.testing.expectEqual(@as(u64, @bitCast(receiver)), exception_bits);
+
+    invocation.call_target = 3;
+    try std.testing.expectEqual(interpreter.ManagedMemoryStatus.ok, invokeInterpretedMethod(
+        &runtime,
+        &invocation,
+        &caller_registers,
+        &caller_references,
+        &caller_kinds,
+        &output,
+        &exception_bits,
+    ));
+    const stats = runtime.stats();
+    try std.testing.expectEqual(@as(u64, 4), stats.synchronized_invocations);
+    try std.testing.expectEqual(@as(u64, 3), stats.synchronized_returns);
+    try std.testing.expectEqual(@as(u64, 1), stats.synchronized_exceptions);
+    try std.testing.expectEqual(@as(u64, 1), monitors.stats().reentrant_enters);
+    try std.testing.expectEqual(monitors.stats().associations, monitors.stats().disassociations);
+
+    // A deoptimized synchronized activation already owns its implicit monitor.
+    // Interpreter adoption must validate that ownership without entering it a
+    // second time, then release it exactly once on return.
+    try monitors.enter(receiver, &collector, &registry, &thread_context, &satb);
+    const enters_before_adoption = monitors.stats().enters;
+    const exits_before_adoption = monitors.stats().exits;
+    var resumed_registers = [_]u32{@truncate(@as(u64, @bitCast(receiver)))};
+    var resumed_references = [_]u64{@bitCast(receiver)};
+    var resumed_kinds = [_]bool{true};
+    var resumed_frame = interpreter.ExecutionFrame{
+        .pc = 0,
+        .registers = &resumed_registers,
+        .instructions = &normal_code,
+        .register_is_ref = &resumed_kinds,
+        .reference_registers = &resumed_references,
+        .managed_memory = runtime.attachment(),
+        .managed_frame_state = .{
+            .held_monitors = blk: {
+                var held: [interpreter.ManagedFrameState.max_held_monitors]u64 =
+                    @splat(@as(u64, @bitCast(Handle.none)));
+                held[0] = @bitCast(receiver);
+                break :blk held;
+            },
+            .held_monitor_count = 1,
+            .synchronized_monitor_owned = true,
+        },
+        .synchronized_monitor = @bitCast(receiver),
+    };
+    _ = try interpreter.execute(&resumed_frame);
+    try std.testing.expectEqual(enters_before_adoption, monitors.stats().enters);
+    try std.testing.expectEqual(exits_before_adoption + 1, monitors.stats().exits);
+    try std.testing.expectEqual(@as(u8, 0), resumed_frame.managed_frame_state.held_monitor_count);
+    try std.testing.expect(!resumed_frame.managed_frame_state.synchronized_monitor_owned);
+    try std.testing.expectEqual(monitors.stats().associations, monitors.stats().disassociations);
+    try std.testing.expectEqual(@as(usize, 0), call_stack.cursor);
+    try std.testing.expectEqual(@as(usize, 0), thread_context.rootCount());
 }

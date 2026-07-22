@@ -9,6 +9,7 @@ const optimizer = @import("optimizer");
 const runtime_gc = @import("runtime_gc");
 const runtime_heap = @import("runtime_heap");
 const runtime_jit = @import("runtime_jit");
+const runtime_method_sync = @import("runtime_method_sync");
 const runtime_monitor = @import("runtime_monitor");
 const runtime_code_manager = @import("runtime_code_manager");
 const runtime_deopt = @import("runtime_deopt");
@@ -1060,6 +1061,152 @@ test "x64 monitor helpers execute reentrant balanced ownership with precise safe
     managed.deinit();
     try std.testing.expectEqual(@as(u32, 0), managed.native_state.held_monitor_count);
     try std.testing.expectEqual(@as(u64, 1), runtime.stats().monitor_unwind_exits);
+    try std.testing.expectEqual(monitors.stats().associations, monitors.stats().disassociations);
+}
+
+test "JIT monitor ownership transfers across deoptimization and OSR without relocking" {
+    var storage: [512]u8 align(runtime_value.object_alignment) = @splat(0);
+    const regions = [_]runtime_value.Region{try runtime_value.Region.fromSlice(&storage)};
+    var handles = try runtime_value.HandleTable.init(std.testing.allocator, 4, &regions);
+    defer handles.deinit();
+    var heap = try runtime_heap.ManagedHeap.init(std.testing.allocator, &handles, 128);
+    defer heap.deinit();
+    var allocator = heap.threadAllocator();
+    const reservation = try allocator.allocate(16, runtime_value.object_alignment);
+    const object = try handles.reserve(0, 0);
+    try heap.publishObject(reservation, object);
+
+    var monitors = try runtime_monitor.MonitorTable.init(std.testing.allocator, std.testing.io, &handles);
+    defer monitors.deinit() catch unreachable;
+    var collector = try runtime_gc.ConcurrentCollector.init(std.testing.allocator, &heap, &handles, .{
+        .satb_queue_capacity = 8,
+        .max_satb_buffers = 1,
+        .card_bytes = 64,
+        .static_root_slots = monitors.rootSlotAddresses(),
+    });
+    defer collector.deinit() catch unreachable;
+    var registry = try runtime_thread_registry.Registry.init(std.testing.allocator, std.testing.io, 1);
+    defer registry.deinit() catch unreachable;
+    var context = try runtime_thread_registry.ThreadContext.init(std.testing.allocator, 16);
+    defer context.deinit();
+    try registry.register(&context);
+    defer registry.unregister(&context) catch unreachable;
+    var satb = try runtime_gc.SatbBuffer.init(std.testing.allocator, 8);
+    defer satb.deinit() catch unreachable;
+    try collector.registerThreadSatbBuffer(&satb, &context);
+    defer collector.unregisterSatbBuffer(&satb) catch unreachable;
+
+    var runtime = try runtime_jit.Runtime.init(std.testing.allocator, &handles, &registry);
+    defer runtime.deinit() catch unreachable;
+    try runtime.installCollector(&collector);
+    try runtime.installMonitorTable(&monitors);
+    var managed = try runtime.enter(&context);
+    defer managed.deinit();
+
+    const values = [_]runtime_deopt.ValueSpec{.{
+        .vreg = 0,
+        .kind = .reference,
+        .source = .{ .native_register = 0 },
+    }};
+    const monitor_specs = [_]runtime_deopt.MonitorSpec{.{
+        .source = .{ .native_register = 0 },
+        .kind = .synchronized,
+    }};
+    var deopt_table = try runtime_deopt.Table.init(std.testing.allocator, &.{.{
+        .id = 5,
+        .method_id = 77,
+        .dex_pc = 3,
+        .values = &values,
+        .monitors = &monitor_specs,
+    }}, .{ .register_count = 1, .native_register_count = 16, .max_dex_pc = 8 });
+    defer deopt_table.deinit();
+
+    var destination_registers: [1]u32 = .{0};
+    var destination_references: [1]u64 = .{@bitCast(runtime_value.Handle.none)};
+    var destination_kinds: [1]bool = .{false};
+    var destination = runtime_deopt.Frame{ .execution = .{
+        .pc = 0,
+        .registers = &destination_registers,
+        .instructions = &.{},
+        .reference_registers = &destination_references,
+        .register_is_ref = &destination_kinds,
+    } };
+    var scratch: [2]u64 = undefined;
+    var stack_anchor: u64 = 0;
+    const Resume = struct {
+        seen: bool = false,
+        expected: runtime_value.Handle,
+
+        fn run(raw: *anyopaque, frame: *runtime_deopt.Frame) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.seen = frame.active and frame.execution.managed_frame_state.held_monitor_count == 1 and
+                frame.execution.managed_frame_state.held_monitors[0] == @as(u64, @bitCast(self.expected));
+            return if (self.seen) 73 else 0;
+        }
+    };
+    var resume_state = Resume{ .expected = object };
+    var request = runtime_deopt.Request{
+        .table = &deopt_table,
+        .point_id = 5,
+        .destination = .{ .frame = &destination, .scratch = &scratch },
+        .stack_base = @ptrCast(&stack_anchor),
+        .stack_max_offset = @sizeOf(@TypeOf(stack_anchor)),
+        .resume_context = &resume_state,
+        .resume_fn = Resume.run,
+    };
+
+    try monitors.enter(object, &collector, &registry, &context, &satb);
+    managed.native_state.held_monitors[0] = @bitCast(object);
+    managed.native_state.held_monitor_count = 1;
+    managed.native_state.captured_gp[0] = @bitCast(object);
+    managed.native_state.deopt_request = @intFromPtr(&request);
+    try std.testing.expectEqual(@as(usize, 73), runtime_jit.deoptResumeBridge(&managed.native_state, 0, 0, 0, 0, 0));
+    try std.testing.expect(resume_state.seen);
+    try std.testing.expectEqual(@as(u32, 0), managed.native_state.held_monitor_count);
+    try std.testing.expectEqual(@as(u8, 1), destination.execution.managed_frame_state.held_monitor_count);
+    try std.testing.expect(destination.execution.managed_frame_state.synchronized_monitor_owned);
+    try std.testing.expectEqual(@as(?u64, @bitCast(object)), destination.execution.synchronized_monitor);
+    try std.testing.expectEqual(runtime_jit.SynchronizedOwner.interpreter, managed.native_state.synchronized_owner);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().monitor_deopt_transfers);
+    try monitors.exit(object, &collector, &satb);
+    destination.execution.managed_frame_state.held_monitors[0] = @bitCast(runtime_value.Handle.none);
+    destination.execution.managed_frame_state.held_monitor_count = 0;
+    destination.execution.managed_frame_state.synchronized_monitor_owned = false;
+    destination.execution.synchronized_monitor = null;
+
+    try monitors.enter(object, &collector, &registry, &context, &satb);
+    var source_registers: [1]u32 = .{@truncate(@as(u64, @bitCast(object)))};
+    var source_references: [1]u64 = .{@bitCast(object)};
+    var source_kinds: [1]bool = .{true};
+    var source = runtime_deopt.Frame{
+        .method_id = 77,
+        .active = true,
+        .execution = .{
+            .pc = 3,
+            .registers = &source_registers,
+            .instructions = &.{},
+            .reference_registers = &source_references,
+            .register_is_ref = &source_kinds,
+        },
+    };
+    var osr_gp: [16]u64 = @splat(0);
+    var osr_scratch: [18]u64 = undefined;
+    try std.testing.expect(!runtime_jit.transferOsrMonitorOwnership(&managed.native_state, &deopt_table, 5, &source, &osr_gp));
+    try std.testing.expectEqual(@as(u32, 0), managed.native_state.held_monitor_count);
+    source.execution.managed_frame_state.held_monitors[0] = @bitCast(object);
+    source.execution.managed_frame_state.held_monitor_count = 1;
+    source.execution.managed_frame_state.synchronized_monitor_owned = true;
+    source.execution.synchronized_monitor = @bitCast(object);
+    try deopt_table.exportOsr(5, &source, .{ .native_registers = &osr_gp, .scratch = &osr_scratch });
+    try std.testing.expect(runtime_jit.transferOsrMonitorOwnership(&managed.native_state, &deopt_table, 5, &source, &osr_gp));
+    try std.testing.expectEqual(@as(u8, 0), source.execution.managed_frame_state.held_monitor_count);
+    try std.testing.expect(!source.execution.managed_frame_state.synchronized_monitor_owned);
+    try std.testing.expectEqual(@as(?u64, null), source.execution.synchronized_monitor);
+    try std.testing.expectEqual(@as(u32, 1), managed.native_state.held_monitor_count);
+    try std.testing.expectEqual(runtime_jit.SynchronizedOwner.compiled, managed.native_state.synchronized_owner);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().monitor_osr_transfers);
+    managed.deinit();
+    try std.testing.expectEqual(@as(u32, 0), managed.native_state.held_monitor_count);
     try std.testing.expectEqual(monitors.stats().associations, monitors.stats().disassociations);
 }
 
@@ -2803,16 +2950,35 @@ test "x64 deoptimization entry publishes captured references during handshake" {
 test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
     if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
 
-    var storage: [64]u8 align(runtime_value.object_alignment) = @splat(0);
+    var storage: [512]u8 align(runtime_value.object_alignment) = @splat(0);
     const regions = [_]runtime_value.Region{try runtime_value.Region.fromSlice(&storage)};
     var handles = try runtime_value.HandleTable.init(std.testing.allocator, 2, &regions);
     defer handles.deinit();
+    var heap = try runtime_heap.ManagedHeap.init(std.testing.allocator, &handles, 128);
+    defer heap.deinit();
+    var heap_allocator = heap.threadAllocator();
+    const reservation = try heap_allocator.allocate(16, runtime_value.object_alignment);
+    const handle = try handles.reserve(0, 0);
+    try heap.publishObject(reservation, handle);
+    var monitors = try runtime_monitor.MonitorTable.init(std.testing.allocator, std.testing.io, &handles);
+    defer monitors.deinit() catch unreachable;
+    var collector = try runtime_gc.ConcurrentCollector.init(std.testing.allocator, &heap, &handles, .{
+        .satb_queue_capacity = 8,
+        .max_satb_buffers = 1,
+        .card_bytes = 64,
+        .static_root_slots = monitors.rootSlotAddresses(),
+    });
+    defer collector.deinit() catch unreachable;
     var registry = try runtime_thread_registry.Registry.init(std.testing.allocator, std.testing.io, 1);
     defer registry.deinit() catch unreachable;
     var context = try runtime_thread_registry.ThreadContext.init(std.testing.allocator, 4);
     defer context.deinit();
     try registry.register(&context);
     defer registry.unregister(&context) catch unreachable;
+    var satb = try runtime_gc.SatbBuffer.init(std.testing.allocator, 8);
+    defer satb.deinit() catch unreachable;
+    try collector.registerThreadSatbBuffer(&satb, &context);
+    defer collector.unregisterSatbBuffer(&satb) catch unreachable;
 
     var shims = try encode(std.testing.allocator, @intFromPtr(&runtime_jit.slowResolveBridge));
     defer shims.deinit();
@@ -2821,8 +2987,11 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
     const entry_code = try stable_cache.addBytes(shims.entry);
     const slow_code = try stable_cache.addBytes(shims.slow_helper);
     const deopt_code = try stable_cache.addBytes(shims.deopt_helper);
+    const monitor_enter_code = try stable_cache.addBytes(shims.monitor_enter_helper);
+    const monitor_exit_code = try stable_cache.addBytes(shims.monitor_exit_helper);
 
     const insts = [_]Instruction{
+        .{ .monitor_enter = .{ .src = 0 } },
         .{ .iget = .{ .field_idx = 0, .dest_or_src = 1, .obj = 0 } },
         .{ .return_ = .{ .src = 1 } },
     };
@@ -2830,11 +2999,13 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
     defer optimized.deinit();
     var handle_reg: ?u32 = null;
     var site_id: ?u32 = null;
+    var synchronized_enter_site: ?u32 = null;
     for (optimized.machine.blocks) |block| for (block.insts) |inst| {
-        if (inst.opcode == .resolve_handle and inst.pc == 0) {
+        if (inst.opcode == .resolve_handle and inst.pc == 1) {
             handle_reg = inst.state_handle;
             site_id = inst.resolve_id;
         }
+        if (inst.opcode == .monitor_enter and inst.pc == 0) synchronized_enter_site = inst.monitor_site_id;
     };
     const point_values = [_]x64_encoder.DeoptValueSpec{
         .{ .vreg = 0, .kind = .reference, .source = .{ .machine_register = handle_reg orelse return error.TestUnexpectedResult } },
@@ -2844,19 +3015,31 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
         .{ .vreg = 0, .kind = .reference, .source = .{ .machine_register = handle_reg orelse return error.TestUnexpectedResult } },
         .{ .vreg = 1, .kind = .scalar32, .source = .{ .constant = 91 } },
     };
+    const point_monitors = [_]x64_encoder.DeoptMonitorSpec{
+        .{
+            .source = .{ .machine_register = handle_reg orelse return error.TestUnexpectedResult },
+            .kind = .synchronized,
+        },
+        .{
+            .source = .{ .machine_register = handle_reg orelse return error.TestUnexpectedResult },
+            .kind = .synchronized,
+        },
+    };
     const inline_frames = [_]x64_encoder.DeoptInlineFrameSpec{.{
         .method_id = 700,
         .dex_pc = 1,
         .register_count = 2,
         .values = &caller_values,
+        .monitors = point_monitors[0..1],
     }};
     const points = [_]x64_encoder.DeoptPointSpec{.{
         .id = 5,
         .safepoint_id = site_id orelse return error.TestUnexpectedResult,
         .method_id = 0,
-        .dex_pc = 0,
+        .dex_pc = 1,
         .values = &point_values,
         .inline_frames = &inline_frames,
+        .monitors = point_monitors[1..2],
     }};
     var dependency_epoch = std.atomic.Value(u64).init(1);
     const layouts = [_]x64_encoder.FieldLayout{.{ .offset = 8, .storage = .i32 }};
@@ -2868,15 +3051,24 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
             .deopt_epoch_address = @intFromPtr(&dependency_epoch),
             .compiled_deopt_epoch = 1,
             .deopt_helper = deopt_code.entryAddress(),
+            .monitor_enter_helper = monitor_enter_code.entryAddress(),
+            .monitor_exit_helper = monitor_exit_code.entryAddress(),
             .field_layouts = &layouts,
         },
-        .deopt = .{ .points = &points, .register_count = 2, .max_dex_pc = 1 },
+        .deopt = .{
+            .points = &points,
+            .register_count = 2,
+            .max_dex_pc = 2,
+            .entry_monitors = point_monitors[0..1],
+            .synchronized_monitor_enter_sites = &.{synchronized_enter_site orelse return error.TestUnexpectedResult},
+        },
     });
     defer native.deinit();
     try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_guards);
     try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_traps);
     try std.testing.expectEqual(@as(u32, 2), native.stats.deopt_frames);
     try std.testing.expectEqual(@as(u32, 4), native.stats.deopt_values);
+    try std.testing.expectEqual(@as(u32, 2), native.stats.deopt_monitors);
     const native_bytes = try native.finalize();
     defer std.testing.allocator.free(native_bytes);
     const maps = if (native.root_maps) |*value| value else return error.TestUnexpectedResult;
@@ -2912,6 +3104,14 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
 
     var runtime = try runtime_jit.Runtime.init(std.testing.allocator, &handles, &registry);
     defer runtime.deinit() catch unreachable;
+    try runtime.installCollector(&collector);
+    try runtime.installMonitorTable(&monitors);
+    const synchronization_entries = [_]runtime_method_sync.Entry{.{
+        .method_id = 0,
+        .target = .{ .instance_parameter = 0 },
+    }};
+    const synchronization = try runtime_method_sync.Table.init(&synchronization_entries, &collector);
+    try runtime.installMethodSynchronization(&synchronization);
     try runtime.installCodeManager(&manager);
     var registers: [2]u32 = @splat(0);
     var references: [2]u64 = @splat(@as(u64, @bitCast(runtime_value.Handle.none)));
@@ -2933,7 +3133,7 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
         .register_is_ref = &caller_reference_kinds,
         .reference_registers = &caller_references,
     } }};
-    var scratch: [4]u64 = undefined;
+    var scratch: [6]u64 = undefined;
     var stack_anchor: u64 = 0;
     const Resume = struct {
         called: bool = false,
@@ -2942,8 +3142,16 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
             const self: *@This() = @ptrCast(@alignCast(raw));
             const caller = frame.previous orelse return 0;
             self.called = frame.active and frame.execution.register_is_ref[0] and
+                frame.execution.synchronized_monitor == frame.execution.reference_registers[0] and
+                frame.execution.managed_frame_state.synchronized_monitor_owned and
+                frame.execution.managed_frame_state.held_monitor_count == 1 and
+                frame.execution.managed_frame_state.held_monitors[0] == frame.execution.reference_registers[0] and
                 caller.active and caller.method_id == 700 and caller.execution.pc == 1 and
                 caller.execution.register_is_ref[0] and caller.execution.registers[1] == 91 and
+                caller.execution.synchronized_monitor == caller.execution.reference_registers[0] and
+                caller.execution.managed_frame_state.synchronized_monitor_owned and
+                caller.execution.managed_frame_state.held_monitor_count == 1 and
+                caller.execution.managed_frame_state.held_monitors[0] == caller.execution.reference_registers[0] and
                 caller.previous == null;
             return if (self.called) 77 else 0;
         }
@@ -2960,23 +3168,228 @@ test "x64 dependency epoch trap deoptimizes through version-owned metadata" {
     };
     var managed = try runtime.enter(&context);
     defer managed.deinit();
+    try managed.installRootMaps(maps);
     var frame = CallFrame{
         .image = try managed.registerImage(),
         .target = 0,
         .deopt_request = @intFromPtr(&request),
         .method_id = 0,
     };
-    const handle = runtime_value.Handle{ .index = 0, .generation = 1 };
     frame.gp_args[0] = @bitCast(handle);
-    dependency_epoch.store(2, .release);
     const EntryFn = fn (*const CallFrame) callconv(.c) usize;
+    try std.testing.expectEqual(@as(usize, 0), entry_code.typedEntry(EntryFn)(&frame));
+    try std.testing.expectEqual(runtime_jit.CodeDispatchStatus.ok, managed.native_state.last_code_dispatch);
+    try std.testing.expectEqual(@as(u32, 0), managed.native_state.held_monitor_count);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().synchronized_method_enters);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().synchronized_method_exits);
+    try std.testing.expectEqual(@as(u64, 0), runtime.stats().synchronized_method_failures);
+
+    frame.image = try managed.registerImage();
+    dependency_epoch.store(2, .release);
     try std.testing.expectEqual(@as(usize, 77), entry_code.typedEntry(EntryFn)(&frame));
     try std.testing.expect(resume_state.called);
     try std.testing.expectEqual(runtime_jit.CodeDispatchStatus.deoptimized, managed.native_state.last_code_dispatch);
+    try std.testing.expectEqual(@as(u32, 0), managed.native_state.held_monitor_count);
+    try std.testing.expectEqual(@as(u8, 1), reconstructed.execution.managed_frame_state.held_monitor_count);
+    try std.testing.expect(reconstructed.execution.managed_frame_state.synchronized_monitor_owned);
+    try std.testing.expectEqual(@as(?u64, @bitCast(handle)), reconstructed.execution.synchronized_monitor);
+    try std.testing.expectEqual(@as(u8, 1), reconstructed_callers[0].execution.managed_frame_state.held_monitor_count);
+    try std.testing.expect(reconstructed_callers[0].execution.managed_frame_state.synchronized_monitor_owned);
+    try std.testing.expectEqual(@as(?u64, @bitCast(handle)), reconstructed_callers[0].execution.synchronized_monitor);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().monitor_deopt_transfers);
+    try std.testing.expectEqual(@as(u64, 2), runtime.stats().synchronized_method_enters);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().synchronized_method_exits);
+    try monitors.exit(handle, &collector, &satb);
+    try monitors.exit(handle, &collector, &satb);
+    reconstructed.execution.managed_frame_state.held_monitors[0] = @bitCast(runtime_value.Handle.none);
+    reconstructed.execution.managed_frame_state.held_monitor_count = 0;
+    reconstructed.execution.managed_frame_state.synchronized_monitor_owned = false;
+    reconstructed.execution.synchronized_monitor = null;
+    reconstructed_callers[0].execution.managed_frame_state.held_monitors[0] = @bitCast(runtime_value.Handle.none);
+    reconstructed_callers[0].execution.managed_frame_state.held_monitor_count = 0;
+    reconstructed_callers[0].execution.managed_frame_state.synchronized_monitor_owned = false;
+    reconstructed_callers[0].execution.synchronized_monitor = null;
     try std.testing.expectEqual(@as(u64, 0), manager.stats().active_leases);
     try std.testing.expect(try manager.invalidate(0));
     try std.testing.expectEqual(@as(u32, 1), try manager.reclaim());
     try std.testing.expectEqual(@as(u32, 1), metadata_owner.references.load(.acquire));
+}
+
+test "synchronized native exceptions unwind and no-code fallback acquires once" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+
+    var storage: [512]u8 align(runtime_value.object_alignment) = @splat(0);
+    const regions = [_]runtime_value.Region{try runtime_value.Region.fromSlice(&storage)};
+    var handles = try runtime_value.HandleTable.init(std.testing.allocator, 2, &regions);
+    defer handles.deinit();
+    var heap = try runtime_heap.ManagedHeap.init(std.testing.allocator, &handles, 128);
+    defer heap.deinit();
+    var heap_allocator = heap.threadAllocator();
+    const reservation = try heap_allocator.allocate(32, runtime_value.object_alignment);
+    const array = try handles.reserve(0, 0);
+    try heap.publishObject(reservation, array);
+    const payload = @intFromPtr(try handles.resolve(array));
+    const length: *std.atomic.Value(u32) = @ptrFromInt(payload);
+    length.store(1, .release);
+
+    var monitors = try runtime_monitor.MonitorTable.init(std.testing.allocator, std.testing.io, &handles);
+    defer monitors.deinit() catch unreachable;
+    var collector = try runtime_gc.ConcurrentCollector.init(std.testing.allocator, &heap, &handles, .{
+        .satb_queue_capacity = 8,
+        .max_satb_buffers = 1,
+        .card_bytes = 64,
+        .static_root_slots = monitors.rootSlotAddresses(),
+    });
+    defer collector.deinit() catch unreachable;
+    var registry = try runtime_thread_registry.Registry.init(std.testing.allocator, std.testing.io, 1);
+    defer registry.deinit() catch unreachable;
+    var context = try runtime_thread_registry.ThreadContext.init(std.testing.allocator, 8);
+    defer context.deinit();
+    try registry.register(&context);
+    defer registry.unregister(&context) catch unreachable;
+    var satb = try runtime_gc.SatbBuffer.init(std.testing.allocator, 8);
+    defer satb.deinit() catch unreachable;
+    try collector.registerThreadSatbBuffer(&satb, &context);
+    defer collector.unregisterSatbBuffer(&satb) catch unreachable;
+
+    var manager = try runtime_code_manager.Manager.init(std.testing.allocator, 1, 1, 1);
+    defer manager.deinit() catch unreachable;
+    var runtime = try runtime_jit.Runtime.init(std.testing.allocator, &handles, &registry);
+    defer runtime.deinit() catch unreachable;
+    try runtime.installCollector(&collector);
+    try runtime.installMonitorTable(&monitors);
+    const synchronization_entries = [_]runtime_method_sync.Entry{.{
+        .method_id = 0,
+        .target = .{ .instance_parameter = 0 },
+    }};
+    const synchronization = try runtime_method_sync.Table.init(&synchronization_entries, &collector);
+    try runtime.installMethodSynchronization(&synchronization);
+    try runtime.installCodeManager(&manager);
+
+    var shims = try encode(std.testing.allocator, @intFromPtr(&runtime_jit.slowResolveBridge));
+    defer shims.deinit();
+    var cache = jit_memory.Cache.init(std.testing.allocator);
+    defer cache.deinit();
+    const entry_code = try cache.addBytes(shims.entry);
+    const slow_code = try cache.addBytes(shims.slow_helper);
+    const bounds_code = try cache.addBytes(shims.bounds_exception_helper);
+
+    const insts = [_]Instruction{
+        .{ .aget_object = .{ .dest_or_src = 2, .array = 0, .index = 1 } },
+        .{ .return_object = .{ .src = 2 } },
+    };
+    var optimized = try optimizer.optimize(std.testing.allocator, &insts, &.{}, .{});
+    defer optimized.deinit();
+    var native = try x64_encoder.encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = .{
+            .handle_capacity = handles.entryCapacity(),
+            .region_count = handles.regionCount(),
+            .slow_resolve_helper = slow_code.entryAddress(),
+            .bounds_exception_helper = bounds_code.entryAddress(),
+            .reference_array_layout = .{ .length_offset = 0, .data_offset = 8 },
+            .field_layouts = &.{},
+        },
+    });
+    defer native.deinit();
+    const native_bytes = try native.finalize();
+    defer std.testing.allocator.free(native_bytes);
+    var candidate = try manager.prepare(native_bytes);
+    defer candidate.deinit();
+    try manager.publish(0, &candidate);
+
+    var managed = try runtime.enter(&context);
+    defer managed.deinit();
+    const root_maps = if (native.root_maps) |*maps| maps else return error.TestUnexpectedResult;
+    try managed.installRootMaps(root_maps);
+    var frame = CallFrame{
+        .image = try managed.registerImage(),
+        .target = 0,
+        .method_id = 0,
+    };
+    frame.gp_args[0] = @bitCast(array);
+    frame.gp_args[1] = @as(u32, @bitCast(@as(i32, -1)));
+    const EntryFn = fn (*const CallFrame) callconv(.c) usize;
+    const call = entry_code.typedEntry(EntryFn);
+    try std.testing.expectEqual(@as(usize, 0), call(&frame));
+    try std.testing.expectEqual(@as(u32, 0), managed.native_state.held_monitor_count);
+    const exception = managed.takeException() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(runtime_jit.ManagedExceptionKind.array_index_out_of_bounds, exception.kind);
+    try std.testing.expectEqual(@as(i32, -1), exception.index);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().synchronized_method_enters);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().synchronized_method_exits);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().synchronized_exception_exits);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().monitor_unwind_exits);
+    try std.testing.expectEqual(monitors.stats().associations, monitors.stats().disassociations);
+
+    // A bad receiver is discovered only after the code lease is selected.
+    // The entry bridge must roll that lease back before invoking fallback.
+    frame.image = try managed.registerImage();
+    frame.fallback_target = @intFromPtr(&runtime_jit.unavailableCodeTarget);
+    frame.gp_args[0] = @bitCast(runtime_value.Handle.none);
+    try std.testing.expectEqual(@as(usize, 0), call(&frame));
+    try std.testing.expectEqual(runtime_jit.CodeDispatchStatus.fallback_runtime_error, managed.native_state.last_code_dispatch);
+    try std.testing.expectEqual(@as(u64, 0), manager.stats().active_leases);
+    try std.testing.expectEqual(@as(u32, 0), managed.native_state.held_monitor_count);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().synchronized_method_failures);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().synchronized_method_enters);
+
+    const Fallback = struct {
+        monitors: *runtime_monitor.MonitorTable,
+        collector: *runtime_gc.ConcurrentCollector,
+        registry: *runtime_thread_registry.Registry,
+        context: *runtime_thread_registry.ThreadContext,
+        satb: *runtime_gc.SatbBuffer,
+        called: bool = false,
+        observed_reentrant_entry: bool = false,
+        failed: bool = false,
+
+        fn run(state: *runtime_jit.NativeThreadState, _: usize, _: usize, _: usize, _: usize, _: usize) callconv(.c) usize {
+            const receiver_register: u8 = if (builtin.os.tag == .windows) 1 else 7;
+            const context_register: u8 = if (builtin.os.tag == .windows) 2 else 6;
+            const self: *@This() = @ptrFromInt(state.captured_gp[context_register]);
+            if (state.dispatch_method_id != 0 or state.synchronized_owner != .fallback) {
+                self.failed = true;
+                return 0;
+            }
+            const handle_bits = state.captured_gp[receiver_register];
+            const handle: runtime_value.Handle = @bitCast(@as(u64, handle_bits));
+            const reentrant_before = self.monitors.stats().reentrant_enters;
+            self.monitors.enter(handle, self.collector, self.registry, self.context, self.satb) catch {
+                self.failed = true;
+                return 0;
+            };
+            self.observed_reentrant_entry = self.monitors.stats().reentrant_enters != reentrant_before;
+            self.monitors.exit(handle, self.collector, self.satb) catch {
+                self.failed = true;
+                return 0;
+            };
+            self.called = true;
+            return 73;
+        }
+    };
+    var fallback = Fallback{
+        .monitors = &monitors,
+        .collector = &collector,
+        .registry = &registry,
+        .context = &context,
+        .satb = &satb,
+    };
+    try std.testing.expect(try manager.invalidate(0));
+    try std.testing.expectEqual(@as(u32, 1), try manager.reclaim());
+    frame.image = try managed.registerImage();
+    frame.fallback_target = @intFromPtr(&Fallback.run);
+    frame.gp_args[0] = @bitCast(array);
+    frame.gp_args[1] = @intFromPtr(&fallback);
+    try std.testing.expectEqual(@as(usize, 73), call(&frame));
+    try std.testing.expect(fallback.called);
+    try std.testing.expect(!fallback.failed);
+    try std.testing.expect(!fallback.observed_reentrant_entry);
+    try std.testing.expectEqual(runtime_jit.CodeDispatchStatus.fallback_no_code, managed.native_state.last_code_dispatch);
+    try std.testing.expectEqual(@as(u32, 0), managed.native_state.held_monitor_count);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().synchronized_method_enters);
+    try std.testing.expectEqual(@as(u64, 1), runtime.stats().synchronized_fallback_deferrals);
+    try std.testing.expectEqual(runtime_jit.SynchronizedOwner.none, managed.native_state.synchronized_owner);
+    try std.testing.expectEqual(monitors.stats().associations, monitors.stats().disassociations);
 }
 
 test "x64 deoptimization captures a managed spill slot and low XMM lane" {
@@ -3323,7 +3736,7 @@ test "x64 compiler-owned OSR label executes under its code-version lease" {
         var gp: [16]u64 = @splat(0);
         var scratch: [26]u64 = undefined;
         try deopt_table.exportOsr(51, &interpreter_frame, .{ .native_registers = &gp, .scratch = &scratch });
-        const target = runtime_jit.codeOsrEnterBridge(&managed.native_state, 0, 0, 51);
+        const target = runtime_jit.codeOsrEnterBridge(&managed.native_state, 0, 0, 51, &interpreter_frame, &gp);
         var call_frame = OsrCallFrame{ .image = try managed.registerImage(), .target = target, .gp = gp };
         const EntryFn = fn (*const OsrCallFrame) callconv(.c) usize;
         const value = osr_adapter.typedEntry(EntryFn)(&call_frame);

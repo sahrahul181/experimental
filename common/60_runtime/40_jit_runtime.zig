@@ -6,11 +6,13 @@
 //! resolution participate in thread root handshakes without allocation.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const runtime_value = @import("runtime_value");
 const runtime_stack_map = @import("runtime_stack_map");
 const thread_registry = @import("runtime_thread_registry");
 const runtime_gc = @import("runtime_gc");
 const runtime_monitor = @import("runtime_monitor");
+const runtime_method_sync = @import("runtime_method_sync");
 const runtime_code_manager = @import("runtime_code_manager");
 const runtime_deopt = @import("runtime_deopt");
 
@@ -19,7 +21,7 @@ const HandleTable = runtime_value.HandleTable;
 const Registry = thread_registry.Registry;
 const ThreadContext = thread_registry.ThreadContext;
 
-pub const Error = runtime_value.Error || runtime_stack_map.Error || thread_registry.Error || runtime_gc.Error || runtime_monitor.Error || runtime_code_manager.Error || runtime_deopt.Error || std.mem.Allocator.Error || error{
+pub const Error = runtime_value.Error || runtime_stack_map.Error || thread_registry.Error || runtime_gc.Error || runtime_monitor.Error || runtime_method_sync.Error || runtime_code_manager.Error || runtime_deopt.Error || std.mem.Allocator.Error || error{
     ActiveEntries,
     ActiveCodeLease,
     InactiveEntry,
@@ -41,6 +43,15 @@ pub const CodeDispatchStatus = enum(u32) {
     deoptimized,
     deopt_failed,
     fallback_osr_metadata,
+};
+
+/// Owner of the implicit synchronized-method recursion level while an entry
+/// crosses compiled, fallback, deoptimization, and OSR boundaries.
+pub const SynchronizedOwner = enum(u32) {
+    none,
+    compiled,
+    fallback,
+    interpreter,
 };
 
 pub const OsrEntry = extern struct {
@@ -113,6 +124,8 @@ pub const NativeThreadState = extern struct {
     monitor_table: usize = 0,
     held_monitors: [max_native_monitors]u64 = @splat(@bitCast(Handle.none)),
     held_monitor_count: u32 = 0,
+    entry_monitor_mark: u32 = 0,
+    entry_synchronized_monitor: u32 = 0,
     last_card_destination: u64 = 0,
     pending_exception: ManagedException = .{},
     code_manager: usize = 0,
@@ -120,6 +133,8 @@ pub const NativeThreadState = extern struct {
     code_lease_slot: usize = 0,
     deopt_request: usize = 0,
     last_code_dispatch: CodeDispatchStatus = .ok,
+    dispatch_method_id: u32 = unmanaged_method_id,
+    synchronized_owner: SynchronizedOwner = .none,
     captured_gp: [16]u64 = @splat(0),
     captured_xmm: [8][16]u8 = @splat(@splat(0)),
     /// Managed rsp before the private helper call. Spill offsets are relative
@@ -148,6 +163,13 @@ pub const Stats = struct {
     monitor_exits: u64,
     monitor_unwind_exits: u64,
     monitor_failures: u64,
+    monitor_deopt_transfers: u64,
+    monitor_osr_transfers: u64,
+    synchronized_method_enters: u64,
+    synchronized_method_exits: u64,
+    synchronized_exception_exits: u64,
+    synchronized_fallback_deferrals: u64,
+    synchronized_method_failures: u64,
 };
 
 const Counters = struct {
@@ -171,6 +193,13 @@ const Counters = struct {
     monitor_exits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     monitor_unwind_exits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     monitor_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    monitor_deopt_transfers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    monitor_osr_transfers: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    synchronized_method_enters: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    synchronized_method_exits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    synchronized_exception_exits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    synchronized_fallback_deferrals: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    synchronized_method_failures: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 };
 
 pub const Runtime = struct {
@@ -180,6 +209,7 @@ pub const Runtime = struct {
     region_bases: []usize,
     collector: ?*runtime_gc.ConcurrentCollector = null,
     monitor_table: ?*runtime_monitor.MonitorTable = null,
+    method_synchronization: ?*const runtime_method_sync.Table = null,
     code_manager: ?*runtime_code_manager.Manager = null,
     counters: Counters = .{},
 
@@ -226,6 +256,13 @@ pub const Runtime = struct {
             if (!collector.isStaticRootSlot(address)) return error.InvalidTableLayout;
         }
         self.monitor_table = monitors;
+    }
+
+    pub fn installMethodSynchronization(self: *Runtime, synchronization: *const runtime_method_sync.Table) Error!void {
+        if (self.counters.active_entries.load(.acquire) != 0) return error.ActiveEntries;
+        const collector = self.collector orelse return error.MissingCollector;
+        if (synchronization.collectorDomain() != collector or self.monitor_table == null) return error.InvalidTableLayout;
+        self.method_synchronization = synchronization;
     }
 
     /// Installs the immutable-code publication domain used by architecture
@@ -295,6 +332,13 @@ pub const Runtime = struct {
             .monitor_exits = self.counters.monitor_exits.load(.acquire),
             .monitor_unwind_exits = self.counters.monitor_unwind_exits.load(.acquire),
             .monitor_failures = self.counters.monitor_failures.load(.acquire),
+            .monitor_deopt_transfers = self.counters.monitor_deopt_transfers.load(.acquire),
+            .monitor_osr_transfers = self.counters.monitor_osr_transfers.load(.acquire),
+            .synchronized_method_enters = self.counters.synchronized_method_enters.load(.acquire),
+            .synchronized_method_exits = self.counters.synchronized_method_exits.load(.acquire),
+            .synchronized_exception_exits = self.counters.synchronized_exception_exits.load(.acquire),
+            .synchronized_fallback_deferrals = self.counters.synchronized_fallback_deferrals.load(.acquire),
+            .synchronized_method_failures = self.counters.synchronized_method_failures.load(.acquire),
         };
     }
 };
@@ -311,6 +355,8 @@ pub const ManagedEntry = struct {
     pub fn deinit(self: *ManagedEntry) void {
         if (!self.active) return;
         releaseHeldMonitors(&self.native_state);
+        self.native_state.synchronized_owner = .none;
+        self.native_state.dispatch_method_id = unmanaged_method_id;
         if (self.code_lease) |*lease| lease.deinit();
         self.code_lease = null;
         if (self.code_reader) |*reader| reader.deinit();
@@ -356,6 +402,8 @@ pub const ManagedEntry = struct {
         self.native_state.code_lease_slot = @intFromPtr(&self.code_lease);
         self.native_state.deopt_request = 0;
         self.native_state.last_code_dispatch = .ok;
+        self.native_state.dispatch_method_id = unmanaged_method_id;
+        self.native_state.synchronized_owner = .none;
         return .{
             .r12_acknowledged_epoch = self.acknowledged_epoch,
             .r13_region_bases = @intFromPtr(self.runtime.region_bases.ptr),
@@ -441,6 +489,83 @@ fn codeFallback(state: *NativeThreadState, status: CodeDispatchStatus, fallback_
     return @intFromPtr(&unavailableCodeTarget);
 }
 
+fn managedArgumentRegister(index: u16) ?u8 {
+    if (builtin.cpu.arch != .x86_64) return null;
+    const windows = [_]u8{ 1, 2, 8, 9 };
+    const system_v = [_]u8{ 7, 6, 2, 1, 8, 9 };
+    const registers = if (builtin.os.tag == .windows) windows[0..] else system_v[0..];
+    return if (index < registers.len) registers[index] else null;
+}
+
+/// The caller has completed the managed-entry poll and keeps the entry root
+/// scope alive. This local root extends receiver liveness across monitor
+/// association and any passive contended wait without adding a second poll to
+/// every synchronized compiled invocation.
+fn acquireMethodMonitorAfterEntryPoll(state: *NativeThreadState, handle: Handle) bool {
+    state.last_error = .ok;
+    if (handle.isNull() or state.held_monitor_count >= max_native_monitors or
+        state.monitor_table == 0 or state.collector == 0 or state.satb_buffer == 0)
+    {
+        _ = state.runtime.counters.synchronized_method_failures.fetchAdd(1, .monotonic);
+        const status: SlowResolveStatus = if (handle.isNull())
+            .invalid_handle
+        else if (state.held_monitor_count >= max_native_monitors)
+            .monitor_capacity
+        else if (state.monitor_table == 0)
+            .missing_monitor
+        else
+            .missing_collector;
+        _ = monitorFailure(state, status);
+        return false;
+    }
+    var rooted = handle;
+    var roots = state.context.beginRootScope() catch |err| {
+        _ = state.runtime.counters.synchronized_method_failures.fetchAdd(1, .monotonic);
+        _ = monitorFailure(state, statusFor(err));
+        return false;
+    };
+    defer roots.deinit();
+    roots.add(&rooted) catch |err| {
+        _ = state.runtime.counters.synchronized_method_failures.fetchAdd(1, .monotonic);
+        _ = monitorFailure(state, statusFor(err));
+        return false;
+    };
+    const monitors: *runtime_monitor.MonitorTable = @ptrFromInt(state.monitor_table);
+    const collector: *runtime_gc.ConcurrentCollector = @ptrFromInt(state.collector);
+    const satb: *runtime_gc.SatbBuffer = @ptrFromInt(state.satb_buffer);
+    monitors.enter(rooted, collector, state.runtime.registry, state.context, satb) catch |err| {
+        _ = state.runtime.counters.synchronized_method_failures.fetchAdd(1, .monotonic);
+        _ = monitorFailure(state, statusFor(err));
+        return false;
+    };
+    state.held_monitors[state.held_monitor_count] = @bitCast(rooted);
+    state.held_monitor_count += 1;
+    _ = state.runtime.counters.monitor_enters.fetchAdd(1, .monotonic);
+    _ = state.runtime.counters.synchronized_method_enters.fetchAdd(1, .monotonic);
+    return true;
+}
+
+fn enterSynchronizedMethod(state: *NativeThreadState, method: u32) bool {
+    const synchronization = state.runtime.method_synchronization orelse return true;
+    const entry = synchronization.find(method) orelse return true;
+    const handle = switch (entry.target) {
+        .instance_parameter => |parameter| blk: {
+            const register = managedArgumentRegister(parameter) orelse {
+                _ = state.runtime.counters.synchronized_method_failures.fetchAdd(1, .monotonic);
+                return false;
+            };
+            break :blk @as(Handle, @bitCast(state.captured_gp[register]));
+        },
+        .static_root_slot => synchronization.loadStatic(entry) catch {
+            _ = state.runtime.counters.synchronized_method_failures.fetchAdd(1, .monotonic);
+            return false;
+        },
+    };
+    if (!acquireMethodMonitorAfterEntryPoll(state, handle)) return false;
+    state.entry_synchronized_monitor = 1;
+    return true;
+}
+
 /// Runtime half of the architecture entry trampoline. The reader is bound to
 /// this ManagedEntry and therefore owner-confined; publication and reclamation
 /// only observe its atomic reader slot. A successful return owns exactly one
@@ -451,7 +576,19 @@ pub fn codeLeaseEnterBridge(
     method: u32,
     deopt_request: usize,
 ) callconv(.c) usize {
+    return codeLeaseEnterBridgeInner(state, fallback_target, method, deopt_request, true);
+}
+
+fn codeLeaseEnterBridgeInner(
+    state: *NativeThreadState,
+    fallback_target: usize,
+    method: u32,
+    deopt_request: usize,
+    acquire_synchronized_monitor: bool,
+) usize {
     state.deopt_request = deopt_request;
+    state.dispatch_method_id = method;
+    state.synchronized_owner = .none;
     if (state.active == 0) return codeFallback(state, .inactive_entry, fallback_target);
     if (state.code_manager == 0 or state.code_reader == 0 or state.code_lease_slot == 0) {
         return codeFallback(state, .fallback_runtime_error, fallback_target);
@@ -459,7 +596,11 @@ pub fn codeLeaseEnterBridge(
 
     const lease_slot: *?runtime_code_manager.Lease = @ptrFromInt(state.code_lease_slot);
     if (lease_slot.* != null) return codeFallback(state, .active_lease, fallback_target);
-
+    state.entry_monitor_mark = state.held_monitor_count;
+    state.entry_synchronized_monitor = 0;
+    if (acquire_synchronized_monitor) if (state.runtime.method_synchronization) |synchronization| {
+        if (synchronization.find(method) != null) state.synchronized_owner = .fallback;
+    };
     var entry_roots = state.context.beginRootScope() catch {
         return codeFallback(state, .fallback_runtime_error, fallback_target);
     };
@@ -494,9 +635,22 @@ pub fn codeLeaseEnterBridge(
     const manager: *runtime_code_manager.Manager = @ptrFromInt(state.code_manager);
     const reader: *runtime_code_manager.Reader = @ptrFromInt(state.code_reader);
     lease_slot.* = manager.enter(reader, method) catch |err| switch (err) {
-        error.NoCode => return codeFallback(state, .fallback_no_code, fallback_target),
+        error.NoCode => {
+            if (acquire_synchronized_monitor) if (state.runtime.method_synchronization) |synchronization| {
+                if (synchronization.find(method) != null) {
+                    _ = state.runtime.counters.synchronized_fallback_deferrals.fetchAdd(1, .monotonic);
+                }
+            };
+            return codeFallback(state, .fallback_no_code, fallback_target);
+        },
         else => return codeFallback(state, .fallback_runtime_error, fallback_target),
     };
+    if (acquire_synchronized_monitor and !enterSynchronizedMethod(state, method)) {
+        lease_slot.*.?.deinit();
+        lease_slot.* = null;
+        return codeFallback(state, .fallback_runtime_error, fallback_target);
+    }
+    if (state.entry_synchronized_monitor != 0) state.synchronized_owner = .compiled;
     state.last_code_dispatch = .ok;
     _ = state.runtime.counters.code_entries.fetchAdd(1, .monotonic);
     return lease_slot.*.?.entryAddress();
@@ -511,17 +665,29 @@ pub fn codeOsrEnterBridge(
     fallback_target: usize,
     method: u32,
     point_id: u32,
+    source_frame: ?*runtime_deopt.Frame,
+    source_image: ?*const [16]u64,
 ) callconv(.c) usize {
-    const base = codeLeaseEnterBridge(state, fallback_target, method, 0);
-    if (state.code_lease_slot == 0) return base;
+    const source_owns_synchronized = source_frame != null and
+        source_frame.?.execution.managed_frame_state.synchronized_monitor_owned;
+    const base = codeLeaseEnterBridgeInner(state, fallback_target, method, 0, false);
+    if (state.code_lease_slot == 0) {
+        if (source_owns_synchronized) state.synchronized_owner = .interpreter;
+        return base;
+    }
     const lease_slot: *?runtime_code_manager.Lease = @ptrFromInt(state.code_lease_slot);
-    const lease = if (lease_slot.*) |*value| value else return base;
+    const lease = if (lease_slot.*) |*value| value else {
+        if (source_owns_synchronized) state.synchronized_owner = .interpreter;
+        return base;
+    };
     const metadata = lease.metadata() orelse {
         _ = codeLeaseExitBridge(state, 0);
+        if (source_owns_synchronized) state.synchronized_owner = .interpreter;
         return codeFallback(state, .fallback_osr_metadata, fallback_target);
     };
     if (metadata.osr_entries == 0 or metadata.osr_entry_count == 0) {
         _ = codeLeaseExitBridge(state, 0);
+        if (source_owns_synchronized) state.synchronized_owner = .interpreter;
         return codeFallback(state, .fallback_osr_metadata, fallback_target);
     }
     const entries: [*]const OsrEntry = @ptrFromInt(metadata.osr_entries);
@@ -535,10 +701,85 @@ pub fn codeOsrEnterBridge(
         {
             break;
         }
-        return base + entry.code_offset;
+        const target = base + entry.code_offset;
+        if (!transferOsrMonitors(state, metadata, point_id, source_frame, source_image)) {
+            _ = codeLeaseExitBridge(state, 0);
+            if (source_owns_synchronized) state.synchronized_owner = .interpreter;
+            return codeFallback(state, .fallback_osr_metadata, fallback_target);
+        }
+        return target;
     }
     _ = codeLeaseExitBridge(state, 0);
+    if (source_owns_synchronized) state.synchronized_owner = .interpreter;
     return codeFallback(state, .fallback_osr_metadata, fallback_target);
+}
+
+fn transferOsrMonitors(
+    state: *NativeThreadState,
+    metadata: runtime_code_manager.Metadata,
+    point_id: u32,
+    source_frame: ?*runtime_deopt.Frame,
+    source_image: ?*const [16]u64,
+) bool {
+    if (state.held_monitor_count != 0) return false;
+    // Legacy metadata without a deoptimization table can only enter OSR when
+    // neither side carries monitor ownership.
+    if (metadata.deopt_table == 0) return source_frame == null and source_image == null;
+    const table: *const runtime_deopt.Table = @ptrFromInt(metadata.deopt_table);
+    return transferOsrMonitorOwnership(state, table, point_id, source_frame, source_image);
+}
+
+/// Commits the interpreter-to-native monitor bookkeeping handoff after the
+/// caller has pinned and validated the target code version. No monitor-table
+/// enter/exit occurs: ownership remains with the current OS thread.
+pub fn transferOsrMonitorOwnership(
+    state: *NativeThreadState,
+    table: *const runtime_deopt.Table,
+    point_id: u32,
+    source_frame: ?*runtime_deopt.Frame,
+    source_image: ?*const [16]u64,
+) bool {
+    if (state.held_monitor_count != 0) return false;
+    const count = table.monitorCount(point_id) catch return false;
+    if (count > max_native_monitors) return false;
+    if (count == 0) {
+        if (source_frame) |frame| {
+            if (frame.execution.managed_frame_state.held_monitor_count != 0 or
+                frame.execution.managed_frame_state.synchronized_monitor_owned or
+                frame.execution.synchronized_monitor != null)
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+    if (state.monitor_table == 0 or state.collector == 0 or state.satb_buffer == 0) return false;
+    const frame = source_frame orelse return false;
+    const image = source_image orelse return false;
+    var staged: [max_native_monitors]u64 = @splat(@bitCast(Handle.none));
+    const staged_count = table.copyOsrMonitors(point_id, frame, &staged) catch return false;
+    if (staged_count != count) return false;
+    const record = table.find(point_id) catch return false;
+    const frames = table.framesFor(record);
+    if (frames.len != 1) return false;
+    const method_monitors = table.monitorsForFrame(frames[0]);
+    for (method_monitors, 0..) |monitor, index| switch (monitor.source) {
+        .native_register => |register| {
+            if (register >= image.len or image[register] != staged[index]) return false;
+        },
+        .stack_slot, .xmm_register, .constant => return false,
+    };
+
+    @memcpy(state.held_monitors[0..count], staged[0..count]);
+    state.held_monitor_count = @intCast(count);
+    @memset(frame.execution.managed_frame_state.held_monitors[0..count], @as(u64, @bitCast(Handle.none)));
+    frame.execution.managed_frame_state.held_monitor_count = 0;
+    frame.execution.managed_frame_state.synchronized_monitor_owned = false;
+    frame.execution.synchronized_monitor = null;
+    state.entry_synchronized_monitor = @intFromBool(method_monitors.len != 0 and method_monitors[0].kind == .synchronized);
+    if (state.entry_synchronized_monitor != 0) state.synchronized_owner = .compiled;
+    _ = state.runtime.counters.monitor_osr_transfers.fetchAdd(1, .monotonic);
+    return true;
 }
 
 /// Stable fallback ABI selected by the entry trampoline after invalidation.
@@ -562,6 +803,7 @@ pub fn deoptResumeBridge(
         .stack_base = request.stack_base,
         .stack_min_offset = request.stack_min_offset,
         .stack_max_offset = request.stack_max_offset,
+        .held_monitors = state.held_monitors[0..state.held_monitor_count],
     });
     state.deopt_request = 0;
     return result;
@@ -576,9 +818,34 @@ fn deoptFailure(state: *NativeThreadState, frame: ?*runtime_deopt.Frame) usize {
 }
 
 fn deoptFailureDestination(state: *NativeThreadState, destination: runtime_deopt.Destination) usize {
+    clearFrameMonitorBookkeeping(destination.frame);
+    for (destination.inline_frames) |*frame| clearFrameMonitorBookkeeping(frame);
     destination.frame.active = false;
     for (destination.inline_frames) |*frame| frame.active = false;
     return deoptFailure(state, null);
+}
+
+fn clearFrameMonitorBookkeeping(frame: *runtime_deopt.Frame) void {
+    const count: usize = frame.execution.managed_frame_state.held_monitor_count;
+    @memset(frame.execution.managed_frame_state.held_monitors[0..count], @as(u64, @bitCast(Handle.none)));
+    frame.execution.managed_frame_state.held_monitor_count = 0;
+    frame.execution.managed_frame_state.synchronized_monitor_owned = false;
+    frame.execution.synchronized_monitor = null;
+}
+
+fn clearNativeMonitorBookkeeping(state: *NativeThreadState) void {
+    const count: usize = state.held_monitor_count;
+    @memset(state.held_monitors[0..count], @as(u64, @bitCast(Handle.none)));
+    state.held_monitor_count = 0;
+    state.entry_synchronized_monitor = 0;
+}
+
+fn reconstructedSynchronizationOwned(frame: *const runtime_deopt.Frame) bool {
+    var current: ?*const runtime_deopt.Frame = frame;
+    while (current) |activation| : (current = activation.previous) {
+        if (activation.execution.managed_frame_state.synchronized_monitor_owned) return true;
+    }
+    return false;
 }
 
 fn resumeDeoptPoint(
@@ -615,6 +882,12 @@ fn resumeDeoptPoint(
     table.visitFrameReferenceSlots(point_id, frame, &resumed_roots, RootVisitor.add) catch {
         return deoptFailureDestination(state, request.destination);
     };
+    if (state.held_monitor_count != 0) {
+        const synchronized = reconstructedSynchronizationOwned(frame);
+        clearNativeMonitorBookkeeping(state);
+        if (synchronized) state.synchronized_owner = .interpreter;
+        _ = state.runtime.counters.monitor_deopt_transfers.fetchAdd(1, .monotonic);
+    }
     state.last_code_dispatch = .deoptimized;
     _ = state.runtime.counters.deoptimizations.fetchAdd(1, .monotonic);
     return request.resume_fn(request.resume_context, frame);
@@ -627,10 +900,6 @@ pub fn midFunctionDeoptBridge(state: *NativeThreadState, site_id: u32) callconv(
     if (state.active == 0 or state.deopt_request == 0 or state.code_lease_slot == 0) {
         return deoptFailure(state, null);
     }
-    // Until monitor ownership is represented in immutable deoptimization
-    // metadata, never transfer a frame while this native activation owns a
-    // monitor. The entry remains responsible for fail-safe reverse unwind.
-    if (state.held_monitor_count != 0) return deoptFailure(state, null);
     const lease_slot: *?runtime_code_manager.Lease = @ptrFromInt(state.code_lease_slot);
     const lease = if (lease_slot.*) |*value| value else return deoptFailure(state, null);
     const metadata = lease.metadata() orelse return deoptFailure(state, null);
@@ -649,14 +918,63 @@ pub fn midFunctionDeoptBridge(state: *NativeThreadState, site_id: u32) callconv(
         .stack_base = @ptrFromInt(state.captured_stack_base),
         .stack_min_offset = stack_bounds.min_offset,
         .stack_max_offset = stack_bounds.max_offset,
+        .held_monitors = state.held_monitors[0..state.held_monitor_count],
     });
 }
 
 /// Normal-return edge for both compiled and fallback targets. Returning the
 /// result unchanged lets the generated trampoline close the lease without a
 /// spill or a second result ABI.
+fn releaseMethodMonitors(state: *NativeThreadState, exceptional: bool) bool {
+    const mark: usize = state.entry_monitor_mark;
+    if (mark > state.held_monitor_count or state.monitor_table == 0 or
+        state.collector == 0 or state.satb_buffer == 0)
+    {
+        if (state.held_monitor_count != mark or state.entry_synchronized_monitor != 0) {
+            _ = state.runtime.counters.synchronized_method_failures.fetchAdd(1, .monotonic);
+            _ = monitorFailure(state, .runtime_error);
+        }
+        return false;
+    }
+    const monitors: *runtime_monitor.MonitorTable = @ptrFromInt(state.monitor_table);
+    const collector: *runtime_gc.ConcurrentCollector = @ptrFromInt(state.collector);
+    const satb: *runtime_gc.SatbBuffer = @ptrFromInt(state.satb_buffer);
+    var released: u32 = 0;
+    while (state.held_monitor_count > mark) {
+        const index = state.held_monitor_count - 1;
+        const handle: Handle = @bitCast(state.held_monitors[index]);
+        monitors.exit(handle, collector, satb) catch |err| {
+            _ = state.runtime.counters.synchronized_method_failures.fetchAdd(1, .monotonic);
+            _ = monitorFailure(state, statusFor(err));
+            return false;
+        };
+        state.held_monitors[index] = @bitCast(Handle.none);
+        state.held_monitor_count = index;
+        released += 1;
+        _ = state.runtime.counters.monitor_exits.fetchAdd(1, .monotonic);
+        if (exceptional) _ = state.runtime.counters.monitor_unwind_exits.fetchAdd(1, .monotonic);
+    }
+    if (state.entry_synchronized_monitor != 0) {
+        if (released == 0) {
+            _ = state.runtime.counters.synchronized_method_failures.fetchAdd(1, .monotonic);
+            _ = monitorFailure(state, .illegal_monitor_state);
+            return false;
+        }
+        _ = state.runtime.counters.synchronized_method_exits.fetchAdd(1, .monotonic);
+    }
+    state.entry_synchronized_monitor = 0;
+    state.entry_monitor_mark = state.held_monitor_count;
+    return true;
+}
+
 pub fn codeLeaseExitBridge(state: *NativeThreadState, result: usize) callconv(.c) usize {
     if (state.code_lease_slot == 0) return result;
+    const synchronized = state.entry_synchronized_monitor != 0;
+    const exceptional = state.pending_exception.kind != .none;
+    if (releaseMethodMonitors(state, exceptional) and synchronized and exceptional) {
+        _ = state.runtime.counters.synchronized_exception_exits.fetchAdd(1, .monotonic);
+    }
+    state.synchronized_owner = .none;
     const lease_slot: *?runtime_code_manager.Lease = @ptrFromInt(state.code_lease_slot);
     if (lease_slot.*) |*lease| lease.deinit();
     lease_slot.* = null;
@@ -710,7 +1028,7 @@ test "code OSR entry resolves a version-owned interior label under one lease" {
         var managed = try runtime.enter(&context);
         defer managed.deinit();
         _ = try managed.registerImage();
-        const target = codeOsrEnterBridge(&managed.native_state, 0x1234, 0, 9);
+        const target = codeOsrEnterBridge(&managed.native_state, 0x1234, 0, 9, null, null);
         const lease = if (managed.code_lease) |*value| value else return error.TestUnexpectedResult;
         try std.testing.expectEqual(lease.entryAddress() + 16, target);
         try std.testing.expectEqual(CodeDispatchStatus.ok, managed.native_state.last_code_dispatch);
@@ -718,8 +1036,25 @@ test "code OSR entry resolves a version-owned interior label under one lease" {
         try std.testing.expectEqual(@as(usize, 77), codeLeaseExitBridge(&managed.native_state, 77));
         try std.testing.expectEqual(@as(u64, 0), manager.stats().active_leases);
 
-        try std.testing.expectEqual(@as(usize, 0x1234), codeOsrEnterBridge(&managed.native_state, 0x1234, 0, 10));
+        var source = runtime_deopt.Frame{ .execution = .{
+            .pc = 4,
+            .registers = &.{},
+            .instructions = &.{},
+            .managed_frame_state = .{
+                .held_monitors = blk: {
+                    var held: [max_native_monitors]u64 =
+                        @splat(@as(u64, @bitCast(Handle.none)));
+                    held[0] = 1;
+                    break :blk held;
+                },
+                .held_monitor_count = 1,
+                .synchronized_monitor_owned = true,
+            },
+            .synchronized_monitor = 1,
+        } };
+        try std.testing.expectEqual(@as(usize, 0x1234), codeOsrEnterBridge(&managed.native_state, 0x1234, 0, 10, &source, null));
         try std.testing.expectEqual(CodeDispatchStatus.fallback_osr_metadata, managed.native_state.last_code_dispatch);
+        try std.testing.expectEqual(SynchronizedOwner.interpreter, managed.native_state.synchronized_owner);
         try std.testing.expectEqual(@as(u64, 0), manager.stats().active_leases);
     }
     try std.testing.expect(try manager.invalidate(0));

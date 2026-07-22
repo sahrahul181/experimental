@@ -49,11 +49,17 @@ pub const DeoptValueSpec = struct {
     source: DeoptSource,
 };
 
+pub const DeoptMonitorSpec = struct {
+    source: DeoptSource,
+    kind: runtime_deopt.MonitorKind = .explicit,
+};
+
 pub const DeoptInlineFrameSpec = struct {
     method_id: u32,
     dex_pc: u32,
     register_count: u16,
     values: []const DeoptValueSpec,
+    monitors: []const DeoptMonitorSpec = &.{},
 };
 
 pub const DeoptPointSpec = struct {
@@ -69,12 +75,20 @@ pub const DeoptPointSpec = struct {
     values: []const DeoptValueSpec,
     /// Outer-to-inner caller activations materialized before the leaf frame.
     inline_frames: []const DeoptInlineFrameSpec = &.{},
+    /// Held monitors acquired by the leaf activation, in acquisition order.
+    monitors: []const DeoptMonitorSpec = &.{},
 };
 
 pub const DeoptOptions = struct {
     points: []const DeoptPointSpec,
     register_count: u16,
     max_dex_pc: u32,
+    /// Monitor stack already owned when control enters the machine CFG. This
+    /// includes the outer synchronized-method monitor and OSR-held monitors.
+    entry_monitors: []const DeoptMonitorSpec = &.{},
+    /// Sorted monitor-enter safepoint ids that open synchronized inlined
+    /// regions. Unlisted monitor-enter operations are explicit bytecode locks.
+    synchronized_monitor_enter_sites: []const u32 = &.{},
 };
 
 pub const OsrEntrySpec = struct {
@@ -203,6 +217,7 @@ pub const Stats = struct {
     deopt_points: u32 = 0,
     deopt_frames: u32 = 0,
     deopt_values: u32 = 0,
+    deopt_monitors: u32 = 0,
     deopt_xmm_values: u32 = 0,
     deopt_stack_values: u32 = 0,
     deopt_block_entries: u32 = 0,
@@ -287,7 +302,7 @@ pub const Function = struct {
         if ((self.stats.deopt_points == 0) != (self.deopt_table == null)) return error.InvalidMachine;
         if (self.deopt_table) |table| {
             if (table.records.len != self.stats.deopt_points or table.frames.len != self.stats.deopt_frames or
-                table.values.len != self.stats.deopt_values) return error.InvalidMachine;
+                table.values.len != self.stats.deopt_values or table.monitors.len != self.stats.deopt_monitors) return error.InvalidMachine;
             if (self.stats.deopt_block_entries > self.stats.deopt_points or
                 self.stats.deopt_guards != self.stats.deopt_points or self.stats.deopt_traps != self.stats.deopt_points) return error.InvalidMachine;
             const maps = &(self.root_maps orelse return error.InvalidMachine);
@@ -3110,6 +3125,236 @@ fn translateDeoptValues(
     return values;
 }
 
+fn translateDeoptMonitors(
+    allocator: std.mem.Allocator,
+    source: *const machine.Function,
+    allocation: *const regalloc.Allocation,
+    spill_plan: *const regalloc.SpillPlan,
+    maps: *const runtime_stack_map.Table,
+    safepoint_id: u32,
+    live_values: []const usize,
+    physical_owners: *[16]?machine.RegId,
+    specs: []const DeoptMonitorSpec,
+    stats: *Stats,
+) Error![]runtime_deopt.MonitorSpec {
+    const monitors = try allocator.alloc(runtime_deopt.MonitorSpec, specs.len);
+    errdefer allocator.free(monitors);
+    for (specs, 0..) |monitor, index| {
+        const reg = switch (monitor.source) {
+            .machine_register => |value| value,
+            .constant => return error.InvalidDeoptMetadata,
+        };
+        if (reg >= source.reg_types.len or !rootIsSet(live_values, reg) or !source.isGcRoot(reg)) {
+            return error.DeadDeoptValue;
+        }
+        const translated: runtime_deopt.Source = switch (allocation.locationOf(reg) orelse return error.InvalidMachine) {
+            .phys => |assigned| switch (assigned.class()) {
+                .gp => blk: {
+                    const physical = try x64Reg(assigned);
+                    if (physical_owners[physical]) |owner| {
+                        if (owner != reg) return error.AliasedDeoptValue;
+                    } else {
+                        physical_owners[physical] = reg;
+                    }
+                    break :blk .{ .native_register = physical };
+                },
+                .xmm => return error.InvalidDeoptMetadata,
+            },
+            .spill => blk: {
+                const slot = spillSlotFor(spill_plan, reg) orelse return error.InvalidDeoptMetadata;
+                if (slot.byte_offset > std.math.maxInt(i32)) return error.InvalidDeoptMetadata;
+                stats.deopt_stack_values += 1;
+                break :blk .{ .stack_slot = @intCast(slot.byte_offset) };
+            },
+            .none => return error.InvalidMachine,
+        };
+        if (!try rootMapContainsSource(maps, safepoint_id, translated)) return error.InvalidDeoptMetadata;
+        monitors[index] = .{ .source = translated, .kind = monitor.kind };
+    }
+    stats.deopt_monitors = std.math.add(u32, stats.deopt_monitors, @intCast(specs.len)) catch
+        return error.InvalidDeoptMetadata;
+    return monitors;
+}
+
+const MonitorRegionEntry = struct {
+    reg: machine.RegId,
+    kind: runtime_deopt.MonitorKind,
+};
+
+const MonitorRegionState = struct {
+    initialized: bool = false,
+    depth: u8 = 0,
+    stack: [runtime_jit.max_native_monitors]MonitorRegionEntry = undefined,
+};
+
+fn deoptMonitorEntry(spec: DeoptMonitorSpec) Error!MonitorRegionEntry {
+    return .{
+        .reg = switch (spec.source) {
+            .machine_register => |reg| reg,
+            .constant => return error.InvalidDeoptMetadata,
+        },
+        .kind = spec.kind,
+    };
+}
+
+fn monitorRegionStatesEqual(lhs: MonitorRegionState, rhs: MonitorRegionState) bool {
+    if (lhs.depth != rhs.depth) return false;
+    for (lhs.stack[0..lhs.depth], rhs.stack[0..rhs.depth]) |left, right| {
+        if (left.reg != right.reg or left.kind != right.kind) return false;
+    }
+    return true;
+}
+
+fn pointMonitorCount(point: DeoptPointSpec) Error!usize {
+    var count = point.monitors.len;
+    for (point.inline_frames) |frame| {
+        count = std.math.add(usize, count, frame.monitors.len) catch return error.InvalidDeoptMetadata;
+    }
+    return count;
+}
+
+fn validatePointMonitorState(point: DeoptPointSpec, state: MonitorRegionState) Error!void {
+    if (try pointMonitorCount(point) != state.depth) return error.InvalidDeoptMetadata;
+    var cursor: usize = 0;
+    for (point.inline_frames) |frame| {
+        for (frame.monitors) |monitor| {
+            const expected = try deoptMonitorEntry(monitor);
+            const actual = state.stack[cursor];
+            if (expected.reg != actual.reg or expected.kind != actual.kind) return error.InvalidDeoptMetadata;
+            cursor += 1;
+        }
+    }
+    for (point.monitors) |monitor| {
+        const expected = try deoptMonitorEntry(monitor);
+        const actual = state.stack[cursor];
+        if (expected.reg != actual.reg or expected.kind != actual.kind) return error.InvalidDeoptMetadata;
+        cursor += 1;
+    }
+}
+
+fn synchronizedMonitorEnter(options: DeoptOptions, site_id: u32) bool {
+    var low: usize = 0;
+    var high = options.synchronized_monitor_enter_sites.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const candidate = options.synchronized_monitor_enter_sites[middle];
+        if (candidate < site_id) {
+            low = middle + 1;
+        } else if (candidate > site_id) {
+            high = middle;
+        } else return true;
+    }
+    return false;
+}
+
+/// Proves a single structured monitor stack for every machine-CFG edge. A
+/// synchronized inline frame is therefore accepted only when a designated
+/// monitor-enter dominates the deoptimization point on every path. Joins with
+/// different stacks, non-LIFO exits, forged sites, and stale frame metadata are
+/// rejected before register allocation locations become executable metadata.
+fn validateDeoptMonitorRegions(
+    allocator: std.mem.Allocator,
+    source: *const machine.Function,
+    options: DeoptOptions,
+) Error!void {
+    if (options.entry_monitors.len > runtime_jit.max_native_monitors) return error.InvalidDeoptMetadata;
+    for (options.synchronized_monitor_enter_sites, 0..) |site, index| {
+        if (index != 0 and options.synchronized_monitor_enter_sites[index - 1] >= site) {
+            return error.InvalidDeoptMetadata;
+        }
+        var matches: usize = 0;
+        for (source.blocks) |block| for (block.insts) |inst| {
+            if (inst.opcode == .monitor_enter and inst.monitor_site_id == site) matches += 1;
+        };
+        if (matches != 1) return error.InvalidDeoptMetadata;
+    }
+
+    var entry_state = MonitorRegionState{ .initialized = true };
+    for (options.entry_monitors, 0..) |monitor, index| {
+        const value = try deoptMonitorEntry(monitor);
+        if (value.reg >= source.reg_types.len or !source.isGcRoot(value.reg)) return error.InvalidDeoptMetadata;
+        if (value.kind == .synchronized and index != 0) return error.InvalidDeoptMetadata;
+        entry_state.stack[index] = value;
+        entry_state.depth += 1;
+    }
+
+    const states = try allocator.alloc(MonitorRegionState, source.blocks.len);
+    defer allocator.free(states);
+    for (states) |*state| state.* = .{};
+    const visited_points = try allocator.alloc(bool, options.points.len);
+    defer allocator.free(visited_points);
+    @memset(visited_points, false);
+    const queue = try allocator.alloc(cfg.BlockId, source.blocks.len);
+    defer allocator.free(queue);
+
+    const entry_block = source.source.source.graph.entry;
+    if (entry_block >= source.blocks.len) return error.InvalidMachine;
+    states[entry_block] = entry_state;
+    queue[0] = entry_block;
+    var head: usize = 0;
+    var tail: usize = 1;
+    while (head < tail) : (head += 1) {
+        const block_id = queue[head];
+        const block = source.blocks[block_id];
+        var state = states[block_id];
+
+        for (options.points, 0..) |point, point_index| {
+            if ((point.safepoint_id == null) == (point.block_entry == null)) return error.InvalidDeoptMetadata;
+            if (point.block_entry == block_id) {
+                try validatePointMonitorState(point, state);
+                visited_points[point_index] = true;
+            }
+        }
+
+        for (block.insts) |inst| {
+            if (instructionSafepointId(inst)) |site_id| {
+                for (options.points, 0..) |point, point_index| {
+                    if (point.safepoint_id == site_id) {
+                        try validatePointMonitorState(point, state);
+                        visited_points[point_index] = true;
+                    }
+                }
+            }
+            switch (inst.opcode) {
+                .monitor_enter => {
+                    if (state.depth >= runtime_jit.max_native_monitors) return error.InvalidDeoptMetadata;
+                    const reg = inst.state_handle orelse return error.InvalidMachine;
+                    state.stack[state.depth] = .{
+                        .reg = reg,
+                        .kind = if (synchronizedMonitorEnter(options, inst.monitor_site_id orelse return error.InvalidMachine))
+                            .synchronized
+                        else
+                            .explicit,
+                    };
+                    state.depth += 1;
+                },
+                .monitor_exit => {
+                    if (state.depth <= entry_state.depth) return error.InvalidDeoptMetadata;
+                    const reg = inst.state_handle orelse return error.InvalidMachine;
+                    if (state.stack[state.depth - 1].reg != reg) return error.InvalidDeoptMetadata;
+                    state.depth -= 1;
+                },
+                else => {},
+            }
+        }
+
+        for (source.successors[block_id]) |successor| {
+            if (successor >= states.len) return error.InvalidMachine;
+            if (!states[successor].initialized) {
+                states[successor] = state;
+                states[successor].initialized = true;
+                if (tail >= queue.len) return error.InvalidMachine;
+                queue[tail] = successor;
+                tail += 1;
+            } else if (!monitorRegionStatesEqual(states[successor], state)) {
+                return error.InvalidDeoptMetadata;
+            }
+        }
+    }
+    for (states) |state| if (!state.initialized) return error.InvalidMachine;
+    for (visited_points) |visited| if (!visited) return error.MissingDeoptSafepoint;
+}
+
 fn buildDeoptTable(
     allocator: std.mem.Allocator,
     source: *const machine.Function,
@@ -3122,6 +3367,7 @@ fn buildDeoptTable(
     try validateSpillPlan(source, allocation, spill_plan);
     const deopt = options orelse return null;
     if (deopt.points.len == 0 or deopt.register_count == 0) return error.InvalidDeoptMetadata;
+    try validateDeoptMonitorRegions(allocator, source, deopt);
     const maps = root_maps orelse return error.MissingDeoptSafepoint;
     var value_liveness = try buildLiveness(allocator, source, false);
     defer value_liveness.deinit();
@@ -3140,6 +3386,11 @@ fn buildDeoptTable(
     defer {
         for (owned_values.items) |values| allocator.free(values);
         owned_values.deinit(allocator);
+    }
+    var owned_monitors: std.ArrayList([]runtime_deopt.MonitorSpec) = .empty;
+    defer {
+        for (owned_monitors.items) |monitors| allocator.free(monitors);
+        owned_monitors.deinit(allocator);
     }
 
     for (deopt.points, 0..) |point, point_index| {
@@ -3168,11 +3419,28 @@ fn buildDeoptTable(
                 allocator.free(values);
                 return err;
             };
+            const monitors = try translateDeoptMonitors(
+                allocator,
+                source,
+                allocation,
+                spill_plan,
+                maps,
+                safepoint.site_id,
+                live_values,
+                &physical_owners,
+                frame.monitors,
+                stats,
+            );
+            owned_monitors.append(allocator, monitors) catch |err| {
+                allocator.free(monitors);
+                return err;
+            };
             inline_frames[frame_index] = .{
                 .method_id = frame.method_id,
                 .dex_pc = frame.dex_pc,
                 .register_count = frame.register_count,
                 .values = values,
+                .monitors = monitors,
             };
         }
         const values = try translateDeoptValues(
@@ -3192,12 +3460,29 @@ fn buildDeoptTable(
             allocator.free(values);
             return err;
         };
+        const monitors = try translateDeoptMonitors(
+            allocator,
+            source,
+            allocation,
+            spill_plan,
+            maps,
+            safepoint.site_id,
+            live_values,
+            &physical_owners,
+            point.monitors,
+            stats,
+        );
+        owned_monitors.append(allocator, monitors) catch |err| {
+            allocator.free(monitors);
+            return err;
+        };
         translated_points[point_index] = .{
             .id = point.id,
             .method_id = point.method_id,
             .dex_pc = point.dex_pc,
             .values = values,
             .inline_frames = inline_frames,
+            .monitors = monitors,
         };
         stats.deopt_points += 1;
         stats.deopt_frames = std.math.add(u32, stats.deopt_frames, @intCast(point.inline_frames.len + 1)) catch
@@ -3280,6 +3565,7 @@ fn validateOsrLiveRegister(
     source: *const machine.Function,
     allocation: *const regalloc.Allocation,
     mapped_values: []const runtime_deopt.ValueSpec,
+    mapped_monitors: []const runtime_deopt.MonitorSpec,
     osr_block: cfg.BlockId,
     reg: machine.RegId,
 ) Error!void {
@@ -3295,6 +3581,10 @@ fn validateOsrLiveRegister(
     if (value_id >= source.source.source.values.len) return error.InvalidDeoptMetadata;
     const vreg = source.source.source.values[value_id].reg;
     const physical = try x64Reg(try physOf(allocation, reg));
+    for (mapped_monitors) |monitor| switch (monitor.source) {
+        .native_register => |mapped| if (mapped == physical) return,
+        else => {},
+    };
     for (mapped_values) |value| {
         const width = value.kind.registerWidth();
         if (vreg < value.vreg or vreg >= value.vreg + width) continue;
@@ -3310,6 +3600,13 @@ fn validateOsrMappedSources(values: []const runtime_deopt.ValueSpec) Error!void 
     for (values) |value| switch (value.source) {
         .native_register, .constant => {},
         .stack_slot, .xmm_register => return error.InvalidDeoptMetadata,
+    };
+}
+
+fn validateOsrMonitorSources(monitors: []const runtime_deopt.MonitorSpec) Error!void {
+    for (monitors) |monitor| switch (monitor.source) {
+        .native_register => {},
+        .stack_slot, .xmm_register, .constant => return error.InvalidDeoptMetadata,
     };
 }
 
@@ -3362,7 +3659,11 @@ fn buildOsrAugmentedRootMaps(
         if (!osrBlockNeedsRematerialization(source, spec.block)) continue;
         const deopt_record = deopt_table.find(spec.point_id) catch return error.InvalidDeoptMetadata;
         const mapped_values = deopt_table.valuesFor(deopt_record);
+        const deopt_frames = deopt_table.framesFor(deopt_record);
+        if (deopt_frames.len != 1) return error.InvalidDeoptMetadata;
+        const mapped_monitors = deopt_table.monitorsForFrame(deopt_frames[0]);
         try validateOsrMappedSources(mapped_values);
+        try validateOsrMonitorSources(mapped_monitors);
 
         var roots: std.ArrayList(runtime_stack_map.RootLocation) = .empty;
         errdefer roots.deinit(allocator);
@@ -3378,6 +3679,14 @@ fn buildOsrAugmentedRootMaps(
                 .stack_slot, .xmm_register => return error.InvalidDeoptMetadata,
             }
         }
+        for (mapped_monitors) |monitor| switch (monitor.source) {
+            .native_register => |physical| try appendUniqueRoot(
+                &roots,
+                allocator,
+                runtime_stack_map.RootLocation.nativeRegister(physical),
+            ),
+            .stack_slot, .xmm_register, .constant => return error.InvalidDeoptMetadata,
+        };
         for (barriers.loop_reuses) |reuse| {
             if (reuse.header != spec.block) continue;
             const operands = try osrRematOperands(source, reuse.resolve);
@@ -3558,11 +3867,15 @@ fn buildOsrEntries(
         if (!natural_loop) return error.InvalidDeoptMetadata;
         const record = deopt_table.find(spec.point_id) catch return error.InvalidDeoptMetadata;
         const mapped_values = deopt_table.valuesFor(record);
+        const deopt_frames = deopt_table.framesFor(record);
+        if (deopt_frames.len != 1) return error.InvalidDeoptMetadata;
+        const mapped_monitors = deopt_table.monitorsForFrame(deopt_frames[0]);
         try validateOsrMappedSources(mapped_values);
+        try validateOsrMonitorSources(mapped_monitors);
         for (0..source.reg_types.len) |reg_index| {
             const reg: machine.RegId = @intCast(reg_index);
             if (try osrRegisterReadBeforeDefinition(allocator, source, safepoint, reg)) {
-                try validateOsrLiveRegister(source, allocation, mapped_values, spec.block, reg);
+                try validateOsrLiveRegister(source, allocation, mapped_values, mapped_monitors, spec.block, reg);
             }
         }
         const offset = try buffer.labelOffset(osr_labels[entry_index]);
@@ -3606,6 +3919,13 @@ fn collectOsrRequiredRegisters(
                 try appendUniqueRegister(&required, allocator, reg);
             },
             .constant => {},
+        };
+        for (deopt_point.monitors) |monitor| switch (monitor.source) {
+            .machine_register => |reg| {
+                if (reg >= source.reg_types.len or !source.isGcRoot(reg)) return error.InvalidDeoptMetadata;
+                try appendUniqueRegister(&required, allocator, reg);
+            },
+            .constant => return error.InvalidDeoptMetadata,
         };
         const safepoint = try resolveDeoptPosition(source, options, selected_index);
         if (safepoint.block != spec.block or safepoint.pc != deopt_point.dex_pc) {
@@ -4997,30 +5317,54 @@ test "x64 compiler translates deoptimization values after register allocation" {
         .{ .vreg = 1, .kind = .scalar32, .source = .{ .machine_register = live_scalar } },
         .{ .vreg = 2, .kind = .scalar32, .source = .{ .constant = 99 } },
     };
+    const held_monitors = [_]DeoptMonitorSpec{.{ .source = .{ .machine_register = handle_reg } }};
     const points = [_]DeoptPointSpec{.{
         .id = 17,
         .safepoint_id = safepoint,
         .method_id = 23,
         .dex_pc = 0,
         .values = &values,
+        .monitors = &held_monitors,
     }};
     var deopt_epoch = std.atomic.Value(u64).init(0);
     var deopt_runtime = testRuntimeAbi();
     deopt_runtime.deopt_epoch_address = @intFromPtr(&deopt_epoch);
     deopt_runtime.deopt_helper = 1;
-    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+    try std.testing.expectError(error.InvalidDeoptMetadata, encodeWithOptions(std.testing.allocator, &optimized.machine, .{
         .runtime = deopt_runtime,
         .deopt = .{ .points = &points, .register_count = 3, .max_dex_pc = 2 },
+    }));
+    try std.testing.expectError(error.InvalidDeoptMetadata, encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = deopt_runtime,
+        .deopt = .{
+            .points = &points,
+            .register_count = 3,
+            .max_dex_pc = 2,
+            .entry_monitors = &held_monitors,
+            .synchronized_monitor_enter_sites = &.{999},
+        },
+    }));
+    var native = try encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = deopt_runtime,
+        .deopt = .{
+            .points = &points,
+            .register_count = 3,
+            .max_dex_pc = 2,
+            .entry_monitors = &held_monitors,
+        },
     });
     defer native.deinit();
     try native.verify();
     try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_points);
     try std.testing.expectEqual(@as(u32, 3), native.stats.deopt_values);
+    try std.testing.expectEqual(@as(u32, 1), native.stats.deopt_monitors);
     const table = if (native.deopt_table) |*value| value else return error.TestUnexpectedResult;
     const record = try table.find(17);
     const translated = table.valuesFor(record);
+    const translated_monitors = table.monitorsForFrame(table.framesFor(record)[0]);
     try std.testing.expectEqual(runtime_deopt.Source.native_register, std.meta.activeTag(translated[0].source));
     try std.testing.expectEqual(runtime_deopt.Source.native_register, std.meta.activeTag(translated[1].source));
+    try std.testing.expectEqual(translated[0].source.native_register, translated_monitors[0].source.native_register);
     const maps = if (native.root_maps) |*value| value else return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u32, 17), (try maps.find(safepoint)).deopt_id);
 
@@ -5038,19 +5382,22 @@ test "x64 compiler translates deoptimization values after register allocation" {
         .register_is_ref = &reference_kinds,
         .reference_registers = &references,
     } };
-    var scratch: [3]u64 = undefined;
+    var scratch: [4]u64 = undefined;
     var anchor: u64 = 0;
     _ = try table.reconstruct(17, .{
         .native_registers = &captured,
         .stack_base = @ptrCast(&anchor),
         .stack_min_offset = 0,
         .stack_max_offset = @sizeOf(@TypeOf(anchor)),
+        .held_monitors = &.{@bitCast(handle)},
     }, .{ .frame = &frame, .scratch = &scratch }, .invalidation, .{});
     try std.testing.expectEqual(@as(u64, @bitCast(handle)), frame.execution.reference_registers[0]);
     try std.testing.expectEqual(@as(u32, 1234), frame.execution.registers[1]);
     try std.testing.expectEqual(@as(u32, 99), frame.execution.registers[2]);
+    try std.testing.expectEqual(@as(u8, 1), frame.execution.managed_frame_state.held_monitor_count);
+    try std.testing.expectEqual(@as(u64, @bitCast(handle)), frame.execution.managed_frame_state.held_monitors[0]);
     var osr_image: [16]u64 = @splat(0);
-    var osr_scratch: [19]u64 = undefined;
+    var osr_scratch: [20]u64 = undefined;
     try table.exportOsr(17, &frame, .{ .native_registers = &osr_image, .scratch = &osr_scratch });
     try std.testing.expectEqual(@as(u64, @bitCast(handle)), osr_image[translated[0].source.native_register]);
     try std.testing.expectEqual(@as(u64, 1234), osr_image[translated[1].source.native_register]);
@@ -5099,7 +5446,12 @@ test "x64 compiler translates deoptimization values after register allocation" {
     var spill_plan = try regalloc.planSpills(std.testing.allocator, &allocation);
     defer spill_plan.deinit();
     var linked_stats: Stats = .{};
-    const deopt_options = DeoptOptions{ .points = &points, .register_count = 3, .max_dex_pc = 2 };
+    const deopt_options = DeoptOptions{
+        .points = &points,
+        .register_count = 3,
+        .max_dex_pc = 2,
+        .entry_monitors = &held_monitors,
+    };
     var linked_maps = (try buildRootMaps(
         std.testing.allocator,
         &optimized.machine,
@@ -5182,7 +5534,12 @@ test "x64 compiler translates deoptimization values after register allocation" {
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         deoptEncodingFailureProbe,
-        .{ &optimized.machine, DeoptOptions{ .points = &points, .register_count = 3, .max_dex_pc = 2 } },
+        .{ &optimized.machine, DeoptOptions{
+            .points = &points,
+            .register_count = 3,
+            .max_dex_pc = 2,
+            .entry_monitors = &held_monitors,
+        } },
     );
 
     const allocation_failure_callers = [_]DeoptInlineFrameSpec{.{
@@ -5204,6 +5561,88 @@ test "x64 compiler translates deoptimization values after register allocation" {
         deoptEncodingFailureProbe,
         .{ &optimized.machine, DeoptOptions{ .points = &allocation_failure_points, .register_count = 3, .max_dex_pc = 2 } },
     );
+}
+
+test "x64 deoptimization rejects non-LIFO monitor regions" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .monitor_enter = .{ .src = 0 } },
+        .{ .monitor_enter = .{ .src = 1 } },
+        .{ .monitor_exit = .{ .src = 0 } },
+        .{ .iget = .{ .field_idx = 0, .dest_or_src = 2, .obj = 0 } },
+        .{ .return_ = .{ .src = 2 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    var safepoint: ?u32 = null;
+    for (optimized.machine.blocks) |block| for (block.insts) |inst| {
+        if (inst.opcode == .resolve_handle and inst.pc == 3) safepoint = inst.resolve_id;
+    };
+    const values = [_]DeoptValueSpec{.{
+        .vreg = 0,
+        .kind = .scalar32,
+        .source = .{ .constant = 0 },
+    }};
+    const points = [_]DeoptPointSpec{.{
+        .id = 1,
+        .safepoint_id = safepoint orelse return error.TestUnexpectedResult,
+        .method_id = 0,
+        .dex_pc = 3,
+        .values = &values,
+    }};
+    var epoch = std.atomic.Value(u64).init(0);
+    var abi = testRuntimeAbi();
+    abi.deopt_epoch_address = @intFromPtr(&epoch);
+    abi.deopt_helper = 1;
+    abi.monitor_enter_helper = 1;
+    abi.monitor_exit_helper = 1;
+    try std.testing.expectError(error.InvalidDeoptMetadata, encodeWithOptions(std.testing.allocator, &optimized.machine, .{
+        .runtime = abi,
+        .deopt = .{ .points = &points, .register_count = 1, .max_dex_pc = 4 },
+    }));
+}
+
+test "x64 deoptimization rejects monitor-stack disagreement at CFG joins" {
+    if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
+    const insts = [_]Instruction{
+        .{ .if_eqz = .{ .src = 2, .offset = 3 } },
+        .{ .monitor_enter = .{ .src = 0 } },
+        .{ .goto_ = .{ .offset = 2 } },
+        .{ .monitor_enter = .{ .src = 0 } },
+        .{ .iget = .{ .field_idx = 0, .dest_or_src = 1, .obj = 0 } },
+        .{ .return_ = .{ .src = 1 } },
+    };
+    var optimized = try optimizedMachine(std.testing.allocator, &insts);
+    defer optimized.deinit();
+    var safepoint: ?u32 = null;
+    var removed_enter = false;
+    for (optimized.machine.blocks) |*block| for (block.insts) |*inst| {
+        if (inst.opcode == .resolve_handle and inst.pc == 4) safepoint = inst.resolve_id;
+        if (!removed_enter and inst.opcode == .monitor_enter and inst.pc == 3) {
+            // The optimizer produced a valid equal-stack join. Removing one
+            // path's abstract acquisition isolates the backend merge proof.
+            inst.opcode = .memory_barrier;
+            removed_enter = true;
+        }
+    };
+    try std.testing.expect(removed_enter);
+    const values = [_]DeoptValueSpec{.{
+        .vreg = 0,
+        .kind = .scalar32,
+        .source = .{ .constant = 0 },
+    }};
+    const points = [_]DeoptPointSpec{.{
+        .id = 1,
+        .safepoint_id = safepoint orelse return error.TestUnexpectedResult,
+        .method_id = 0,
+        .dex_pc = 4,
+        .values = &values,
+    }};
+    try std.testing.expectError(error.InvalidDeoptMetadata, validateDeoptMonitorRegions(
+        std.testing.allocator,
+        &optimized.machine,
+        .{ .points = &points, .register_count = 1, .max_dex_pc = 5 },
+    ));
 }
 
 test "x64 compiler publishes a verified no-prologue OSR safepoint label" {

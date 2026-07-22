@@ -57,6 +57,9 @@ pub const ManagedFrameState = struct {
     active: bool = false,
     held_monitors: [max_held_monitors]u64 = @splat(null_reference_bits),
     held_monitor_count: u8 = 0,
+    /// True when slot zero is the implicit monitor of a synchronized method.
+    /// Deoptimization may prepopulate this ownership before interpreter entry.
+    synchronized_monitor_owned: bool = false,
 };
 
 pub const ManagedMemoryVTable = struct {
@@ -107,6 +110,8 @@ pub const ExecutionFrame = struct {
     reference_registers: []u64 = &.{},
     managed_memory: ?ManagedMemory = null,
     managed_frame_state: ManagedFrameState = .{},
+    /// Implicit class/receiver Handle for a synchronized method invocation.
+    synchronized_monitor: ?u64 = null,
 
     // --- Helper Methods for Type Punning ---
     // Dalvik registers are untyped 32-bit slots. These helpers safely cast
@@ -377,6 +382,7 @@ fn monitorExitManaged(frame: *ExecutionFrame, object_bits: u64) RuntimeError!voi
     var cursor: usize = frame.managed_frame_state.held_monitor_count;
     while (cursor != 0) {
         cursor -= 1;
+        if (cursor == 0 and frame.managed_frame_state.synchronized_monitor_owned) break;
         if (frame.managed_frame_state.held_monitors[cursor] == object_bits) {
             found = cursor;
             break;
@@ -434,6 +440,21 @@ pub fn execute(frame: *ExecutionFrame) RuntimeError!ExecutionResult {
         memory.vtable.leave_frame.?(memory.context, &frame.managed_frame_state);
     };
     if (managed_frame_entered) try pollManagedFrame(frame);
+    if (frame.synchronized_monitor) |monitor_bits| {
+        if (!managed_frame_entered) return error.MissingManagedMemory;
+        if (frame.managed_frame_state.synchronized_monitor_owned) {
+            if (frame.managed_frame_state.held_monitor_count == 0 or
+                frame.managed_frame_state.held_monitors[0] != monitor_bits)
+            {
+                return error.IllegalMonitorState;
+            }
+        } else {
+            try monitorEnterManaged(frame, monitor_bits);
+            frame.managed_frame_state.synchronized_monitor_owned = true;
+        }
+    } else if (frame.managed_frame_state.synchronized_monitor_owned) {
+        return error.IllegalMonitorState;
+    }
     // OPTIMIZATION 5: Safety Stripping
     // We explicitly disable runtime bounds checking inside the hot loop.
     // The DEX parser/verifier guarantees that `pc` and register indices are bounds-safe.
